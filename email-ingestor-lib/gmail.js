@@ -263,6 +263,37 @@ export class GmailClient {
     return { ok: true, id: res.data.id, forwarded_to: toAddress };
   }
 
+  /** Move a message to trash */
+  async trash(id) {
+    await this._gmail.users.messages.trash({ userId: 'me', id });
+    return { ok: true, id };
+  }
+
+  /** List recent inbox messages (up to limit) */
+  async listInbox(limit = 30) {
+    const res = await this._gmail.users.messages.list({
+      userId: 'me',
+      labelIds: ['INBOX'],
+      maxResults: Math.min(limit, 100),
+    });
+    const messages = [];
+    for (const msg of (res.data.messages || []).slice(0, limit)) {
+      const detail = await this.fetchMetadata(msg.id);
+      const headers = detail.payload?.headers || [];
+      messages.push({
+        id: msg.id,
+        threadId: detail.threadId,
+        subject: headers.find(h => h.name === 'Subject')?.value || '(no subject)',
+        from: headers.find(h => h.name === 'From')?.value || '(unknown)',
+        date: headers.find(h => h.name === 'Date')?.value || '',
+        snippet: detail.snippet || '',
+        labels: detail.labelIds || [],
+        isUnread: (detail.labelIds || []).includes('UNREAD'),
+      });
+    }
+    return messages;
+  }
+
   /** Get unread messages (up to limit) */
   async getUnread(limit = 20) {
     const res = await this._gmail.users.messages.list({
