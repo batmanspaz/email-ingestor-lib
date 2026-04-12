@@ -1,0 +1,11 @@
+{
+  "name": "email-ingestor-lib",
+  "version": "1.0.0",
+  "description": "Shared email ingestor library — poll, forward, log for all entity ingestors",
+  "type": "module",
+  "main": "index.js",
+  "dependencies": {
+    "dotenv": "^16.4.5",
+    "googleapis": "^144.0.0"
+  }
+}
