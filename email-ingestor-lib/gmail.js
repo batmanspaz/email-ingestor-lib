@@ -15,6 +15,33 @@ import os from 'os';
 const CRED_DIR = path.join(os.homedir(), 'claude/shared/config/credentials');
 const CLIENT_FILE = path.join(CRED_DIR, 'conductor_paul_client.json');
 
+/**
+ * Retry a Gmail API call with exponential backoff on 429 / 5xx / network errors.
+ * Non-retryable errors (401, 403, 404) bubble up immediately.
+ */
+async function withRetry(fn, label = 'gmail') {
+  const MAX_ATTEMPTS = 4;
+  let attempt = 0;
+  let lastErr;
+  while (attempt < MAX_ATTEMPTS) {
+    try {
+      return await fn();
+    } catch (err) {
+      lastErr = err;
+      const code = err.code || err.response?.status;
+      const retryable = code === 429 || code === 500 || code === 502 || code === 503 || code === 504
+        || /ECONN|ETIMEDOUT|ENOTFOUND|socket hang up/i.test(err.message || '');
+      if (!retryable) throw err;
+      attempt++;
+      if (attempt >= MAX_ATTEMPTS) break;
+      const backoffMs = Math.min(30000, 500 * Math.pow(2, attempt)) + Math.floor(Math.random() * 250);
+      console.warn(`  [${label}] retryable error ${code || err.message} — attempt ${attempt}/${MAX_ATTEMPTS}, backing off ${backoffMs}ms`);
+      await new Promise(r => setTimeout(r, backoffMs));
+    }
+  }
+  throw lastErr;
+}
+
 export class GmailClient {
   /**
    * @param {object} config
@@ -85,7 +112,7 @@ export class GmailClient {
 
   /** Get current historyId without fetching messages */
   async getCurrentHistoryId() {
-    const res = await this._gmail.users.getProfile({ userId: 'me' });
+    const res = await withRetry(() => this._gmail.users.getProfile({ userId: 'me' }), `${this.account}:getProfile`);
     return res.data.historyId;
   }
 
@@ -99,13 +126,13 @@ export class GmailClient {
 
     try {
       do {
-        const res = await this._gmail.users.history.list({
+        const res = await withRetry(() => this._gmail.users.history.list({
           userId: 'me',
           startHistoryId,
           historyTypes: ['messageAdded'],
           labelId: 'INBOX',
           pageToken: pageToken || undefined,
-        });
+        }), `${this.account}:history.list`);
         for (const record of res.data.history || []) {
           for (const item of record.messagesAdded || []) {
             if (item.message?.id) ids.push(item.message.id);
@@ -125,22 +152,22 @@ export class GmailClient {
 
   /** Fetch a single full message by ID */
   async fetchMessage(id) {
-    const res = await this._gmail.users.messages.get({
+    const res = await withRetry(() => this._gmail.users.messages.get({
       userId: 'me',
       id,
       format: 'full',
-    });
+    }), `${this.account}:messages.get(full)`);
     return res.data;
   }
 
   /** Fetch message metadata only (lighter) */
   async fetchMetadata(id) {
-    const res = await this._gmail.users.messages.get({
+    const res = await withRetry(() => this._gmail.users.messages.get({
       userId: 'me',
       id,
       format: 'metadata',
       metadataHeaders: ['Subject', 'From', 'Date', 'To', 'Message-ID'],
-    });
+    }), `${this.account}:messages.get(metadata)`);
     return res.data;
   }
 
