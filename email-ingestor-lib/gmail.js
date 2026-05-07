@@ -290,6 +290,55 @@ export class GmailClient {
     return { ok: true, id: res.data.id, forwarded_to: toAddress };
   }
 
+  /**
+   * Create a Gmail draft, optionally as a reply to an existing message.
+   *
+   * @param {object} opts
+   * @param {string|string[]} opts.to          — recipient(s)
+   * @param {string}          opts.subject     — subject line
+   * @param {string}          opts.body        — plain-text body
+   * @param {string}          [opts.cc]        — cc address(es)
+   * @param {string}          [opts.threadId]  — Gmail thread ID (to thread the draft)
+   * @param {string}          [opts.inReplyTo] — Message-ID header of the email being replied to
+   * @param {string}          [opts.references] — References header chain
+   * @returns {{ ok: boolean, draftId: string, threadId: string }}
+   */
+  async createDraft({ to, subject, body, cc, threadId, inReplyTo, references }) {
+    const toStr = Array.isArray(to) ? to.join(', ') : to;
+    const lines = [
+      `From: ${this.account}`,
+      `To: ${toStr}`,
+      cc ? `Cc: ${Array.isArray(cc) ? cc.join(', ') : cc}` : null,
+      `Subject: ${subject}`,
+      inReplyTo ? `In-Reply-To: ${inReplyTo}` : null,
+      references ? `References: ${references}` : null,
+      'Content-Type: text/plain; charset="UTF-8"',
+      'MIME-Version: 1.0',
+      '',
+      body,
+    ].filter(Boolean);
+
+    const raw = Buffer.from(lines.join('\r\n'))
+      .toString('base64')
+      .replace(/\+/g, '-')
+      .replace(/\//g, '_')
+      .replace(/=+$/, '');
+
+    const requestBody = { message: { raw } };
+    if (threadId) requestBody.message.threadId = threadId;
+
+    const res = await withRetry(() => this._gmail.users.drafts.create({
+      userId: 'me',
+      requestBody,
+    }), `${this.account}:drafts.create`);
+
+    return {
+      ok: true,
+      draftId: res.data.id,
+      threadId: res.data.message?.threadId || threadId,
+    };
+  }
+
   /** Move a message to trash */
   async trash(id) {
     await this._gmail.users.messages.trash({ userId: 'me', id });
