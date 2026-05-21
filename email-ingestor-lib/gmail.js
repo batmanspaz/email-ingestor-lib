@@ -240,6 +240,21 @@ export class GmailClient {
     return label?.id || null;
   }
 
+  /** Find a label by name, create it if missing. Returns label ID. */
+  async getOrCreateLabel(name) {
+    const existing = await this.findLabelId(name);
+    if (existing) return existing;
+    const res = await this._gmail.users.labels.create({
+      userId: 'me',
+      requestBody: {
+        name,
+        labelListVisibility: 'labelShow',
+        messageListVisibility: 'show',
+      },
+    });
+    return res.data.id;
+  }
+
   /** Forward a message to another address */
   async forwardEmail(messageId, toAddress) {
     const original = await this.fetchMessage(messageId);
