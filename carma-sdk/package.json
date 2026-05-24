@@ -1,0 +1,33 @@
+{
+  "name": "@carma/sdk",
+  "version": "0.1.0",
+  "description": "Carma shared SDK — single Anthropic gateway, typed Worker REST client, env loader, PII scrubber. Replaces 12 hand-rolled call sites + 4 apiFetch reimplementations + 5 env loaders + 4 PII scrubbers.",
+  "type": "module",
+  "private": true,
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/CarmaSF/carma-sdk.git"
+  },
+  "main": "index.js",
+  "exports": {
+    ".": "./index.js",
+    "./gateway": "./anthropic-gateway.js",
+    "./worker-client": "./worker-client.js",
+    "./env": "./env.js",
+    "./pii": "./pii.js",
+    "./gmail": "./gmail.js",
+    "./cost": "./lib/cost.js",
+    "./caps": "./lib/caps.js",
+    "./telemetry": "./lib/telemetry.js",
+    "./batch": "./lib/batch.js"
+  },
+  "scripts": {
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "test:coverage": "vitest run --coverage"
+  },
+  "devDependencies": {
+    "@vitest/coverage-v8": "^4.1.4",
+    "vitest": "^4.1.4"
+  }
+}
