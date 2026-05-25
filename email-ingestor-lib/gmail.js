@@ -70,7 +70,7 @@ export class GmailClient {
    * Reads ~/claude/shared/config/credentials/{account}.json for refresh_token
    * and conductor_paul_client.json for client_id/client_secret.
    *
-   * @param {string} account — email address (e.g. paulallensteinberg@gmail.com)
+   * @param {string} account — email address (e.g. paul.steinberg@gocarma.com)
    * @param {string} [entity] — entity name for logging
    * @returns {GmailClient}
    */

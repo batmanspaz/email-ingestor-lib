@@ -5,7 +5,7 @@ incremental polling via history API, cross-entity forwarding, and JSONL logging.
 
 ## Usage
 
-Each entity ingestor (collagesoup, perfectcity, personal) imports from this lib:
+Each entity ingestor (carma, collagesoup, perfectcity, personal) imports from this lib:
 
 ```js
 import { GmailClient, poll, checkAndForward, createLogger } from '../../../shared/email-ingestor-lib/index.js';

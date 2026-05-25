@@ -10,7 +10,7 @@ import { GmailClient } from './gmail.js';
 
 /**
  * Create a logger for an entity.
- * @param {string} entity — entity name (collagesoup, perfectcity, personal)
+ * @param {string} entity — entity name (carma, collagesoup, perfectcity, personal)
  * @param {string} logPath — full path to the .jsonl log file
  * @returns {object} logger with methods: message(), forward(), error(), runStart(), runEnd()
  */
