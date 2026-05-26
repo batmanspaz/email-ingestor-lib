@@ -16,3 +16,5 @@ jobs:
           cache-dependency-path: email-ingestor-lib/package-lock.json
       - name: Install dependencies
         run: cd email-ingestor-lib && npm ci
+      - name: Run tests
+        run: cd email-ingestor-lib && npm test
