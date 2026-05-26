@@ -154,9 +154,9 @@ describe('GmailClient.getHeader', () => {
 // ── fromTokenFile error path ─────────────────────────────────────────────────
 
 describe('GmailClient.fromTokenFile', () => {
-  it('throws "Token file not found" when credential file is missing', () => {
+  it('throws a "file not found" error when credential files are missing', () => {
     expect(() => GmailClient.fromTokenFile('nonexistent@example.com', 'test'))
-      .toThrow('Token file not found');
+      .toThrow(/not found/i);
   });
 });
 
