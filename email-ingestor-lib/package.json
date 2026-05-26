@@ -9,7 +9,7 @@
   },
   "dependencies": {
     "dotenv": "^16.4.5",
-    "googleapis": "^144.0.0"
+    "googleapis": "^172.0.0"
   },
   "devDependencies": {
     "vitest": "^4.1.7"
