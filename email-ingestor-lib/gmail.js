@@ -345,6 +345,26 @@ export class GmailClient {
     return { ok: true, id };
   }
 
+  /**
+   * List recent messages from a specific label (not history-based).
+   * Used for sent mail scanning where history API filters to INBOX.
+   *
+   * @param {string} labelId — Gmail label ID (e.g. 'SENT')
+   * @param {number} maxResults
+   * @returns {Promise<string[]>} — array of message IDs
+   */
+  async listMessagesByLabel(labelId, maxResults = 25) {
+    const res = await withRetry(
+      () => this._gmail.users.messages.list({
+        userId: 'me',
+        labelIds: [labelId],
+        maxResults,
+      }),
+      `${this.account}:messages.list:${labelId}`
+    );
+    return (res.data.messages || []).map(m => m.id);
+  }
+
   /** List recent inbox messages (up to limit) */
   async listInbox(limit = 30) {
     const res = await this._gmail.users.messages.list({
