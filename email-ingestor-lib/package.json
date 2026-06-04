@@ -12,6 +12,6 @@
     "googleapis": "^144.0.0"
   },
   "devDependencies": {
-    "vitest": "^4.1.7"
+    "vitest": "^4.1.8"
   }
 }
