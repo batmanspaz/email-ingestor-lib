@@ -8,6 +8,25 @@
 import { GmailClient } from './gmail.js';
 
 /**
+ * Compile a rule pattern into a case-insensitive whole-word regex.
+ *
+ * Patterns are literal strings, not regexes — special chars are escaped.
+ * Word boundaries are only asserted where the pattern edge is a word
+ * character, so patterns like 'perfect city' or 'perfectcity.com' match
+ * naturally while short patterns like 'ruc' no longer match inside
+ * unrelated words ("truck", "instructions", "crucial").
+ *
+ * @param {string} pattern — literal pattern from a forward rule
+ * @returns {RegExp}
+ */
+export function compilePattern(pattern) {
+  const escaped = pattern.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  const lead = /^\w/.test(pattern) ? '\\b' : '';
+  const trail = /\w$/.test(pattern) ? '\\b' : '';
+  return new RegExp(`${lead}${escaped}${trail}`, 'i');
+}
+
+/**
  * Check forward rules and forward if matched.
  *
  * @param {object} message — Gmail message metadata (from fetchMetadata)
@@ -19,10 +38,10 @@ export async function checkAndForward(message, client, rules) {
   const subject = GmailClient.getHeader(message, 'Subject') || '';
   const from = GmailClient.getHeader(message, 'From') || '';
   const snippet = message.snippet || '';
-  const haystack = `${subject} ${from} ${snippet}`.toLowerCase();
+  const haystack = `${subject} ${from} ${snippet}`;
 
   for (const rule of rules) {
-    const matched = rule.patterns.some(p => haystack.includes(p.toLowerCase()));
+    const matched = rule.patterns.some(p => compilePattern(p).test(haystack));
     if (matched) {
       console.log(`    → Forwarding to ${rule.target} (rule: ${rule.label})`);
       await client.forwardEmail(message.id, rule.target);
