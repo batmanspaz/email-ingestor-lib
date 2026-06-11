@@ -162,6 +162,33 @@ describe('compilePattern — literal patterns, not regexes', () => {
   });
 });
 
+describe('checkAndForward — dryRun', () => {
+  it('does NOT call forwardEmail when a rule matches in dry-run', async () => {
+    const client = mockClient();
+    const rules = [{ patterns: ['receipt'], target: 'finance@example.com', label: 'receipt-rule' }];
+    const result = await checkAndForward(
+      makeMessage({ subject: 'Your Receipt #456', id: 'msg-dry' }), client, rules, { dryRun: true }
+    );
+    expect(client.forwardEmail).not.toHaveBeenCalled();
+    expect(result).toEqual({
+      forwarded: true,
+      target: 'finance@example.com',
+      rule: 'receipt-rule',
+      dryRun: true,
+    });
+  });
+
+  it('returns {forwarded: false} on no match in dry-run', async () => {
+    const client = mockClient();
+    const rules = [{ patterns: ['receipt'], target: 'f@example.com', label: 'r' }];
+    const result = await checkAndForward(
+      makeMessage({ subject: 'Hello' }), client, rules, { dryRun: true }
+    );
+    expect(result).toEqual({ forwarded: false });
+    expect(client.forwardEmail).not.toHaveBeenCalled();
+  });
+});
+
 describe('checkAndForward — missing message fields', () => {
   it('handles message with no payload headers gracefully', async () => {
     const client = mockClient();

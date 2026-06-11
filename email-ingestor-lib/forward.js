@@ -32,9 +32,13 @@ export function compilePattern(pattern) {
  * @param {object} message — Gmail message metadata (from fetchMetadata)
  * @param {GmailClient} client — the source account's client
  * @param {Array<{patterns: string[], target: string, label: string}>} rules — forward rules
- * @returns {Promise<{forwarded: boolean, target?: string, rule?: string}>}
+ * @param {object} [opts]
+ * @param {boolean} [opts.dryRun=false] — if true, log the matched rule but do NOT forward;
+ *   the result carries dryRun: true so callers can skip their own follow-up writes
+ * @returns {Promise<{forwarded: boolean, target?: string, rule?: string, dryRun?: boolean}>}
  */
-export async function checkAndForward(message, client, rules) {
+export async function checkAndForward(message, client, rules, opts = {}) {
+  const { dryRun = false } = opts;
   const subject = GmailClient.getHeader(message, 'Subject') || '';
   const from = GmailClient.getHeader(message, 'From') || '';
   const snippet = message.snippet || '';
@@ -43,6 +47,10 @@ export async function checkAndForward(message, client, rules) {
   for (const rule of rules) {
     const matched = rule.patterns.some(p => compilePattern(p).test(haystack));
     if (matched) {
+      if (dryRun) {
+        console.log(`    [DRY] would forward to ${rule.target} (rule: ${rule.label})`);
+        return { forwarded: true, target: rule.target, rule: rule.label, dryRun: true };
+      }
       console.log(`    → Forwarding to ${rule.target} (rule: ${rule.label})`);
       await client.forwardEmail(message.id, rule.target);
       return { forwarded: true, target: rule.target, rule: rule.label };
