@@ -49,6 +49,9 @@ function makeClient({ account = 'a@example.com', messages = [], currentHistoryId
     getCurrentHistoryId: vi.fn().mockResolvedValue(currentHistoryId),
     getHistory: vi.fn().mockResolvedValue(messages.map(m => m.id)),
     fetchMetadata: vi.fn().mockImplementation(async id => metaById[id]),
+    // Stub for archiveAfterProcess — batchModify is never called in these tests
+    // (archiveAfterProcess defaults to false), but the field must exist.
+    _gmail: { users: { messages: { batchModify: vi.fn().mockResolvedValue({}) } } },
   };
 }
 
@@ -68,7 +71,7 @@ describe('poll — first run (no historyId)', () => {
     const stats = await poll({ clients: [{ client, label: 'A' }], statePath }, handler);
 
     expect(handler).not.toHaveBeenCalled();
-    expect(stats).toEqual({ fetched: 0, processed: 0, errors: 0, forwarded: 0 });
+    expect(stats).toEqual({ fetched: 0, processed: 0, errors: 0, forwarded: 0, archived: 0 });
     expect(readStateFile().accounts['a@example.com'].lastHistoryId).toBe('1234');
   });
 
@@ -92,7 +95,7 @@ describe('poll — normal run', () => {
 
     expect(handler).toHaveBeenCalledTimes(2);
     expect(handler).toHaveBeenCalledWith(messages[0], client, { dryRun: false });
-    expect(stats).toEqual({ fetched: 2, processed: 2, errors: 0, forwarded: 0 });
+    expect(stats).toEqual({ fetched: 2, processed: 2, errors: 0, forwarded: 0, archived: 0 });
     const state = readStateFile();
     expect(state.accounts['a@example.com'].lastHistoryId).toBe('3000');
     expect(state.totalProcessed).toBe(2);
@@ -176,7 +179,7 @@ describe('poll — dry-run', () => {
     );
 
     expect(handler).not.toHaveBeenCalled();
-    expect(stats).toEqual({ fetched: 2, processed: 2, errors: 0, forwarded: 0 });
+    expect(stats).toEqual({ fetched: 2, processed: 2, errors: 0, forwarded: 0, archived: 0 });
   });
 
   it('logs a "[DRY] would process" preview line per message', async () => {
