@@ -101,8 +101,13 @@ export async function poll(config, handler) {
         if (result === 'forwarded') stats.forwarded++;
         stats.processed++;
       } catch (err) {
-        console.error(`    Error processing ${id}: ${err.message}`);
-        stats.errors++;
+        // Gmail 404: message deleted before fetch — skip silently, not an error
+        if (err.message?.includes('Requested entity was not found')) {
+          stats.processed++;
+        } else {
+          console.error(`    Error processing ${id}: ${err.message}`);
+          stats.errors++;
+        }
       }
     }
 
