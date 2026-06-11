@@ -7,7 +7,7 @@
  */
 
 import { describe, it, expect, vi } from 'vitest';
-import { checkAndForward } from '../forward.js';
+import { checkAndForward, compilePattern } from '../forward.js';
 
 function makeMessage({ subject = '', from = '', snippet = '', id = 'msg-001' } = {}) {
   return {
@@ -118,6 +118,47 @@ describe('checkAndForward — rule ordering', () => {
     );
     expect(result.forwarded).toBe(true);
     expect(result.rule).toBe('finance');
+  });
+});
+
+describe('checkAndForward — whole-word matching', () => {
+  const rucRule = [{ patterns: ['ruc'], target: 'carma@example.com', label: 'carma' }];
+
+  it('does NOT match a pattern embedded inside a longer word', async () => {
+    const client = mockClient();
+    for (const subject of ['Truck delivery update', 'Read the instructions', 'A crucial fix']) {
+      const result = await checkAndForward(makeMessage({ subject }), client, rucRule);
+      expect(result, subject).toEqual({ forwarded: false });
+    }
+    expect(client.forwardEmail).not.toHaveBeenCalled();
+  });
+
+  it('still matches the pattern as a standalone word', async () => {
+    const result = await checkAndForward(
+      makeMessage({ subject: 'RUC pilot program update' }), mockClient(), rucRule
+    );
+    expect(result.forwarded).toBe(true);
+  });
+
+  it('treats punctuation as a word boundary (emails, brackets, slashes)', async () => {
+    const rules = [{ patterns: ['hntb'], target: 'c@example.com', label: 'c' }];
+    const result = await checkAndForward(
+      makeMessage({ from: 'Jane Doe <jane@hntb.com>' }), mockClient(), rules
+    );
+    expect(result.forwarded).toBe(true);
+  });
+});
+
+describe('compilePattern — literal patterns, not regexes', () => {
+  it('escapes regex special characters', () => {
+    expect(compilePattern('perfectcity.com').test('from perfectcity.com')).toBe(true);
+    expect(compilePattern('perfectcity.com').test('perfectcityXcom')).toBe(false);
+  });
+
+  it('anchors boundaries only at word-character edges', () => {
+    expect(compilePattern('perfect city').test('the perfect city plan')).toBe(true);
+    expect(compilePattern('ruc').test('truck')).toBe(false);
+    expect(compilePattern('ruc').test('(RUC)')).toBe(true);
   });
 });
 
