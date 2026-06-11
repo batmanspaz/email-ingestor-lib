@@ -16,12 +16,16 @@ import { GmailClient } from './gmail.js';
  * @param {Array<{client: GmailClient, label: string}>} config.clients — Gmail clients to poll
  * @param {string} config.statePath — path to state.json (per-entity)
  * @param {number} [config.maxPerRun=50] — cap messages per cycle
- * @param {boolean} [config.dryRun=false] — if true, don't update state or call handler
- * @param {function} handler — async (message, client) => void, called for each new message
+ * @param {boolean} [config.dryRun=false] — if true, don't update state or call handler;
+ *   each new message is logged as "[DRY] would process" instead
+ * @param {boolean} [config.invokeHandlerInDryRun=false] — opt-in: call the handler even in
+ *   dry-run, passing { dryRun: true } as its third argument. Only set this if the handler
+ *   gates ALL of its side effects (forwards, file/DB/queue writes) on that flag.
+ * @param {function} handler — async (message, client, { dryRun }) => void, called for each new message
  * @returns {Promise<{fetched: number, processed: number, errors: number, forwarded: number}>}
  */
 export async function poll(config, handler) {
-  const { clients, statePath, maxPerRun = 50, dryRun = false } = config;
+  const { clients, statePath, maxPerRun = 50, dryRun = false, invokeHandlerInDryRun = false } = config;
   const stats = { fetched: 0, processed: 0, errors: 0, forwarded: 0 };
 
   const state = readState(statePath);
@@ -84,6 +88,14 @@ export async function poll(config, handler) {
           continue;
         }
         if (msgId) seenMessageIds.add(msgId);
+
+        if (dryRun && !invokeHandlerInDryRun) {
+          const from = GmailClient.getHeader(meta, 'From') || '(unknown sender)';
+          const subject = GmailClient.getHeader(meta, 'Subject') || '(no subject)';
+          console.log(`    [DRY] would process: ${from.slice(0, 40)} — ${subject.slice(0, 60)}`);
+          stats.processed++;
+          continue;
+        }
 
         const result = await handler(meta, client, { dryRun });
         if (result === 'forwarded') stats.forwarded++;
