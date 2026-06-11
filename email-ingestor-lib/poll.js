@@ -21,12 +21,16 @@ import { GmailClient } from './gmail.js';
  * @param {boolean} [config.invokeHandlerInDryRun=false] — opt-in: call the handler even in
  *   dry-run, passing { dryRun: true } as its third argument. Only set this if the handler
  *   gates ALL of its side effects (forwards, file/DB/queue writes) on that flag.
+ * @param {boolean} [config.archiveAfterProcess=false] — remove INBOX label for every
+ *   processed message after the per-account loop. Keeps entity inboxes thin.
+ *   Forwarded messages are also archived (already handled at destination).
+ *   Has no effect in dryRun mode.
  * @param {function} handler — async (message, client, { dryRun }) => void, called for each new message
- * @returns {Promise<{fetched: number, processed: number, errors: number, forwarded: number}>}
+ * @returns {Promise<{fetched: number, processed: number, errors: number, forwarded: number, archived: number}>}
  */
 export async function poll(config, handler) {
-  const { clients, statePath, maxPerRun = 50, dryRun = false, invokeHandlerInDryRun = false } = config;
-  const stats = { fetched: 0, processed: 0, errors: 0, forwarded: 0 };
+  const { clients, statePath, maxPerRun = 50, dryRun = false, invokeHandlerInDryRun = false, archiveAfterProcess = false } = config;
+  const stats = { fetched: 0, processed: 0, errors: 0, forwarded: 0, archived: 0 };
 
   const state = readState(statePath);
   const seenMessageIds = new Set();
@@ -78,6 +82,8 @@ export async function poll(config, handler) {
     stats.fetched += messageIds.length;
     console.log(`  [${label}] ${messageIds.length} new message(s)`);
 
+    const toArchive = []; // collect processed IDs for inbox cleanup
+
     for (const id of messageIds) {
       try {
         const meta = await client.fetchMetadata(id);
@@ -100,10 +106,32 @@ export async function poll(config, handler) {
         const result = await handler(meta, client, { dryRun });
         if (result === 'forwarded') stats.forwarded++;
         stats.processed++;
+        if (!dryRun && archiveAfterProcess) toArchive.push(id);
       } catch (err) {
-        console.error(`    Error processing ${id}: ${err.message}`);
-        stats.errors++;
+        // Gmail 404: message deleted before fetch — skip silently, not an error
+        if (err.message?.includes('Requested entity was not found')) {
+          stats.processed++;
+        } else {
+          console.error(`    Error processing ${id}: ${err.message}`);
+          stats.errors++;
+        }
       }
+    }
+
+    // Archive all processed messages in one batch (keeps inbox thin)
+    if (toArchive.length > 0) {
+      const gmail = client._gmail;
+      const CHUNK = 1000;
+      for (let i = 0; i < toArchive.length; i += CHUNK) {
+        const ids = toArchive.slice(i, i + CHUNK);
+        try {
+          await gmail.users.messages.batchModify({ userId: 'me', requestBody: { ids, removeLabelIds: ['INBOX'] } });
+          stats.archived += ids.length;
+        } catch (err) {
+          console.warn(`  [${label}] archive batch failed: ${err.message}`);
+        }
+      }
+      console.log(`  [${label}] archived ${toArchive.length} from inbox`);
     }
 
     // Update historyId for this account
