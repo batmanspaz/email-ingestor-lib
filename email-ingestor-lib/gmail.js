@@ -131,6 +131,7 @@ export class GmailClient {
           startHistoryId,
           historyTypes: ['messageAdded'],
           labelId: 'INBOX',
+          maxResults: 500,
           pageToken: pageToken || undefined,
         }), `${this.account}:history.list`);
         for (const record of res.data.history || []) {
@@ -139,6 +140,11 @@ export class GmailClient {
           }
         }
         pageToken = res.data.nextPageToken || null;
+        // Hard cap: prevent runaway cost on inbox surges (e.g. long gap + burst)
+        if (ids.length >= 500) {
+          console.warn(`[gmail] history.list hit 500-message cap for ${this.account} — truncating`);
+          break;
+        }
       } while (pageToken);
     } catch (err) {
       if (err.code === 404 || err.message?.includes('404')) {
