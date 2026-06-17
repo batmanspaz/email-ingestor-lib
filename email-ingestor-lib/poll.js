@@ -35,7 +35,8 @@ export async function poll(config, handler) {
   const state = readState(statePath);
   const seenMessageIds = new Set();
 
-  for (const { client, label } of clients) {
+  for (const clientEntry of clients) {
+    const { client, label } = clientEntry;
     const accountKey = client.account;
     const historyId = state.accounts?.[accountKey]?.lastHistoryId;
 
@@ -106,7 +107,10 @@ export async function poll(config, handler) {
         const result = await handler(meta, client, { dryRun });
         if (result === 'forwarded') stats.forwarded++;
         stats.processed++;
-        if (!dryRun && archiveAfterProcess) toArchive.push(id);
+        // Per-client archiveAfterProcess overrides the global setting.
+        // Set noArchive: true on a client entry to keep that account's inbox intact.
+        const shouldArchive = !dryRun && (clientEntry.noArchive ? false : archiveAfterProcess);
+        if (shouldArchive) toArchive.push(id);
       } catch (err) {
         // Gmail 404: message deleted before fetch — skip silently, not an error
         if (err.message?.includes('Requested entity was not found')) {
