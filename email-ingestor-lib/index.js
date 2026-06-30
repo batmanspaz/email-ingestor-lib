@@ -12,3 +12,4 @@ export { GmailClient } from './gmail.js';
 export { poll } from './poll.js';
 export { checkAndForward } from './forward.js';
 export { createLogger } from './log.js';
+export { maskEmail, maskFrom, redact } from './mask.js';
