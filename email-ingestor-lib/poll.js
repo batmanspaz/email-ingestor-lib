@@ -74,9 +74,12 @@ export async function poll(config, handler) {
       continue;
     }
 
-    // Cap
-    if (messageIds.length > maxPerRun) {
-      console.warn(`  [${label}] ${messageIds.length} new — capping to ${maxPerRun}`);
+    // Cap. Remember if we capped: when there's overflow we must NOT advance
+    // the cursor past the messages we didn't process this run, or they're lost
+    // forever. Leaving the cursor parked re-surfaces the remainder next run.
+    const capped = messageIds.length > maxPerRun;
+    if (capped) {
+      console.warn(`  [${label}] ${messageIds.length} new — capping to ${maxPerRun}; ${messageIds.length - maxPerRun} deferred to next run`);
       messageIds = messageIds.slice(0, maxPerRun);
     }
 
@@ -138,9 +141,13 @@ export async function poll(config, handler) {
       console.log(`  [${label}] archived ${toArchive.length} from inbox`);
     }
 
-    // Update historyId for this account
-    const newHistoryId = await client.getCurrentHistoryId();
-    state.accounts[accountKey].lastHistoryId = newHistoryId;
+    // Update historyId for this account — but ONLY when we processed the whole
+    // batch. On overflow we leave the cursor parked at the old historyId so the
+    // deferred (capped) messages are re-fetched and drained on the next run.
+    if (!capped) {
+      const newHistoryId = await client.getCurrentHistoryId();
+      state.accounts[accountKey].lastHistoryId = newHistoryId;
+    }
     state.accounts[accountKey].lastRunAt = new Date().toISOString();
     if (!dryRun) writeState(statePath, state);
   }
