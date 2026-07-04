@@ -151,6 +151,49 @@ describe('poll — normal run', () => {
     expect(stats.processed).toBe(1);
   });
 
+  it('does NOT advance the cursor past unprocessed overflow; next run drains the remainder', async () => {
+    // 3 new messages, maxPerRun = 2 → m3 is the capped overflow.
+    // The mailbox window is modelled as the set of *undrained* INBOX ids
+    // (mirrors archiveAfterProcess shrinking the history window), and is
+    // only returned while the cursor is still parked at the old historyId.
+    const metaById = {
+      m1: makeMeta({ id: 'm1' }),
+      m2: makeMeta({ id: 'm2' }),
+      m3: makeMeta({ id: 'm3' }),
+    };
+    const drained = new Set();
+    const client = {
+      account: 'a@example.com',
+      getCurrentHistoryId: vi.fn().mockResolvedValue('3000'),
+      getHistory: vi.fn().mockImplementation(async (startId) => {
+        // Once the cursor advances past the window, the overflow is stranded.
+        if (startId !== '2000') return [];
+        return ['m1', 'm2', 'm3'].filter(id => !drained.has(id));
+      }),
+      fetchMetadata: vi.fn().mockImplementation(async id => metaById[id]),
+      _gmail: { users: { messages: { batchModify: vi.fn().mockResolvedValue({}) } } },
+    };
+    seedState({ 'a@example.com': { lastHistoryId: '2000' } });
+
+    const processed = [];
+    const handler = vi.fn().mockImplementation(async (meta) => {
+      processed.push(meta.id);
+      drained.add(meta.id);
+      return 'processed';
+    });
+
+    // Run 1 — only the first 2 fit; the cursor MUST stay put so m3 isn't lost.
+    await poll({ clients: [{ client, label: 'A' }], statePath, maxPerRun: 2 }, handler);
+    expect(processed).toEqual(['m1', 'm2']);
+    expect(readStateFile().accounts['a@example.com'].lastHistoryId).toBe('2000');
+
+    // Run 2 — same cursor, window now surfaces the deferred m3.
+    await poll({ clients: [{ client, label: 'A' }], statePath, maxPerRun: 2 }, handler);
+    expect(processed).toContain('m3'); // overflow eventually processed — no mail lost
+    // Everything fit this time, so the cursor finally advances.
+    expect(readStateFile().accounts['a@example.com'].lastHistoryId).toBe('3000');
+  });
+
   it('caps messages at maxPerRun', async () => {
     const messages = ['m1', 'm2', 'm3'].map(id => makeMeta({ id }));
     const client = makeClient({ messages });

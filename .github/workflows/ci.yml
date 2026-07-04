@@ -17,4 +17,10 @@ jobs:
       - name: Install dependencies
         run: cd email-ingestor-lib && npm ci
       - name: Run tests
-        run: cd email-ingestor-lib && npm test
+        # @perfectcity/telemetry (optionalDependency, file:../telemetry) is a private
+        # sibling package CI cannot check out — npm ci above skips it rather than
+        # failing. producer-health.test.js imports it directly to exercise its REAL
+        # schema validation + PII scanning (deliberately not mocked — mirrors intake's
+        # own sluice-dispatch-health.js), so it only runs locally/pre-push where the
+        # real sibling checkout is present. Every other test runs in CI same as always.
+        run: cd email-ingestor-lib && npx vitest run --exclude tests/producer-health.test.js

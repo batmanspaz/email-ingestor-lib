@@ -7,6 +7,7 @@
 import fs from 'fs';
 import path from 'path';
 import { GmailClient } from './gmail.js';
+import { maskFrom, redact } from './mask.js';
 
 /**
  * Create a logger for an entity.
@@ -37,9 +38,10 @@ export function createLogger(entity, logPath) {
       append({
         op: 'message',
         messageId: meta.id,
-        from: GmailClient.getHeader(meta, 'From')?.slice(0, 120),
-        subject: GmailClient.getHeader(meta, 'Subject')?.slice(0, 120),
-        snippet: meta.snippet?.slice(0, 200),
+        // PII (SOC 2): mask sender, redact subject + body snippet before write.
+        from: maskFrom(GmailClient.getHeader(meta, 'From')),
+        subject: redact(GmailClient.getHeader(meta, 'Subject')),
+        snippet: redact(meta.snippet),
         ...extra,
       });
     },
@@ -48,8 +50,9 @@ export function createLogger(entity, logPath) {
       append({
         op: 'forward',
         messageId: meta.id,
-        from: GmailClient.getHeader(meta, 'From')?.slice(0, 80),
-        subject: GmailClient.getHeader(meta, 'Subject')?.slice(0, 80),
+        // PII (SOC 2): mask sender + redact subject before write.
+        from: maskFrom(GmailClient.getHeader(meta, 'From')),
+        subject: redact(GmailClient.getHeader(meta, 'Subject')),
         target,
         rule,
       });
