@@ -9,6 +9,8 @@
  *   shouldRunSluiceProducer — SLUICE_INTAKE comma-list resolver
  *   computeProducerStatus / reportProducerHealth / trackProducerRun —
  *     Sluice producer health + analytics contract (dev-rules.md Sec28)
+ *   createLocalFileTransport — @perfectcity/telemetry local-jsonl stand-in
+ *     transport, until the central ingest Worker is deployed
  */
 
 export { GmailClient } from './gmail.js';
@@ -18,3 +20,4 @@ export { createLogger } from './log.js';
 export { maskEmail, maskFrom, redact } from './mask.js';
 export { shouldRunSluiceProducer } from './sluice-flag.js';
 export { computeProducerStatus, reportProducerHealth, trackProducerRun } from './producer-health.js';
+export { createLocalFileTransport } from './sluice-local-transport.js';
