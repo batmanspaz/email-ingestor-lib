@@ -5,15 +5,22 @@
  * intake/src/lib/sluice-dispatch-health.js for the equivalent dispatcher-side
  * module this mirrors). TEST-FIRST, red before impl.
  *
- * Phase-0 invariant (dev-rules.md §28): every new producer module must
+ * Every sent body is validated against the package's own exported Zod schemas
+ * (HealthReportSchema / AnalyticsBatchSchema) rather than a hand-guessed shape.
+ * intake's own sluice-dispatch-health.test.js originally hand-guessed the
+ * analytics wire shape as `{ events: [...] }` and got it wrong (the real wire
+ * body is a BARE array of events) — validating against the real schema here
+ * makes that class of drift impossible to miss.
+ *
+ * Phase-0 invariant (dev-rules.md Sec28): every new producer module must
  * self-report health (ok/degraded/down, heartbeat-driven staleness) and emit
  * canonical PII-free analytics for its key run event. This is a from-scratch
  * shared module per the "rebuild, don't patch" standing preference — not a
  * retrofit onto any single entity's existing producer code.
  */
 
-import { describe, it, expect, vi } from 'vitest';
-import { createTelemetry } from '@perfectcity/telemetry';
+import { describe, it, expect } from 'vitest';
+import { createTelemetry, HealthReportSchema, AnalyticsBatchSchema } from '@perfectcity/telemetry';
 import { computeProducerStatus, reportProducerHealth, trackProducerRun } from '../producer-health.js';
 
 function fakeTransport() {
@@ -45,7 +52,7 @@ describe('computeProducerStatus', () => {
 });
 
 describe('reportProducerHealth', () => {
-  it('sends a passing health report tagged with the entity as the module name', async () => {
+  it('sends a passing health report tagged with the entity as the module name, valid against the real schema', async () => {
     const { sent, transport } = fakeTransport();
     const telemetry = createTelemetry({
       product: 'sluice',
@@ -57,10 +64,13 @@ describe('reportProducerHealth', () => {
       autoStart: false,
     });
     await reportProducerHealth(telemetry, { fetched: 3, produced: 3, errors: 0 });
+
     expect(sent.health.length).toBe(1);
-    expect(sent.health[0].status).toBe('ok');
-    expect(sent.health[0].module).toBe('producer.collagesoup');
-    const runCheck = sent.health[0].checks.find((c) => c.id === 'producer_run');
+    const report = sent.health[0];
+    expect(() => HealthReportSchema.parse(report)).not.toThrow();
+    expect(report.status).toBe('ok');
+    expect(report.module).toBe('producer.collagesoup');
+    const runCheck = report.checks.find((c) => c.id === 'producer_run');
     expect(runCheck.status).toBe('pass');
     expect(runCheck.metric).toBe(3);
   });
@@ -77,25 +87,55 @@ describe('reportProducerHealth', () => {
       autoStart: false,
     });
     await reportProducerHealth(telemetry, { fetched: 2, produced: 0, errors: 2 });
-    expect(sent.health[0].status).toBe('down');
-    expect(sent.health[0].checks.find((c) => c.id === 'producer_run').status).toBe('fail');
+    const report = sent.health[0];
+    expect(() => HealthReportSchema.parse(report)).not.toThrow();
+    expect(report.status).toBe('down');
+    expect(report.checks.find((c) => c.id === 'producer_run').status).toBe('fail');
   });
 });
 
 describe('trackProducerRun', () => {
-  it('emits a canonical run event with the entity id and counts, no PII', () => {
-    const track = vi.fn();
-    trackProducerRun({ track }, { entityId: 'collagesoup', fetched: 4, produced: 3, skipped: 1, errors: 0 });
-    expect(track).toHaveBeenCalledWith({
-      event: 'producer.run',
-      props: { entity_id: 'collagesoup', fetched: 4, produced: 3, skipped: 1, errors: 0 },
+  it('emits exactly one producer.run event with the entity id and counts, valid against the real schema', async () => {
+    const { sent, transport } = fakeTransport();
+    const telemetry = createTelemetry({
+      product: 'sluice',
+      module: 'producer.collagesoup',
+      version: 'test',
+      transport,
+      heartbeatMs: 0,
+      batchIntervalMs: 0,
+      autoStart: false,
+      batchSize: 1,
     });
+    trackProducerRun(telemetry, { entityId: 'collagesoup', fetched: 4, produced: 3, skipped: 1, errors: 0 });
+    await telemetry.flush();
+
+    expect(sent.analytics.length).toBe(1);
+    // The wire body IS the batch array — no { events: [...] } wrapper.
+    const batch = sent.analytics[0];
+    expect(() => AnalyticsBatchSchema.parse(batch)).not.toThrow();
+    expect(batch.length).toBe(1);
+    const event = batch[0];
+    expect(event.event).toBe('producer.run');
+    expect(event.props).toEqual({ entity_id: 'collagesoup', fetched: 4, produced: 3, skipped: 1, errors: 0 });
   });
 
-  it('never includes raw email addresses, subjects, or message bodies in props', () => {
-    const track = vi.fn();
-    trackProducerRun({ track }, { entityId: 'personal', fetched: 1, produced: 1, skipped: 0, errors: 0 });
-    const [{ props }] = track.mock.calls[0];
+  it('never includes raw email addresses, subjects, or message bodies in props', async () => {
+    const { sent, transport } = fakeTransport();
+    const telemetry = createTelemetry({
+      product: 'sluice',
+      module: 'producer.personal',
+      version: 'test',
+      transport,
+      heartbeatMs: 0,
+      batchIntervalMs: 0,
+      autoStart: false,
+      batchSize: 1,
+    });
+    trackProducerRun(telemetry, { entityId: 'personal', fetched: 1, produced: 1, skipped: 0, errors: 0 });
+    await telemetry.flush();
+
+    const props = sent.analytics[0][0].props;
     const serialized = JSON.stringify(props);
     expect(serialized).not.toMatch(/@/); // no email addresses
     expect(Object.keys(props).sort()).toEqual(['entity_id', 'errors', 'fetched', 'produced', 'skipped']);
