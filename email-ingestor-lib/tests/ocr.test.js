@@ -156,6 +156,63 @@ describe('ocr (shared email-ingestor-lib)', () => {
     expect(result.parsed).toBeNull();
   });
 
+  // ── Truncation recovery ──────────────────────────────────────────────────
+  // Real production bug (2026-07-05): a dense multi-page expense report hit
+  // max_tokens mid-generation, cutting the response off inside the raw_text
+  // string value with no closing quote/braces at all. JSON.parse threw, and
+  // the old fallback returned the ENTIRE raw API response (including the
+  // ```json fence) as rawText — polluting body_text/classification with JSON
+  // noise instead of the actual extracted document text.
+
+  it('requests a generous max_tokens budget so dense documents do not truncate', async () => {
+    mockCreate.mockResolvedValue(makeApiResponse(RECEIPT_RESPONSE));
+    await ocrImagePdf(Buffer.from('fake-pdf'), 'receipt.pdf');
+    const callArgs = mockCreate.mock.calls[0][0];
+    expect(callArgs.max_tokens).toBeGreaterThanOrEqual(8192);
+  });
+
+  it('recovers the partial raw_text when the response is truncated mid-string (no closing quote/braces)', async () => {
+    // Real shape: valid JSON prefix, cut off mid raw_text value, nothing closed.
+    const truncatedText = '```json\n{\n  "raw_text": "6/21/26, 12:23 PM   PerfectCity Expense Report\\n\\nPeriod: '
+      + 'January 1 – April 30, 2026 | Employee: Paul Steinberg';
+    mockCreate.mockResolvedValue({
+      content: [{ type: 'text', text: truncatedText }],
+      usage: { input_tokens: 5000, output_tokens: 2048 },
+      stop_reason: 'max_tokens',
+    });
+    const result = await ocrImagePdf(Buffer.from('fake-pdf'), 'expense-report.pdf');
+    expect(result).not.toBeNull();
+    expect(result.rawText).toContain('PerfectCity Expense Report');
+    expect(result.rawText).toContain('Paul Steinberg');
+    expect(result.rawText).not.toContain('```json');
+    expect(result.rawText).not.toContain('"raw_text"');
+    // Recovered text is unescaped (real newlines, not literal backslash-n)
+    expect(result.rawText).toContain('\n\n');
+    expect(result.structured).toBeNull();
+    expect(result.parsed).toBeNull();
+  });
+
+  it('recovers partial raw_text even when the field value contains an escaped quote', async () => {
+    const truncatedText = '{\n  "raw_text": "Invoice for \\"Acme Corp\\" — line item';
+    mockCreate.mockResolvedValue({
+      content: [{ type: 'text', text: truncatedText }],
+      usage: { input_tokens: 1000, output_tokens: 2048 },
+      stop_reason: 'max_tokens',
+    });
+    const result = await ocrImagePdf(Buffer.from('fake-pdf'), 'invoice.pdf');
+    expect(result.rawText).toBe('Invoice for "Acme Corp" — line item');
+  });
+
+  it('still falls back to the full raw response when no raw_text field can be recovered at all', async () => {
+    mockCreate.mockResolvedValue({
+      content: [{ type: 'text', text: 'The model just rambled with no JSON structure whatsoever, partial or otherwise.' }],
+      usage: { input_tokens: 500, output_tokens: 2048 },
+      stop_reason: 'max_tokens',
+    });
+    const result = await ocrImagePdf(Buffer.from('fake-pdf'), 'garbled.pdf');
+    expect(result.rawText).toContain('rambled with no JSON structure');
+  });
+
   // ── Prompt coverage ──────────────────────────────────────────────────────
 
   it('sends the universal prompt containing all required field names', async () => {

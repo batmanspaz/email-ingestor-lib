@@ -16,6 +16,11 @@
 import Anthropic from '@anthropic-ai/sdk';
 
 const MAX_FILE_SIZE = 30 * 1024 * 1024; // 30MB
+// Real production bug (2026-07-05): a dense multi-page expense report hit the
+// old 2048-token cap mid-generation, truncating the response inside the
+// raw_text string value. Bumped generously — verbatim extraction of a
+// multi-page document plus every structured field easily exceeds 2048 tokens.
+const MAX_OUTPUT_TOKENS = 8192;
 let client = null;
 
 function getClient() {
@@ -65,36 +70,74 @@ Return ONLY valid JSON (no markdown, no explanation):
 
 All fields not applicable to this document type should be null (or [] for arrays).`;
 
+// Minimal JSON string unescaping for a partially-recovered (unterminated)
+// string value — recoverPartialRawText below extracts a raw_text value that
+// JSON.parse never got to see, so its escape sequences need manual decoding.
+function unescapeJsonString(s) {
+  return s
+    .replace(/\\n/g, '\n')
+    .replace(/\\r/g, '\r')
+    .replace(/\\t/g, '\t')
+    .replace(/\\"/g, '"')
+    .replace(/\\\\/g, '\\');
+}
+
+// Best-effort recovery of just the raw_text field's value from a response
+// that failed full JSON.parse — most commonly because the model's output was
+// cut off mid-generation (hit max_tokens) before the JSON object closed.
+// Tolerant of an unterminated (missing closing quote) string value: matches
+// as far as it can before hitting an unescaped quote or the end of input.
+// Returns the recovered string, or null if no raw_text field is found at all.
+function recoverPartialRawText(text) {
+  const m = text.match(/"raw_text"\s*:\s*"((?:[^"\\]|\\.)*)/);
+  if (!m) return null;
+  return unescapeJsonString(m[1]);
+}
+
 /**
  * Parse the raw Haiku response text into a structured result object.
  * Maintains backward compatibility: always populates rawText, structured (for receipts).
+ *
+ * Three-tier fallback when the response isn't valid JSON (most commonly a
+ * dense document truncating mid-generation at max_tokens):
+ *   1. Full JSON.parse succeeds → structured + parsed fields all populated.
+ *   2. JSON.parse fails, but a raw_text field value is still recoverable
+ *      (even unterminated) → salvage just that, no structured/parsed data.
+ *   3. Nothing resembling raw_text is found at all → last resort, the whole
+ *      raw response text (this is the "the model just rambled" case, not
+ *      the truncation case — genuinely no extracted text to salvage).
  */
-function parseOcrResponse(text, filename, log) {
+function parseOcrResponse(text, filename, log, { truncated = false } = {}) {
+  const truncNote = truncated ? ' (response truncated at max_tokens)' : '';
   const jsonMatch = text.match(/\{[\s\S]*\}/);
-  if (!jsonMatch) {
-    log.warn(`OCR response not valid JSON for ${filename}, using raw response as text`);
-    return { rawText: text, structured: null, parsed: null };
+
+  if (jsonMatch) {
+    try {
+      const parsed = JSON.parse(jsonMatch[0]);
+      const rawText = parsed.raw_text || text;
+      const structured = parsed.is_receipt ? {
+        vendor: parsed.vendor || parsed.sender_name,
+        amount: parsed.amount || parsed.amount_owed,
+        currency: parsed.currency || 'USD',
+        date: parsed.date,
+        line_items: parsed.line_items || [],
+      } : null;
+      return { rawText, structured, parsed };
+    } catch (err) {
+      log.warn(`OCR JSON parse failed for ${filename}${truncNote}: ${err.message}`);
+    }
+  } else {
+    log.warn(`OCR response not valid JSON for ${filename}${truncNote}, attempting partial recovery`);
   }
 
-  let parsed;
-  try {
-    parsed = JSON.parse(jsonMatch[0]);
-  } catch (err) {
-    log.warn(`OCR JSON parse failed for ${filename}: ${err.message}`);
-    return { rawText: text, structured: null, parsed: null };
+  const partial = recoverPartialRawText(text);
+  if (partial) {
+    log.warn(`OCR: recovered partial raw_text for ${filename} from an incomplete/malformed response (${partial.length} chars)`);
+    return { rawText: partial, structured: null, parsed: null };
   }
 
-  const rawText = parsed.raw_text || text;
-
-  const structured = parsed.is_receipt ? {
-    vendor: parsed.vendor || parsed.sender_name,
-    amount: parsed.amount || parsed.amount_owed,
-    currency: parsed.currency || 'USD',
-    date: parsed.date,
-    line_items: parsed.line_items || [],
-  } : null;
-
-  return { rawText, structured, parsed };
+  log.warn(`OCR: no raw_text recoverable for ${filename}, using full raw response as text`);
+  return { rawText: text, structured: null, parsed: null };
 }
 
 /**
@@ -122,7 +165,7 @@ export async function ocrImagePdf(pdfBuffer, filename, opts = {}) {
     const anthropic = getClient();
     const response = await anthropic.messages.create({
       model: 'claude-haiku-4-5-20251001',
-      max_tokens: 2048,
+      max_tokens: MAX_OUTPUT_TOKENS,
       messages: [{
         role: 'user',
         content: [
@@ -147,7 +190,8 @@ export async function ocrImagePdf(pdfBuffer, filename, opts = {}) {
     log.info(`OCR cost: $${(cost || 0).toFixed(4)} — ${filename}`);
 
     const text = response.content[0]?.text || '';
-    const { rawText, structured, parsed } = parseOcrResponse(text, filename, log);
+    const truncated = response.stop_reason === 'max_tokens';
+    const { rawText, structured, parsed } = parseOcrResponse(text, filename, log, { truncated });
 
     return { rawText, structured, parsed, usage, cost };
   } catch (err) {
@@ -190,7 +234,7 @@ export async function ocrImage(imageBuffer, filename, ext, opts = {}) {
     const anthropic = getClient();
     const response = await anthropic.messages.create({
       model: 'claude-haiku-4-5-20251001',
-      max_tokens: 2048,
+      max_tokens: MAX_OUTPUT_TOKENS,
       messages: [{
         role: 'user',
         content: [
@@ -215,7 +259,8 @@ export async function ocrImage(imageBuffer, filename, ext, opts = {}) {
     log.info(`Image OCR cost: $${(cost || 0).toFixed(4)} — ${filename}`);
 
     const text = response.content[0]?.text || '';
-    const { rawText, structured, parsed } = parseOcrResponse(text, filename, log);
+    const truncated = response.stop_reason === 'max_tokens';
+    const { rawText, structured, parsed } = parseOcrResponse(text, filename, log, { truncated });
 
     return { rawText, structured, parsed, usage, cost };
   } catch (err) {
