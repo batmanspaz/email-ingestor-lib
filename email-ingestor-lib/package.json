@@ -8,6 +8,7 @@
     "test": "vitest run"
   },
   "dependencies": {
+    "@anthropic-ai/sdk": "^0.107.0",
     "dotenv": "^17.4.2",
     "googleapis": "^173.0.0"
   },
