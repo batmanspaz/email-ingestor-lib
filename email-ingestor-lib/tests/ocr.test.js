@@ -94,6 +94,51 @@ const COLLECTION_NOTICE_RESPONSE = {
   line_items: [],
 };
 
+// Plan 1 Phase 3 (Sluice, 2026-07-13): a bank/investment account statement
+// has no single "amount owed/paid" — it's a periodic balance snapshot. The
+// prompt previously had no fields for this at all (confirmed by reading it
+// directly before this change), so a real Schwab statement would extract
+// nothing useful even with is_receipt correctly false. Additive only —
+// every existing field/behavior above is unchanged.
+const STATEMENT_RESPONSE = {
+  raw_text: 'CHARLES SCHWAB\nIRA Account Statement\nApril 1-30, 2026\nBeginning Value: $196,667.35\nEnding Value: $212,493.63',
+  document_type: 'financial_statement',
+  sender_name: 'Charles Schwab & Co Inc',
+  sender_address: null,
+  sender_phone: null,
+  sender_email: null,
+  recipient_name: 'Paul Steinberg',
+  recipient_address: null,
+  date: '2026-04-30',
+  reference_number: '...8814',
+  amount_owed: null,
+  amount_paid: null,
+  due_date: null,
+  service_date: null,
+  creditor_name: null,
+  collection_agency: null,
+  patient_name: null,
+  provider_name: null,
+  legal_deadline: null,
+  is_collection_notice: false,
+  is_medical: false,
+  is_legal: false,
+  is_receipt: false,
+  requires_response: false,
+  urgency: 'low',
+  signals: ['financial'],
+  summary: 'Charles Schwab IRA account statement for April 2026.',
+  vendor: null,
+  amount: null,
+  currency: 'USD',
+  line_items: [],
+  statement_period: 'April 1-30, 2026',
+  beginning_value: 196667.35,
+  ending_value: 212493.63,
+  period_gain_loss: 15826.28,
+  account_last_four: '8814',
+};
+
 function makeApiResponse(payload) {
   return {
     content: [{ type: 'text', text: JSON.stringify(payload) }],
@@ -239,6 +284,38 @@ describe('ocr (shared email-ingestor-lib)', () => {
     expect(promptText).toContain('medical_bill');
     expect(promptText).toContain('eob');
     expect(promptText).toContain('legal_document');
+    // Plan 1 Phase 3: statement-specific fields, additive.
+    for (const field of ['statement_period', 'beginning_value', 'ending_value', 'period_gain_loss', 'account_last_four']) {
+      expect(promptText, `prompt missing field: ${field}`).toContain(field);
+    }
+    expect(promptText).toContain('financial_statement');
+    expect(promptText).toContain('bank_statement');
+  });
+
+  // ── Statement parsing (Plan 1 Phase 3) ───────────────────────────────────
+
+  it('parses a bank/investment statement — beginning/ending value and period gain, structured stays null (not a receipt)', async () => {
+    mockCreate.mockResolvedValue(makeApiResponse(STATEMENT_RESPONSE));
+    const result = await ocrImagePdf(Buffer.from('fake-pdf'), 'schwab-statement.pdf');
+
+    expect(result).not.toBeNull();
+    expect(result.rawText).toContain('CHARLES SCHWAB');
+    expect(result.structured).toBeNull(); // is_receipt is false — not receipt-shaped
+    const p = result.parsed;
+    expect(p.document_type).toBe('financial_statement');
+    expect(p.beginning_value).toBe(196667.35);
+    expect(p.ending_value).toBe(212493.63);
+    expect(p.period_gain_loss).toBe(15826.28);
+    expect(p.statement_period).toBe('April 1-30, 2026');
+    expect(p.account_last_four).toBe('8814');
+    expect(p.sender_name).toBe('Charles Schwab & Co Inc');
+  });
+
+  it('a non-statement document simply has null/undefined statement fields — no crash, no spurious values', async () => {
+    mockCreate.mockResolvedValue(makeApiResponse(RECEIPT_RESPONSE));
+    const result = await ocrImagePdf(Buffer.from('fake-pdf'), 'receipt.pdf');
+    expect(result.parsed.beginning_value ?? null).toBeNull();
+    expect(result.parsed.ending_value ?? null).toBeNull();
   });
 
   // ── Receipt parsing ──────────────────────────────────────────────────────
