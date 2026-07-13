@@ -65,7 +65,12 @@ Return ONLY valid JSON (no markdown, no explanation):
   "vendor": "vendor or store name for receipts/invoices, or null",
   "amount": total transaction amount as a number for receipts/invoices or null,
   "currency": "USD" or other currency code,
-  "line_items": [{"description": "item description", "amount": 0.00}] or []
+  "line_items": [{"description": "item description", "amount": 0.00}] or [],
+  "statement_period": "the statement's covered period as free text (e.g. 'April 1-30, 2026'), for financial_statement/bank_statement documents only, or null",
+  "beginning_value": "for financial_statement/bank_statement documents: the account's total value/balance at the START of the statement period, as a number, or null",
+  "ending_value": "for financial_statement/bank_statement documents: the account's total value/balance at the END of the statement period, as a number, or null",
+  "period_gain_loss": "for financial_statement/bank_statement documents: the net gain or loss over the period if explicitly stated (may be negative), as a number, or null",
+  "account_last_four": "the last 4 digits of the account number, if shown, or null"
 }
 
 All fields not applicable to this document type should be null (or [] for arrays).`;
