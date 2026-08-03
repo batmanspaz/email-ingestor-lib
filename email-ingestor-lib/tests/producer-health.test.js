@@ -19,9 +19,24 @@
  * retrofit onto any single entity's existing producer code.
  */
 
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach } from 'vitest';
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
 import { createTelemetry, HealthReportSchema, AnalyticsBatchSchema } from '@perfectcity/telemetry';
 import { computeProducerStatus, reportProducerHealth, trackProducerRun } from '../producer-health.js';
+
+// Healthy on-disk sluice fixture (empty inbox) so reportProducerHealth's
+// queue.depth check is deterministic — never dependent on the shell's
+// SLUICE_DIR or the machine's real queue state.
+let sluiceDir;
+beforeEach(() => {
+  sluiceDir = fs.mkdtempSync(path.join(os.tmpdir(), 'producer-health-sluice-'));
+  fs.mkdirSync(path.join(sluiceDir, 'inbox'));
+});
+afterEach(() => {
+  fs.rmSync(sluiceDir, { recursive: true, force: true });
+});
 
 function fakeTransport() {
   const sent = { health: [], analytics: [] };
@@ -63,7 +78,7 @@ describe('reportProducerHealth', () => {
       batchIntervalMs: 0,
       autoStart: false,
     });
-    await reportProducerHealth(telemetry, { fetched: 3, produced: 3, errors: 0 });
+    await reportProducerHealth(telemetry, { fetched: 3, produced: 3, errors: 0 }, { sluiceDir });
 
     expect(sent.health.length).toBe(1);
     const report = sent.health[0];
@@ -73,6 +88,11 @@ describe('reportProducerHealth', () => {
     const runCheck = report.checks.find((c) => c.id === 'producer_run');
     expect(runCheck.status).toBe('pass');
     expect(runCheck.metric).toBe(3);
+    // 2026-08-02 outage lesson: the report must ALWAYS carry queue.depth,
+    // not just producer_run.
+    const queueCheck = report.checks.find((c) => c.id === 'queue.depth');
+    expect(queueCheck.status).toBe('pass');
+    expect(queueCheck.metric).toBe(0);
   });
 
   it('sends a failing health report when every item errored', async () => {
@@ -86,11 +106,59 @@ describe('reportProducerHealth', () => {
       batchIntervalMs: 0,
       autoStart: false,
     });
-    await reportProducerHealth(telemetry, { fetched: 2, produced: 0, errors: 2 });
+    await reportProducerHealth(telemetry, { fetched: 2, produced: 0, errors: 2 }, { sluiceDir });
     const report = sent.health[0];
     expect(() => HealthReportSchema.parse(report)).not.toThrow();
     expect(report.status).toBe('down');
     expect(report.checks.find((c) => c.id === 'producer_run').status).toBe('fail');
+  });
+
+  it('degrades the OVERALL status when the producer ran fine but the queue is stalled (the 2026-08-02 outage shape)', async () => {
+    // Reconstruct the outage: producer runs green, but the oldest queued
+    // envelope is >24h old because nothing consumes. The old report said
+    // status:"ok" here for ten days straight.
+    const stale = new Date(Date.now() - 25 * 60 * 60 * 1000);
+    const staleEnv = path.join(sluiceDir, 'inbox', 'stale-envelope');
+    fs.mkdirSync(staleEnv);
+    fs.utimesSync(staleEnv, stale, stale);
+
+    const { sent, transport } = fakeTransport();
+    const telemetry = createTelemetry({
+      product: 'sluice',
+      module: 'producer.perfectcity',
+      version: 'test',
+      transport,
+      heartbeatMs: 0,
+      batchIntervalMs: 0,
+      autoStart: false,
+    });
+    await reportProducerHealth(telemetry, { fetched: 3, produced: 3, errors: 0 }, { sluiceDir });
+
+    const report = sent.health[0];
+    expect(() => HealthReportSchema.parse(report)).not.toThrow();
+    expect(report.checks.find((c) => c.id === 'producer_run').status).toBe('pass');
+    expect(report.checks.find((c) => c.id === 'queue.depth').status).toBe('fail');
+    expect(report.status).toBe('down');
+  });
+
+  it('reports queue.depth as fail — never green — when the sluice dir is unconfigured', async () => {
+    // HOUSE RULE: an unconfigured dependency must degrade a health check.
+    const { sent, transport } = fakeTransport();
+    const telemetry = createTelemetry({
+      product: 'sluice',
+      module: 'producer.collagesoup',
+      version: 'test',
+      transport,
+      heartbeatMs: 0,
+      batchIntervalMs: 0,
+      autoStart: false,
+    });
+    await reportProducerHealth(telemetry, { fetched: 1, produced: 1, errors: 0 }, { sluiceDir: null });
+
+    const report = sent.health[0];
+    expect(() => HealthReportSchema.parse(report)).not.toThrow();
+    expect(report.checks.find((c) => c.id === 'queue.depth').status).toBe('fail');
+    expect(report.status).toBe('down');
   });
 });
 
