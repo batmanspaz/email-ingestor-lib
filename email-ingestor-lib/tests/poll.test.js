@@ -28,9 +28,10 @@ afterEach(() => {
   fs.rmSync(tmpDir, { recursive: true, force: true });
 });
 
-function makeMeta({ id, messageId, from = 'Sender <s@example.com>', subject = 'Test' }) {
+function makeMeta({ id, messageId, from = 'Sender <s@example.com>', subject = 'Test', labelIds = ['INBOX', 'UNREAD'] }) {
   return {
     id,
+    labelIds,
     snippet: '',
     payload: {
       headers: [
@@ -151,25 +152,21 @@ describe('poll — normal run', () => {
     expect(stats.processed).toBe(1);
   });
 
-  it('does NOT advance the cursor past unprocessed overflow; next run drains the remainder', async () => {
-    // 3 new messages, maxPerRun = 2 → m3 is the capped overflow.
-    // The mailbox window is modelled as the set of *undrained* INBOX ids
-    // (mirrors archiveAfterProcess shrinking the history window), and is
-    // only returned while the cursor is still parked at the old historyId.
+  it('drains overflow across runs WITHOUT reprocessing (window does not shrink — producers no longer archive)', async () => {
+    // 3 new messages, maxPerRun = 2. Under the single-writer contract nothing
+    // leaves INBOX between runs, so getHistory returns the SAME window while
+    // the cursor is parked. The durable processed-ring must prevent the
+    // 2026-08-04 dup-storm (same first batch re-enveloped every run, forever).
     const metaById = {
       m1: makeMeta({ id: 'm1' }),
       m2: makeMeta({ id: 'm2' }),
       m3: makeMeta({ id: 'm3' }),
     };
-    const drained = new Set();
     const client = {
       account: 'a@example.com',
       getCurrentHistoryId: vi.fn().mockResolvedValue('3000'),
-      getHistory: vi.fn().mockImplementation(async (startId) => {
-        // Once the cursor advances past the window, the overflow is stranded.
-        if (startId !== '2000') return [];
-        return ['m1', 'm2', 'm3'].filter(id => !drained.has(id));
-      }),
+      getHistory: vi.fn().mockImplementation(async (startId) =>
+        startId === '2000' ? ['m1', 'm2', 'm3'] : []),
       fetchMetadata: vi.fn().mockImplementation(async id => metaById[id]),
       _gmail: { users: { messages: { batchModify: vi.fn().mockResolvedValue({}) } } },
     };
@@ -178,20 +175,56 @@ describe('poll — normal run', () => {
     const processed = [];
     const handler = vi.fn().mockImplementation(async (meta) => {
       processed.push(meta.id);
-      drained.add(meta.id);
       return 'processed';
     });
 
-    // Run 1 — only the first 2 fit; the cursor MUST stay put so m3 isn't lost.
+    // Run 1 — first 2 fit; cursor parks; ring records m1+m2 durably.
     await poll({ clients: [{ client, label: 'A' }], statePath, maxPerRun: 2 }, handler);
     expect(processed).toEqual(['m1', 'm2']);
     expect(readStateFile().accounts['a@example.com'].lastHistoryId).toBe('2000');
+    expect(readStateFile().accounts['a@example.com'].processedIds).toEqual(['m1', 'm2']);
 
-    // Run 2 — same cursor, window now surfaces the deferred m3.
+    // Run 2 — SAME window returned; ring skips m1+m2; only m3 processed; cursor advances.
     await poll({ clients: [{ client, label: 'A' }], statePath, maxPerRun: 2 }, handler);
-    expect(processed).toContain('m3'); // overflow eventually processed — no mail lost
-    // Everything fit this time, so the cursor finally advances.
+    expect(processed).toEqual(['m1', 'm2', 'm3']); // no duplicates, no loss
     expect(readStateFile().accounts['a@example.com'].lastHistoryId).toBe('3000');
+
+    // Run 3 — cursor advanced; nothing new; handler untouched.
+    await poll({ clients: [{ client, label: 'A' }], statePath, maxPerRun: 2 }, handler);
+    expect(handler).toHaveBeenCalledTimes(3);
+  });
+
+  it('screens SENT/DRAFT/SPAM/TRASH out of the widened history window (labelId filter removed)', async () => {
+    const messages = [
+      makeMeta({ id: 'in1' }),
+      makeMeta({ id: 's1', labelIds: ['SENT'] }),
+      makeMeta({ id: 'sp1', labelIds: ['SPAM', 'UNREAD'] }),
+      makeMeta({ id: 'arch1', labelIds: ['UNREAD'] }), // archived by triage — MUST still be enveloped
+    ];
+    const client = makeClient({ messages });
+    seedState({ 'a@example.com': { lastHistoryId: '2000' } });
+
+    const handler = vi.fn().mockResolvedValue('processed');
+    await poll({ clients: [{ client, label: 'A' }], statePath }, handler);
+
+    const handled = handler.mock.calls.map(c => c[0].id);
+    expect(handled).toEqual(['in1', 'arch1']);
+    // screened ids land in the ring so they are never refetched
+    expect(readStateFile().accounts['a@example.com'].processedIds).toEqual(
+      expect.arrayContaining(['s1', 'sp1', 'in1', 'arch1']));
+  });
+
+  it('bounds the processed ring', async () => {
+    const messages = Array.from({ length: 30 }, (_, i) => makeMeta({ id: 'm' + i }));
+    const client = makeClient({ messages });
+    seedState({ 'a@example.com': { lastHistoryId: '2000', processedIds: Array.from({ length: 995 }, (_, i) => 'old' + i) } });
+
+    await poll({ clients: [{ client, label: 'A' }], statePath }, vi.fn().mockResolvedValue('processed'));
+
+    const ring = readStateFile().accounts['a@example.com'].processedIds;
+    expect(ring.length).toBeLessThanOrEqual(1000);
+    expect(ring).toContain('m29');       // newest kept
+    expect(ring).not.toContain('old0');  // oldest evicted
   });
 
   it('caps messages at maxPerRun', async () => {

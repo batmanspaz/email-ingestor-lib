@@ -126,11 +126,14 @@ export class GmailClient {
 
     try {
       do {
+        // No labelId filter (2026-08-04): history.list's labelId reflects
+        // CURRENT labels, so triage-archived mail silently vanished from the
+        // window before ever being enveloped. poll.js screens SENT/DRAFT/
+        // SPAM/TRASH per message instead.
         const res = await withRetry(() => this._gmail.users.history.list({
           userId: 'me',
           startHistoryId,
           historyTypes: ['messageAdded'],
-          labelId: 'INBOX',
           maxResults: 500,
           pageToken: pageToken || undefined,
         }), `${this.account}:history.list`);
