@@ -9,11 +9,9 @@
   },
   "dependencies": {
     "@anthropic-ai/sdk": "^0.107.0",
+    "@perfectcity/telemetry": "github:batmanspaz/telemetry",
     "dotenv": "^17.4.2",
     "googleapis": "^173.0.0"
-  },
-  "optionalDependencies": {
-    "@perfectcity/telemetry": "file:../telemetry"
   },
   "devDependencies": {
     "vitest": "^4.1.9"
