@@ -171,6 +171,12 @@ export async function ocrImagePdf(pdfBuffer, filename, opts = {}) {
     const response = await anthropic.messages.create({
       model: 'claude-haiku-4-5-20251001',
       max_tokens: MAX_OUTPUT_TOKENS,
+      // No cache_control on UNIVERSAL_PROMPT despite it being identical every
+      // call: it's ~850 tokens, well under Haiku 4.5's real 4096-token cache
+      // minimum (audited 2026-08-09 as part of a portfolio-wide caching pass).
+      // Wrapping it in cache_control here would be silently ignored by the
+      // API -- do not "fix" this without first re-measuring the prompt if it
+      // ever grows past ~4096 tokens.
       messages: [{
         role: 'user',
         content: [
@@ -240,6 +246,9 @@ export async function ocrImage(imageBuffer, filename, ext, opts = {}) {
     const response = await anthropic.messages.create({
       model: 'claude-haiku-4-5-20251001',
       max_tokens: MAX_OUTPUT_TOKENS,
+      // Same UNIVERSAL_PROMPT, same reasoning as ocrImagePdf above: ~850
+      // tokens is under Haiku 4.5's real 4096-token cache minimum, so no
+      // cache_control here either (audited 2026-08-09).
       messages: [{
         role: 'user',
         content: [
