@@ -171,12 +171,27 @@ export async function ocrImagePdf(pdfBuffer, filename, opts = {}) {
     const response = await anthropic.messages.create({
       model: 'claude-haiku-4-5-20251001',
       max_tokens: MAX_OUTPUT_TOKENS,
-      // No cache_control on UNIVERSAL_PROMPT despite it being identical every
-      // call: it's ~850 tokens, well under Haiku 4.5's real 4096-token cache
-      // minimum (audited 2026-08-09 as part of a portfolio-wide caching pass).
-      // Wrapping it in cache_control here would be silently ignored by the
-      // API -- do not "fix" this without first re-measuring the prompt if it
-      // ever grows past ~4096 tokens.
+      // No cache_control here -- and DO NOT add one just because UNIVERSAL_PROMPT
+      // grows, without also reordering the content array. This was gotten
+      // wrong once already (2026-08-09): the original version of this comment
+      // said caching would be "silently ignored" because the prompt alone
+      // measures ~946 tokens (exact-tokenizer count, corrected from an
+      // earlier ~850 char/4 estimate), under Haiku 4.5's 4096 floor. That's
+      // true for the prompt ALONE, but caching is a PREFIX match, and the
+      // document block comes FIRST below -- a cache_control breakpoint here
+      // would cover document+prompt together, and a dense multi-page PDF
+      // routinely pushes that combined prefix past 4096 on its own (measured:
+      // a trivial 5KB single-page PDF is already ~2519 tokens). So a
+      // cache_control WOULD be honored by the API -- and would be actively
+      // WASTEFUL, since the document differs every call (paying the 1.25x
+      // cache-write premium for a cache that's read zero times). The real
+      // blocker is block order (document before prompt), not prompt size.
+      // Fixing this for real would mean moving UNIVERSAL_PROMPT to a separate
+      // `system` param ahead of the per-call document, THEN caching that.
+      // Watch item: UNIVERSAL_PROMPT itself grew 28% in one commit (e42b4e4,
+      // ~740->946 tokens) and already exceeds Opus 5/Fable 5's 512-token
+      // floor -- if this ever moves off Haiku, re-measure before assuming
+      // nothing changed.
       messages: [{
         role: 'user',
         content: [
