@@ -11,7 +11,15 @@ const mockCreate = vi.fn();
 vi.mock('@anthropic-ai/sdk', () => {
   class MockAnthropic {
     constructor() {
-      this.messages = { create: mockCreate };
+      // ocr.js calls messages.stream(...).finalMessage() (streaming is required
+      // above ~16k max_tokens — the SDK throws outright on a non-streaming call
+      // that could exceed its 10-minute ceiling). The stream mock delegates to
+      // mockCreate so every request-shape assertion below reads the same call
+      // record regardless of which transport the module uses.
+      this.messages = {
+        create: mockCreate,
+        stream: (...args) => ({ finalMessage: () => mockCreate(...args) }),
+      };
     }
   }
   return { default: MockAnthropic };
@@ -194,18 +202,34 @@ describe('ocr (shared email-ingestor-lib)', () => {
     expect(sentPdf.source.data).toBe(trimmed.toString('base64'));
     expect(result).not.toBeNull();
     expect(result.ocrPartial).toBe(true);
-    expect(result.ocrPagesExtracted).toBe(3);
+    expect(result.ocrPagesExtracted).toBe(20);
     expect(result.ocrPagesTotal).toBe(78);
   });
 
-  it('reports totalPages as extracted-page-count when the splitter cannot determine the real total', async () => {
+  it('asks the splitter for the full page budget, and reports back what it actually got', async () => {
+    // The splitter is size-adaptive: a scanner producing ~0.8MB/page can't fit
+    // 20 pages under the 30MB cap, so it steps down and reports the count it
+    // landed on. The result must reflect the real extracted count, not the
+    // requested ceiling — otherwise a digest saying "20 of 78 pages" would be
+    // a lie about a document nobody re-reads.
+    const bigBuffer = Buffer.alloc(59 * 1024 * 1024);
+    const pdfSplitter = vi.fn(async () => ({ buffer: Buffer.from('trimmed'), totalPages: 78, pagesExtracted: 8 }));
+    mockCreate.mockResolvedValue(makeApiResponse(RECEIPT_RESPONSE));
+
+    const result = await ocrImagePdf(bigBuffer, 'scan.pdf', { pdfSplitter });
+    expect(pdfSplitter.mock.calls[0][1]).toEqual({ lastPage: 20, maxBytes: 30 * 1024 * 1024 });
+    expect(result.ocrPagesExtracted).toBe(8);
+    expect(result.ocrPagesTotal).toBe(78);
+  });
+
+  it('reports totalPages as null when the splitter cannot determine the real total', async () => {
     const bigBuffer = Buffer.alloc(59 * 1024 * 1024);
     const pdfSplitter = vi.fn(async () => ({ buffer: Buffer.from('trimmed'), totalPages: null }));
     mockCreate.mockResolvedValue(makeApiResponse(RECEIPT_RESPONSE));
 
     const result = await ocrImagePdf(bigBuffer, 'scan.pdf', { pdfSplitter });
     expect(result.ocrPagesTotal).toBeNull();
-    expect(result.ocrPagesExtracted).toBe(3);
+    expect(result.ocrPagesExtracted).toBe(20);
   });
 
   it('falls back to null when the split buffer is still over the cap (dense first pages) — never calls the API', async () => {
@@ -299,10 +323,16 @@ describe('ocr (shared email-ingestor-lib)', () => {
   // noise instead of the actual extracted document text.
 
   it('requests a generous max_tokens budget so dense documents do not truncate', async () => {
+    // Raised 8192 -> 32000 on 2026-08-16 after measuring a real 78-page scan:
+    // ~1,067 output tokens/page means a 15-page extract truncates at 16k, and
+    // truncation destroys the structured fields (document_type/date/amount)
+    // entirely — parseOcrResponse can only salvage partial raw_text. Haiku 4.5
+    // supports 64k output, so 32000 leaves ~10 pages of headroom past the
+    // 20-page cap. Requires streaming (see the mock's note).
     mockCreate.mockResolvedValue(makeApiResponse(RECEIPT_RESPONSE));
     await ocrImagePdf(Buffer.from('fake-pdf'), 'receipt.pdf');
     const callArgs = mockCreate.mock.calls[0][0];
-    expect(callArgs.max_tokens).toBeGreaterThanOrEqual(8192);
+    expect(callArgs.max_tokens).toBeGreaterThanOrEqual(32000);
   });
 
   it('recovers the partial raw_text when the response is truncated mid-string (no closing quote/braces)', async () => {

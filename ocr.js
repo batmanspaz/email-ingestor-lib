@@ -24,12 +24,19 @@ const MAX_FILE_SIZE = 30 * 1024 * 1024; // 30MB
 // old 2048-token cap mid-generation, truncating the response inside the
 // raw_text string value. Bumped generously — verbatim extraction of a
 // multi-page document plus every structured field easily exceeds 2048 tokens.
-const MAX_OUTPUT_TOKENS = 8192;
+// 32000, not 8192: measured against a real 78-page scan at ~1,067 output
+// tokens/page, a 15-page extract truncates at 16k — and truncation destroys
+// the structured fields outright (parseOcrResponse can only salvage partial
+// raw_text, leaving document_type/date/amount null). max_tokens is a ceiling,
+// not a target, so headroom is free unless used. Haiku 4.5 caps at 64k output.
+const MAX_OUTPUT_TOKENS = 32000;
 // Real incident (2026-08-16): a 78-page, 59MB scanner batch sat unprocessed
 // forever — MAX_FILE_SIZE rejected it outright with no retry. Classification
-// only needs the first few pages, not the whole document, so an oversized PDF
-// gets exactly one retry on just its first N pages before giving up for real.
-const OVERSIZED_PDF_PAGE_LIMIT = 3;
+// only needs the first pages, not the whole document, so an oversized PDF gets
+// exactly one retry on just its first N pages before giving up for real.
+// 20 pages ≈ 21k output tokens, comfortably inside MAX_OUTPUT_TOKENS; the
+// splitter steps this down further when the pages themselves are too large.
+const OVERSIZED_PDF_PAGE_LIMIT = 20;
 let client = null;
 
 function getClient() {
@@ -50,28 +57,37 @@ const NOOP_LOG = { info() {}, warn() {}, error() {} };
  * to a real process — same posture as document-drop-producer.js's injected
  * ocr/pdfParse deps.
  */
-function defaultPdfSplitter(buffer, { lastPage }) {
+function defaultPdfSplitter(buffer, { lastPage, maxBytes }) {
   let dir;
   try {
     dir = mkdtempSync(join(tmpdir(), 'ocr-split-'));
     const inPath = join(dir, 'in.pdf');
-    const outPath = join(dir, 'out.pdf');
     writeFileSync(inPath, buffer);
-    execFileSync('gs', [
-      '-sDEVICE=pdfwrite', '-dNOPAUSE', '-dBATCH', '-dQUIET',
-      '-dFirstPage=1', `-dLastPage=${lastPage}`,
-      `-sOutputFile=${outPath}`, inPath,
-    ], { stdio: 'pipe' });
-    const trimmed = readFileSync(outPath);
 
     let totalPages = null;
     try {
       const info = execFileSync('pdfinfo', [inPath], { stdio: 'pipe' }).toString();
       const m = info.match(/^Pages:\s*(\d+)/m);
       if (m) totalPages = parseInt(m[1], 10);
-    } catch { /* best-effort only — trimmed buffer is still usable without a total */ }
+    } catch { /* best-effort only — a trimmed buffer is still usable without a total */ }
 
-    return { buffer: trimmed, totalPages };
+    // Page count and byte size are independent limits: a text PDF fits 20 pages
+    // in a few MB, while a 600dpi scan runs ~0.8MB/page and blows the cap around
+    // 35. Rather than guess a single safe page count for every document, step
+    // down until the extract actually fits — measured, not assumed.
+    for (const pages of [lastPage, 12, 8, 5, 3].filter((p, i, a) => p <= lastPage && a.indexOf(p) === i)) {
+      const outPath = join(dir, `out-${pages}.pdf`);
+      execFileSync('gs', [
+        '-sDEVICE=pdfwrite', '-dNOPAUSE', '-dBATCH', '-dQUIET',
+        '-dFirstPage=1', `-dLastPage=${pages}`,
+        `-sOutputFile=${outPath}`, inPath,
+      ], { stdio: 'pipe' });
+      const trimmed = readFileSync(outPath);
+      if (trimmed.length <= maxBytes) {
+        return { buffer: trimmed, totalPages, pagesExtracted: Math.min(pages, totalPages ?? pages) };
+      }
+    }
+    return null; // even the smallest extract is over the cap — caller falls back to skipping
   } catch {
     return null;
   } finally {
@@ -214,12 +230,16 @@ export async function ocrImagePdf(pdfBuffer, filename, opts = {}) {
     // promise — the default implementation is sync (execFileSync), and
     // opts.pdfSplitter is a public injectable interface callers may implement
     // either way.
-    const split = await Promise.resolve(splitPdf(buffer, { lastPage: OVERSIZED_PDF_PAGE_LIMIT })).catch(() => null);
+    const split = await Promise.resolve(
+      splitPdf(buffer, { lastPage: OVERSIZED_PDF_PAGE_LIMIT, maxBytes: MAX_FILE_SIZE }),
+    ).catch(() => null);
     if (split && split.buffer && split.buffer.length > 0 && split.buffer.length <= MAX_FILE_SIZE) {
-      log.warn(`PDF too large for OCR (${(pdfBuffer.length / 1024 / 1024).toFixed(1)}MB > 30MB) — retrying with first ${OVERSIZED_PDF_PAGE_LIMIT} pages only: ${filename}`);
       buffer = split.buffer;
-      pagesExtracted = OVERSIZED_PDF_PAGE_LIMIT;
+      // Trust the splitter's own count over the requested ceiling — it steps
+      // pages down to fit the size cap, so the two routinely differ.
+      pagesExtracted = split.pagesExtracted ?? OVERSIZED_PDF_PAGE_LIMIT;
       pagesTotal = split.totalPages ?? null;
+      log.warn(`PDF too large for OCR (${(pdfBuffer.length / 1024 / 1024).toFixed(1)}MB > 30MB) — retrying with first ${pagesExtracted}${pagesTotal ? ` of ${pagesTotal}` : ''} pages only: ${filename}`);
     } else {
       log.warn(`PDF too large for OCR: ${filename} (${(pdfBuffer.length / 1024 / 1024).toFixed(1)}MB > 30MB) — page-split fallback unavailable or still too large`);
       return null;
@@ -233,7 +253,12 @@ export async function ocrImagePdf(pdfBuffer, filename, opts = {}) {
 
   try {
     const anthropic = getClient();
-    const response = await anthropic.messages.create({
+    // .stream(...).finalMessage() rather than .create(): above ~16k max_tokens
+    // the SDK refuses a non-streaming call outright ("Streaming is required for
+    // operations that may take longer than 10 minutes"), and a 20-page scan
+    // measured 122s at 16k. Same response shape either way — only the transport
+    // changes, so every caller and the parse path below are unaffected.
+    const response = await anthropic.messages.stream({
       model: 'claude-haiku-4-5-20251001',
       max_tokens: MAX_OUTPUT_TOKENS,
       // No cache_control here -- and DO NOT add one just because UNIVERSAL_PROMPT
@@ -274,7 +299,7 @@ export async function ocrImagePdf(pdfBuffer, filename, opts = {}) {
           },
         ],
       }],
-    });
+    }).finalMessage();
 
     const usage = response.usage || {};
     const cost = costTracker.record(usage);
@@ -326,7 +351,12 @@ export async function ocrImage(imageBuffer, filename, ext, opts = {}) {
 
   try {
     const anthropic = getClient();
-    const response = await anthropic.messages.create({
+    // .stream(...).finalMessage() rather than .create(): above ~16k max_tokens
+    // the SDK refuses a non-streaming call outright ("Streaming is required for
+    // operations that may take longer than 10 minutes"), and a 20-page scan
+    // measured 122s at 16k. Same response shape either way — only the transport
+    // changes, so every caller and the parse path below are unaffected.
+    const response = await anthropic.messages.stream({
       model: 'claude-haiku-4-5-20251001',
       max_tokens: MAX_OUTPUT_TOKENS,
       // Same UNIVERSAL_PROMPT, same reasoning as ocrImagePdf above: ~850
@@ -349,7 +379,7 @@ export async function ocrImage(imageBuffer, filename, ext, opts = {}) {
           },
         ],
       }],
-    });
+    }).finalMessage();
 
     const usage = response.usage || {};
     const cost = costTracker.record(usage);
