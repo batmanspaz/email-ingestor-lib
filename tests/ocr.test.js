@@ -11,7 +11,15 @@ const mockCreate = vi.fn();
 vi.mock('@anthropic-ai/sdk', () => {
   class MockAnthropic {
     constructor() {
-      this.messages = { create: mockCreate };
+      // ocr.js calls messages.stream(...).finalMessage() (streaming is required
+      // above ~16k max_tokens — the SDK throws outright on a non-streaming call
+      // that could exceed its 10-minute ceiling). The stream mock delegates to
+      // mockCreate so every request-shape assertion below reads the same call
+      // record regardless of which transport the module uses.
+      this.messages = {
+        create: mockCreate,
+        stream: (...args) => ({ finalMessage: () => mockCreate(...args) }),
+      };
     }
   }
   return { default: MockAnthropic };
@@ -162,11 +170,116 @@ describe('ocr (shared email-ingestor-lib)', () => {
 
   // ── Guard conditions ─────────────────────────────────────────────────────
 
-  it('returns null for oversized PDFs', async () => {
+  it('returns null for oversized PDFs when no page-split fallback is available (real-world: gs missing)', async () => {
     const bigBuffer = Buffer.alloc(31 * 1024 * 1024);
-    const result = await ocrImagePdf(bigBuffer, 'huge.pdf');
+    // Explicit stub keeps this test hermetic (no real `gs` process spawned) and
+    // documents the "split unavailable" case — see the dedicated pdfSplitter
+    // tests below for the "split succeeds" / "split still too big" cases.
+    const result = await ocrImagePdf(bigBuffer, 'huge.pdf', { pdfSplitter: async () => null });
     expect(result).toBeNull();
     expect(mockCreate).not.toHaveBeenCalled();
+  });
+
+  // ── Oversized-PDF page-split fallback (2026-08-16) ───────────────────────
+  // Real incident: a 78-page, 59MB scanner batch (a single multi-page drop,
+  // not a dense single page) sat unprocessed forever — MAX_FILE_SIZE rejected
+  // it outright with no retry. Classification only needs the first few pages,
+  // so an injected pdfSplitter (default impl shells out to `gs`) gets one
+  // retry on just the first OVERSIZED_PDF_PAGE_LIMIT pages before giving up.
+
+  it('retries with the first pages via the injected pdfSplitter when the trimmed buffer fits under the cap', async () => {
+    const bigBuffer = Buffer.alloc(59 * 1024 * 1024);
+    const trimmed = Buffer.from('trimmed-first-pages-pdf');
+    const pdfSplitter = vi.fn(async () => ({ buffer: trimmed, totalPages: 78 }));
+    mockCreate.mockResolvedValue(makeApiResponse(RECEIPT_RESPONSE));
+
+    const result = await ocrImagePdf(bigBuffer, 'scan.pdf', { pdfSplitter });
+
+    expect(pdfSplitter).toHaveBeenCalledOnce();
+    expect(pdfSplitter.mock.calls[0][0]).toBe(bigBuffer);
+    expect(mockCreate).toHaveBeenCalledOnce();
+    const sentPdf = mockCreate.mock.calls[0][0].messages[0].content.find(c => c.type === 'document');
+    expect(sentPdf.source.data).toBe(trimmed.toString('base64'));
+    expect(result).not.toBeNull();
+    expect(result.ocrPartial).toBe(true);
+    expect(result.ocrPagesExtracted).toBe(20);
+    expect(result.ocrPagesTotal).toBe(78);
+  });
+
+  it('asks the splitter for the full page budget, and reports back what it actually got', async () => {
+    // The splitter is size-adaptive: a scanner producing ~0.8MB/page can't fit
+    // 20 pages under the 30MB cap, so it steps down and reports the count it
+    // landed on. The result must reflect the real extracted count, not the
+    // requested ceiling — otherwise a digest saying "20 of 78 pages" would be
+    // a lie about a document nobody re-reads.
+    const bigBuffer = Buffer.alloc(59 * 1024 * 1024);
+    const pdfSplitter = vi.fn(async () => ({ buffer: Buffer.from('trimmed'), totalPages: 78, pagesExtracted: 8 }));
+    mockCreate.mockResolvedValue(makeApiResponse(RECEIPT_RESPONSE));
+
+    const result = await ocrImagePdf(bigBuffer, 'scan.pdf', { pdfSplitter });
+    expect(pdfSplitter.mock.calls[0][1]).toEqual({ lastPage: 20, maxBytes: 30 * 1024 * 1024 });
+    expect(result.ocrPagesExtracted).toBe(8);
+    expect(result.ocrPagesTotal).toBe(78);
+  });
+
+  it('reports totalPages as null when the splitter cannot determine the real total', async () => {
+    const bigBuffer = Buffer.alloc(59 * 1024 * 1024);
+    const pdfSplitter = vi.fn(async () => ({ buffer: Buffer.from('trimmed'), totalPages: null }));
+    mockCreate.mockResolvedValue(makeApiResponse(RECEIPT_RESPONSE));
+
+    const result = await ocrImagePdf(bigBuffer, 'scan.pdf', { pdfSplitter });
+    expect(result.ocrPagesTotal).toBeNull();
+    expect(result.ocrPagesExtracted).toBe(20);
+  });
+
+  it('falls back to null when the split buffer is still over the cap (dense first pages) — never calls the API', async () => {
+    const bigBuffer = Buffer.alloc(59 * 1024 * 1024);
+    const stillTooBig = Buffer.alloc(31 * 1024 * 1024);
+    const pdfSplitter = vi.fn(async () => ({ buffer: stillTooBig, totalPages: 2 }));
+
+    const result = await ocrImagePdf(bigBuffer, 'dense.pdf', { pdfSplitter });
+    expect(result).toBeNull();
+    expect(mockCreate).not.toHaveBeenCalled();
+  });
+
+  it('falls back to null when the splitter throws (e.g. gs not installed) — never propagates the error', async () => {
+    const bigBuffer = Buffer.alloc(59 * 1024 * 1024);
+    const pdfSplitter = vi.fn(async () => { throw new Error('spawn gs ENOENT'); });
+
+    const result = await ocrImagePdf(bigBuffer, 'scan.pdf', { pdfSplitter });
+    expect(result).toBeNull();
+    expect(mockCreate).not.toHaveBeenCalled();
+  });
+
+  it('the real default (sync, non-injected) splitter never throws when `gs` is missing — falls back to null', async () => {
+    // No pdfSplitter injected: exercises the actual default implementation
+    // (shells out to `gs`), which is synchronous — a real bug (missing
+    // Promise.resolve at the call site) slipped past every other test here
+    // because they all injected an `async () => ...` mock; caught by a live
+    // run against a real file, not by this suite, before this test existed.
+    // PATH is scrubbed (not garbage input — real Ghostscript recovers from
+    // malformed PDF bytes and can still emit trivial output, which isn't the
+    // scenario this test is for) to force a genuine ENOENT, deterministically
+    // reproducing "gs not installed" without depending on gs's own error-
+    // recovery behavior.
+    const realPath = process.env.PATH;
+    process.env.PATH = '';
+    try {
+      const bigBuffer = Buffer.alloc(31 * 1024 * 1024);
+      const result = await ocrImagePdf(bigBuffer, 'huge.pdf');
+      expect(result).toBeNull();
+      expect(mockCreate).not.toHaveBeenCalled();
+    } finally {
+      process.env.PATH = realPath;
+    }
+  });
+
+  it('never invokes the splitter for a PDF already under the size cap', async () => {
+    mockCreate.mockResolvedValue(makeApiResponse(RECEIPT_RESPONSE));
+    const pdfSplitter = vi.fn();
+    const result = await ocrImagePdf(Buffer.from('small-pdf'), 'small.pdf', { pdfSplitter });
+    expect(pdfSplitter).not.toHaveBeenCalled();
+    expect(result.ocrPartial).toBeUndefined();
   });
 
   it('returns null when the injected cost tracker reports the cap reached', async () => {
@@ -210,10 +323,16 @@ describe('ocr (shared email-ingestor-lib)', () => {
   // noise instead of the actual extracted document text.
 
   it('requests a generous max_tokens budget so dense documents do not truncate', async () => {
+    // Raised 8192 -> 32000 on 2026-08-16 after measuring a real 78-page scan:
+    // ~1,067 output tokens/page means a 15-page extract truncates at 16k, and
+    // truncation destroys the structured fields (document_type/date/amount)
+    // entirely — parseOcrResponse can only salvage partial raw_text. Haiku 4.5
+    // supports 64k output, so 32000 leaves ~10 pages of headroom past the
+    // 20-page cap. Requires streaming (see the mock's note).
     mockCreate.mockResolvedValue(makeApiResponse(RECEIPT_RESPONSE));
     await ocrImagePdf(Buffer.from('fake-pdf'), 'receipt.pdf');
     const callArgs = mockCreate.mock.calls[0][0];
-    expect(callArgs.max_tokens).toBeGreaterThanOrEqual(8192);
+    expect(callArgs.max_tokens).toBeGreaterThanOrEqual(32000);
   });
 
   it('recovers the partial raw_text when the response is truncated mid-string (no closing quote/braces)', async () => {
