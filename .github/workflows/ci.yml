@@ -13,14 +13,20 @@ jobs:
         with:
           node-version: "22.x"
           cache: "npm"
-          cache-dependency-path: email-ingestor-lib/package-lock.json
+          # Paths are repo-root since the 2026-08-15 restructure (#34) moved
+          # package.json out of the nested email-ingestor-lib/ subdirectory so
+          # `github:` dependents could resolve it. The workflow kept pointing at
+          # the old nested path, so every run since has failed at the cache step
+          # ("Some specified paths were not resolved") — CI red for a reason
+          # unrelated to any code change.
+          cache-dependency-path: package-lock.json
       - name: Install dependencies
-        run: cd email-ingestor-lib && npm ci
+        run: npm ci
       - name: Run tests
-        # @perfectcity/telemetry (optionalDependency, file:../telemetry) is a private
-        # sibling package CI cannot check out — npm ci above skips it rather than
-        # failing. producer-health.test.js imports it directly to exercise its REAL
-        # schema validation + PII scanning (deliberately not mocked — mirrors intake's
-        # own sluice-dispatch-health.js), so it only runs locally/pre-push where the
-        # real sibling checkout is present. Every other test runs in CI same as always.
-        run: cd email-ingestor-lib && npx vitest run --exclude tests/producer-health.test.js
+        # The full suite runs in CI. producer-health.test.js used to be excluded
+        # because @perfectcity/telemetry was an optionalDependency on
+        # file:../telemetry — a private sibling checkout CI could not obtain. It
+        # is now a regular `github:batmanspaz/telemetry` dependency on a public
+        # repo, so npm ci installs it and the test's real schema-validation and
+        # PII-scanning coverage runs here too, rather than only pre-push.
+        run: npx vitest run
