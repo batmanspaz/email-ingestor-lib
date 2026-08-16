@@ -14,6 +14,10 @@
  */
 
 import Anthropic from '@anthropic-ai/sdk';
+import { execFileSync } from 'node:child_process';
+import { mkdtempSync, writeFileSync, readFileSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 
 const MAX_FILE_SIZE = 30 * 1024 * 1024; // 30MB
 // Real production bug (2026-07-05): a dense multi-page expense report hit the
@@ -21,6 +25,11 @@ const MAX_FILE_SIZE = 30 * 1024 * 1024; // 30MB
 // raw_text string value. Bumped generously — verbatim extraction of a
 // multi-page document plus every structured field easily exceeds 2048 tokens.
 const MAX_OUTPUT_TOKENS = 8192;
+// Real incident (2026-08-16): a 78-page, 59MB scanner batch sat unprocessed
+// forever — MAX_FILE_SIZE rejected it outright with no retry. Classification
+// only needs the first few pages, not the whole document, so an oversized PDF
+// gets exactly one retry on just its first N pages before giving up for real.
+const OVERSIZED_PDF_PAGE_LIMIT = 3;
 let client = null;
 
 function getClient() {
@@ -30,6 +39,45 @@ function getClient() {
 
 const NOOP_COST_TRACKER = { isCapReached: () => false, record: () => 0 };
 const NOOP_LOG = { info() {}, warn() {}, error() {} };
+
+/**
+ * Default pdfSplitter: shells out to `gs` (Ghostscript) to extract the first
+ * `lastPage` pages of an oversized PDF into a small buffer, and (best-effort,
+ * via `pdfinfo`) the real total page count. Never throws — any failure
+ * (binary missing, corrupt PDF, etc.) returns null so the caller falls back
+ * to today's "too large, skip" behavior exactly as before this existed.
+ * Injectable via opts.pdfSplitter specifically so unit tests never shell out
+ * to a real process — same posture as document-drop-producer.js's injected
+ * ocr/pdfParse deps.
+ */
+function defaultPdfSplitter(buffer, { lastPage }) {
+  let dir;
+  try {
+    dir = mkdtempSync(join(tmpdir(), 'ocr-split-'));
+    const inPath = join(dir, 'in.pdf');
+    const outPath = join(dir, 'out.pdf');
+    writeFileSync(inPath, buffer);
+    execFileSync('gs', [
+      '-sDEVICE=pdfwrite', '-dNOPAUSE', '-dBATCH', '-dQUIET',
+      '-dFirstPage=1', `-dLastPage=${lastPage}`,
+      `-sOutputFile=${outPath}`, inPath,
+    ], { stdio: 'pipe' });
+    const trimmed = readFileSync(outPath);
+
+    let totalPages = null;
+    try {
+      const info = execFileSync('pdfinfo', [inPath], { stdio: 'pipe' }).toString();
+      const m = info.match(/^Pages:\s*(\d+)/m);
+      if (m) totalPages = parseInt(m[1], 10);
+    } catch { /* best-effort only — trimmed buffer is still usable without a total */ }
+
+    return { buffer: trimmed, totalPages };
+  } catch {
+    return null;
+  } finally {
+    if (dir) { try { rmSync(dir, { recursive: true, force: true }); } catch { /* tmpdir cleanup is best-effort */ } }
+  }
+}
 
 const UNIVERSAL_PROMPT = `Extract all text from this document verbatim. Then classify the document type and extract all relevant structured fields.
 
@@ -155,10 +203,27 @@ function parseOcrResponse(text, filename, log, { truncated = false } = {}) {
 export async function ocrImagePdf(pdfBuffer, filename, opts = {}) {
   const costTracker = opts.costTracker || NOOP_COST_TRACKER;
   const log = opts.log || NOOP_LOG;
+  const splitPdf = opts.pdfSplitter || defaultPdfSplitter;
 
-  if (pdfBuffer.length > MAX_FILE_SIZE) {
-    log.warn(`PDF too large for OCR: ${filename} (${(pdfBuffer.length / 1024 / 1024).toFixed(1)}MB > 30MB)`);
-    return null;
+  let buffer = pdfBuffer;
+  let pagesExtracted = null;
+  let pagesTotal = null;
+
+  if (buffer.length > MAX_FILE_SIZE) {
+    // Promise.resolve(...) rather than assuming splitPdf itself returns a
+    // promise — the default implementation is sync (execFileSync), and
+    // opts.pdfSplitter is a public injectable interface callers may implement
+    // either way.
+    const split = await Promise.resolve(splitPdf(buffer, { lastPage: OVERSIZED_PDF_PAGE_LIMIT })).catch(() => null);
+    if (split && split.buffer && split.buffer.length > 0 && split.buffer.length <= MAX_FILE_SIZE) {
+      log.warn(`PDF too large for OCR (${(pdfBuffer.length / 1024 / 1024).toFixed(1)}MB > 30MB) — retrying with first ${OVERSIZED_PDF_PAGE_LIMIT} pages only: ${filename}`);
+      buffer = split.buffer;
+      pagesExtracted = OVERSIZED_PDF_PAGE_LIMIT;
+      pagesTotal = split.totalPages ?? null;
+    } else {
+      log.warn(`PDF too large for OCR: ${filename} (${(pdfBuffer.length / 1024 / 1024).toFixed(1)}MB > 30MB) — page-split fallback unavailable or still too large`);
+      return null;
+    }
   }
 
   if (costTracker.isCapReached()) {
@@ -200,7 +265,7 @@ export async function ocrImagePdf(pdfBuffer, filename, opts = {}) {
             source: {
               type: 'base64',
               media_type: 'application/pdf',
-              data: pdfBuffer.toString('base64'),
+              data: buffer.toString('base64'),
             },
           },
           {
@@ -219,7 +284,10 @@ export async function ocrImagePdf(pdfBuffer, filename, opts = {}) {
     const truncated = response.stop_reason === 'max_tokens';
     const { rawText, structured, parsed } = parseOcrResponse(text, filename, log, { truncated });
 
-    return { rawText, structured, parsed, usage, cost };
+    return {
+      rawText, structured, parsed, usage, cost,
+      ...(pagesExtracted != null ? { ocrPartial: true, ocrPagesExtracted: pagesExtracted, ocrPagesTotal: pagesTotal } : {}),
+    };
   } catch (err) {
     log.error(`OCR failed for ${filename}`, { error: err.message });
     return null;
