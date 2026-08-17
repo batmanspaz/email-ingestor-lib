@@ -194,3 +194,65 @@ describe('extraction-result contract v1 — the migration hazard', () => {
     expect(res.ok).toBe(false);        // ...but NOT a success
   });
 });
+
+describe('extraction-result contract v1 — page continuation', () => {
+  // A page-split partial reads pages 1..20 and stops. Retrying it re-reads the SAME
+  // 20 pages — gs is always invoked with -dFirstPage=1 — so a plain reattempt
+  // recovers literally nothing while still costing a Haiku call. The 58 missing
+  // pages need a different WINDOW, not another attempt.
+  //
+  // Hence opts.startPage: the caller asks for pages 21..40 and appends. This is the
+  // difference between a retry and a recovery.
+
+  it('asks the splitter for the requested window, not always from page 1', async () => {
+    mockCreate.mockResolvedValue(reply(DOC));
+    let seen = null;
+    await ocrImagePdf(Buffer.from('x'.repeat(40 * 1024 * 1024)), 'huge.pdf', opts({
+      startPage: 21,
+      pdfSplitter: (buf, o) => { seen = o; return { buffer: Buffer.from('%PDF-1.4 split'), totalPages: 78, pagesExtracted: 20, firstPage: 21 }; },
+    }));
+    expect(seen.firstPage).toBe(21);
+  });
+
+  it('reports the window it actually read, so a caller can continue from there', async () => {
+    mockCreate.mockResolvedValue(reply(DOC));
+    const res = await ocrImagePdf(Buffer.from('x'.repeat(40 * 1024 * 1024)), 'huge.pdf', opts({
+      startPage: 21,
+      pdfSplitter: () => ({ buffer: Buffer.from('%PDF-1.4 split'), totalPages: 78, pagesExtracted: 20, firstPage: 21 }),
+    }));
+    assertValid(res);
+    expect(res.ocrPagesStart).toBe(21);
+    expect(res.ocrPagesExtracted).toBe(20);
+    expect(res.ocrPagesTotal).toBe(78);
+    // Still partial: pages 41-78 remain unread.
+    expect(res.ocrPartial).toBe(true);
+  });
+
+  it('a normal extraction starts at page 1 and says so', async () => {
+    // Always present, never conditionally spread — same discipline as the other
+    // completeness fields. `undefined` is not "started at 1", it is "declined to say".
+    mockCreate.mockResolvedValue(reply(DOC));
+    const res = await ocrImagePdf(Buffer.from('%PDF-1.4 tiny'), 'small.pdf', opts());
+    assertValid(res);
+    expect(res.ocrPagesStart).toBe(1);
+  });
+
+  it('an image reports page 1 — there is no window to continue', async () => {
+    mockCreate.mockResolvedValue(reply(DOC));
+    const res = await ocrImage(Buffer.from('fakejpeg'), 'scan.jpg', 'jpg', opts());
+    assertValid(res);
+    expect(res.ocrPagesStart).toBe(1);
+  });
+
+  it('reports split_unavailable when the requested window is past the end', async () => {
+    // Asking for pages 100-120 of a 78-page document must fail cleanly and say why,
+    // not return an empty success that looks like "nothing more to read".
+    const res = await ocrImagePdf(Buffer.from('x'.repeat(40 * 1024 * 1024)), 'huge.pdf', opts({
+      startPage: 100,
+      pdfSplitter: () => null,
+    }));
+    assertValid(res);
+    expect(res.ok).toBe(false);
+    expect(res.failureReason).toBe('split_unavailable');
+  });
+});

@@ -57,7 +57,7 @@ const NOOP_LOG = { info() {}, warn() {}, error() {} };
  * to a real process — same posture as document-drop-producer.js's injected
  * ocr/pdfParse deps.
  */
-function defaultPdfSplitter(buffer, { lastPage, maxBytes }) {
+function defaultPdfSplitter(buffer, { firstPage = 1, lastPage, maxBytes }) {
   let dir;
   try {
     dir = mkdtempSync(join(tmpdir(), 'ocr-split-'));
@@ -75,16 +75,24 @@ function defaultPdfSplitter(buffer, { lastPage, maxBytes }) {
     // in a few MB, while a 600dpi scan runs ~0.8MB/page and blows the cap around
     // 35. Rather than guess a single safe page count for every document, step
     // down until the extract actually fits — measured, not assumed.
+    // A window past the end of the document has nothing to extract. Say so rather
+    // than handing back an empty PDF that reads as "successfully extracted nothing".
+    if (totalPages != null && firstPage > totalPages) return null;
+
     for (const pages of [lastPage, 12, 8, 5, 3].filter((p, i, a) => p <= lastPage && a.indexOf(p) === i)) {
       const outPath = join(dir, `out-${pages}.pdf`);
+      const last = firstPage + pages - 1;
       execFileSync('gs', [
         '-sDEVICE=pdfwrite', '-dNOPAUSE', '-dBATCH', '-dQUIET',
-        '-dFirstPage=1', `-dLastPage=${pages}`,
+        `-dFirstPage=${firstPage}`, `-dLastPage=${last}`,
         `-sOutputFile=${outPath}`, inPath,
       ], { stdio: 'pipe' });
       const trimmed = readFileSync(outPath);
       if (trimmed.length <= maxBytes) {
-        return { buffer: trimmed, totalPages, pagesExtracted: Math.min(pages, totalPages ?? pages) };
+        // Clamp to what actually exists: asking for 20 pages starting at 61 of a
+        // 78-page document yields 18, and reporting 20 would misstate coverage.
+        const available = totalPages != null ? Math.max(0, totalPages - firstPage + 1) : pages;
+        return { buffer: trimmed, totalPages, firstPage, pagesExtracted: Math.min(pages, available) };
       }
     }
     return null; // even the smallest extract is over the cap — caller falls back to skipping
@@ -251,8 +259,11 @@ const fail = (failureReason, detail) => ({
  * `truncated` counts as partial: hitting max_tokens means the document was not
  * fully read, which is the same fact as a page split, arrived at differently (F6).
  */
-function success({ rawText, structured, parsed, usage, cost, pagesExtracted, pagesTotal, truncated }) {
+function success({ rawText, structured, parsed, usage, cost, pagesStart = 1, pagesExtracted, pagesTotal, truncated }) {
   const split = pagesExtracted != null;
+  // Still partial if pages remain beyond this window — a continuation pass that
+  // reads 21..40 of 78 has recovered a lot and is still not the whole document.
+  const moreAfter = split && pagesTotal != null && (pagesStart + pagesExtracted - 1) < pagesTotal;
   return {
     ok: true,
     rawText,
@@ -260,7 +271,8 @@ function success({ rawText, structured, parsed, usage, cost, pagesExtracted, pag
     parsed,
     usage,
     cost,
-    ocrPartial: Boolean(split || truncated),
+    ocrPartial: Boolean(moreAfter || (split && pagesTotal == null) || truncated),
+    ocrPagesStart: pagesStart,
     ocrPagesExtracted: split ? pagesExtracted : null,
     ocrPagesTotal: split ? (pagesTotal ?? null) : null,
     ocrTruncated: Boolean(truncated),
@@ -272,17 +284,23 @@ export async function ocrImagePdf(pdfBuffer, filename, opts = {}) {
   const log = opts.log || NOOP_LOG;
   const splitPdf = opts.pdfSplitter || defaultPdfSplitter;
 
+  // startPage lets a caller CONTINUE a partial read (pages 21..40) instead of
+  // retrying it (pages 1..20 again, identically, for the same money).
+  const startPage = opts.startPage || 1;
   let buffer = pdfBuffer;
+  let pagesStart = 1;
   let pagesExtracted = null;
   let pagesTotal = null;
 
-  if (buffer.length > MAX_FILE_SIZE) {
+  // A continuation is a split by definition — the window is not the whole file, so
+  // it must go through the splitter even when the buffer would fit under the cap.
+  if (buffer.length > MAX_FILE_SIZE || startPage > 1) {
     // Promise.resolve(...) rather than assuming splitPdf itself returns a
     // promise — the default implementation is sync (execFileSync), and
     // opts.pdfSplitter is a public injectable interface callers may implement
     // either way.
     const split = await Promise.resolve(
-      splitPdf(buffer, { lastPage: OVERSIZED_PDF_PAGE_LIMIT, maxBytes: MAX_FILE_SIZE }),
+      splitPdf(buffer, { firstPage: startPage, lastPage: OVERSIZED_PDF_PAGE_LIMIT, maxBytes: MAX_FILE_SIZE }),
     ).catch(() => null);
     if (split && split.buffer && split.buffer.length > 0 && split.buffer.length <= MAX_FILE_SIZE) {
       buffer = split.buffer;
@@ -290,6 +308,7 @@ export async function ocrImagePdf(pdfBuffer, filename, opts = {}) {
       // pages down to fit the size cap, so the two routinely differ.
       pagesExtracted = split.pagesExtracted ?? OVERSIZED_PDF_PAGE_LIMIT;
       pagesTotal = split.totalPages ?? null;
+      pagesStart = split.firstPage ?? startPage;
       log.warn(`PDF too large for OCR (${(pdfBuffer.length / 1024 / 1024).toFixed(1)}MB > 30MB) — retrying with first ${pagesExtracted}${pagesTotal ? ` of ${pagesTotal}` : ''} pages only: ${filename}`);
     } else {
       log.warn(`PDF too large for OCR: ${filename} (${(pdfBuffer.length / 1024 / 1024).toFixed(1)}MB > 30MB) — page-split fallback unavailable or still too large`);
@@ -364,7 +383,7 @@ export async function ocrImagePdf(pdfBuffer, filename, opts = {}) {
     const truncated = response.stop_reason === 'max_tokens';
     const { rawText, structured, parsed } = parseOcrResponse(text, filename, log, { truncated });
 
-    return success({ rawText, structured, parsed, usage, cost, pagesExtracted, pagesTotal, truncated });
+    return success({ rawText, structured, parsed, usage, cost, pagesStart, pagesExtracted, pagesTotal, truncated });
   } catch (err) {
     log.error(`OCR failed for ${filename}`, { error: err.message });
     return fail('api_error', err.message);
@@ -446,7 +465,7 @@ export async function ocrImage(imageBuffer, filename, ext, opts = {}) {
     // pagesExtracted/pagesTotal are structurally null for an image — but the
     // FIELDS are present, so a consumer can tell "one page, complete" from
     // "this path never reports completeness" (F7).
-    return success({ rawText, structured, parsed, usage, cost, pagesExtracted: null, pagesTotal: null, truncated });
+    return success({ rawText, structured, parsed, usage, cost, pagesStart: 1, pagesExtracted: null, pagesTotal: null, truncated });
   } catch (err) {
     log.error(`Image OCR failed for ${filename}`, { error: err.message });
     return fail('api_error', err.message);

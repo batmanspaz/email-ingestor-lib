@@ -221,7 +221,10 @@ describe('ocr (shared email-ingestor-lib)', () => {
     mockCreate.mockResolvedValue(makeApiResponse(RECEIPT_RESPONSE));
 
     const result = await ocrImagePdf(bigBuffer, 'scan.pdf', { pdfSplitter });
-    expect(pdfSplitter.mock.calls[0][1]).toEqual({ lastPage: 20, maxBytes: 30 * 1024 * 1024 });
+    // firstPage added 2026-08-17 for page continuation: a partial read is resumed
+    // at pages 21..40 rather than retried at 1..20, which recovers nothing.
+    // Default 1 keeps every existing call identical.
+    expect(pdfSplitter.mock.calls[0][1]).toEqual({ firstPage: 1, lastPage: 20, maxBytes: 30 * 1024 * 1024 });
     expect(result.ocrPagesExtracted).toBe(8);
     expect(result.ocrPagesTotal).toBe(78);
   });
