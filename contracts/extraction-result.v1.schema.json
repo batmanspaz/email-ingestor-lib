@@ -1,0 +1,93 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://intake.local/contracts/extraction-result.v1.schema.json",
+  "title": "Extraction Result — the shape ocr.js returns, v1",
+  "description": "The return contract of email-ingestor-lib's ocrImagePdf()/ocrImage(). Until now this shape was implicit, unversioned and unvalidated, which is exactly how PR #35 (2026-08-15) could add ocrPartial/ocrPagesExtracted/ocrPagesTotal to the PDF path and have two of the three consumers silently drop all three with nothing failing. Unlike intake-contract.v1 — which is hand-copied into four repos and has already drifted — this file SHIPS INSIDE the package every consumer already depends on, so there is exactly one copy. Import it as email-ingestor-lib/contracts/extraction-result.v1.schema.json.\n\nDiscriminated on `ok`. MIGRATION HAZARD: today a failed extraction returns bare `null`, and callers test truthiness (`if (!result) ...`). A failure object is TRUTHY, so any caller reached before it is updated would read a failure as a success. Consumers must be taught to check `.ok` BEFORE ocr.js starts returning failure objects — same consumer-first ordering the envelope contract requires.",
+  "oneOf": [{ "$ref": "#/$defs/success" }, { "$ref": "#/$defs/failure" }],
+  "$defs": {
+    "success": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "ok",
+        "rawText",
+        "structured",
+        "parsed",
+        "usage",
+        "cost",
+        "ocrPartial",
+        "ocrPagesExtracted",
+        "ocrPagesTotal",
+        "ocrTruncated"
+      ],
+      "properties": {
+        "ok": { "const": true },
+        "rawText": {
+          "type": "string",
+          "description": "Extracted text. May be empty when tier-2/tier-3 salvage recovered nothing."
+        },
+        "structured": {
+          "type": ["object", "null"],
+          "description": "Receipt-shaped subset {vendor, amount, currency, date, line_items}. Null unless parsed.is_receipt was true."
+        },
+        "parsed": {
+          "type": ["object", "null"],
+          "description": "Full JSON object from UNIVERSAL_PROMPT, snake_case. Null when the response could not be parsed as JSON — note tiers 2 and 3 of the salvage path return text with parsed:null, so a truncated dense document loses every structured field while still looking successful."
+        },
+        "usage": {
+          "type": "object",
+          "description": "Anthropic usage block.",
+          "properties": {
+            "input_tokens": { "type": "integer", "minimum": 0 },
+            "output_tokens": { "type": "integer", "minimum": 0 }
+          },
+          "required": ["input_tokens", "output_tokens"]
+        },
+        "cost": { "type": "number", "minimum": 0 },
+
+        "ocrPartial": {
+          "type": "boolean",
+          "description": "TRUE when this extraction does not represent the whole document, for ANY reason — an oversized PDF was page-split, or the model hit max_tokens. Always present. Today it is conditionally spread onto the PDF path only and is absent entirely from ocrImage(), so a caller cannot distinguish 'complete' from 'field not emitted on this path' (F7)."
+        },
+        "ocrPagesExtracted": {
+          "type": ["integer", "null"],
+          "minimum": 0,
+          "description": "Pages actually sent to the model. Null when no split occurred or the page count is unknown."
+        },
+        "ocrPagesTotal": {
+          "type": ["integer", "null"],
+          "minimum": 0,
+          "description": "Pages in the source document. Null when pdfinfo could not determine it — best-effort by design, so null here does NOT imply a complete read."
+        },
+        "ocrTruncated": {
+          "type": "boolean",
+          "description": "TRUE when the model stopped on max_tokens. ocr.js already computes this (stop_reason === 'max_tokens') and today throws it away into a log-message suffix, making a truncated extraction indistinguishable from a clean one to every caller (F6)."
+        }
+      }
+    },
+
+    "failure": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["ok", "failureReason"],
+      "properties": {
+        "ok": { "const": false },
+        "failureReason": {
+          "type": "string",
+          "enum": [
+            "file_too_large",
+            "split_unavailable",
+            "cost_cap",
+            "image_too_large",
+            "api_error"
+          ],
+          "description": "Why nothing was extracted. Today all five collapse to a bare `null` with no code (F5) — which is the root cause of the 2026-08-16 finding that four format classes had failed silently and accumulated 766 unusable documents. An unprocessable file must be able to say WHY."
+        },
+        "detail": {
+          "type": "string",
+          "description": "Optional human-readable detail. Never include file contents or a full path — this value reaches logs and telemetry."
+        }
+      }
+    }
+  }
+}

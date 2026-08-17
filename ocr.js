@@ -216,6 +216,57 @@ function parseOcrResponse(text, filename, log, { truncated = false } = {}) {
  * @param {object} [opts] - { costTracker: {isCapReached, record}, log: {info,warn,error} }
  * @returns {Promise<object|null>} Result with rawText, structured, parsed, usage, cost
  */
+// ── extraction-result contract v1 ───────────────────────────────────────────
+// contracts/extraction-result.v1.schema.json. Ships inside this package, so every
+// consumer validates against ONE copy rather than four hand-synchronised ones.
+//
+// Failures used to be a bare `null` for five genuinely different causes, so a
+// caller could not tell "too big" from "cost cap" from "the API fell over" — the
+// root cause behind 766 documents that failed silently and invisibly.
+//
+// ⚠️ A failure object is TRUTHY. Consumers must check `.ok`, never truthiness.
+// intake #155 and personal-email-ingestor #24 shipped that check FIRST, before
+// this file began emitting the new shape.
+
+/** Strip anything path- or filename-shaped: `detail` reaches logs and telemetry. */
+function safeDetail(message) {
+  if (!message) return undefined;
+  return String(message).replace(/\/\S+/g, '<path>').slice(0, 200);
+}
+
+const fail = (failureReason, detail) => ({
+  ok: false,
+  failureReason,
+  ...(safeDetail(detail) ? { detail: safeDetail(detail) } : {}),
+});
+
+/**
+ * Every success carries all four completeness fields, always.
+ *
+ * They used to be spread conditionally, so on the common path they were ABSENT
+ * rather than false — and `undefined` is not "complete", it is "this extractor
+ * declined to say". Consumers doing `if (result.ocrPartial)` read that as a clean
+ * document. The image path omitted them entirely (F7).
+ *
+ * `truncated` counts as partial: hitting max_tokens means the document was not
+ * fully read, which is the same fact as a page split, arrived at differently (F6).
+ */
+function success({ rawText, structured, parsed, usage, cost, pagesExtracted, pagesTotal, truncated }) {
+  const split = pagesExtracted != null;
+  return {
+    ok: true,
+    rawText,
+    structured,
+    parsed,
+    usage,
+    cost,
+    ocrPartial: Boolean(split || truncated),
+    ocrPagesExtracted: split ? pagesExtracted : null,
+    ocrPagesTotal: split ? (pagesTotal ?? null) : null,
+    ocrTruncated: Boolean(truncated),
+  };
+}
+
 export async function ocrImagePdf(pdfBuffer, filename, opts = {}) {
   const costTracker = opts.costTracker || NOOP_COST_TRACKER;
   const log = opts.log || NOOP_LOG;
@@ -242,13 +293,17 @@ export async function ocrImagePdf(pdfBuffer, filename, opts = {}) {
       log.warn(`PDF too large for OCR (${(pdfBuffer.length / 1024 / 1024).toFixed(1)}MB > 30MB) — retrying with first ${pagesExtracted}${pagesTotal ? ` of ${pagesTotal}` : ''} pages only: ${filename}`);
     } else {
       log.warn(`PDF too large for OCR: ${filename} (${(pdfBuffer.length / 1024 / 1024).toFixed(1)}MB > 30MB) — page-split fallback unavailable or still too large`);
-      return null;
+      // Distinct from file_too_large: the file IS too large, but what actually
+      // blocked us is that gs/pdfinfo could not produce a smaller extract.
+      return fail('split_unavailable');
     }
   }
 
   if (costTracker.isCapReached()) {
     log.warn(`Daily cost cap reached — skipping OCR for ${filename}`);
-    return null;
+    // Recoverable tomorrow — the caller can and should retry. That is exactly
+    // what a bare null could never say.
+    return fail('cost_cap');
   }
 
   try {
@@ -309,13 +364,10 @@ export async function ocrImagePdf(pdfBuffer, filename, opts = {}) {
     const truncated = response.stop_reason === 'max_tokens';
     const { rawText, structured, parsed } = parseOcrResponse(text, filename, log, { truncated });
 
-    return {
-      rawText, structured, parsed, usage, cost,
-      ...(pagesExtracted != null ? { ocrPartial: true, ocrPagesExtracted: pagesExtracted, ocrPagesTotal: pagesTotal } : {}),
-    };
+    return success({ rawText, structured, parsed, usage, cost, pagesExtracted, pagesTotal, truncated });
   } catch (err) {
     log.error(`OCR failed for ${filename}`, { error: err.message });
-    return null;
+    return fail('api_error', err.message);
   }
 }
 
@@ -339,12 +391,14 @@ export async function ocrImage(imageBuffer, filename, ext, opts = {}) {
 
   if (imageBuffer.length > MAX_FILE_SIZE) {
     log.warn(`Image too large for OCR: ${filename} (${(imageBuffer.length / 1024 / 1024).toFixed(1)}MB)`);
-    return null;
+    // Unlike a PDF there is no page-split escape hatch for an image — this one
+    // never becomes recoverable on its own.
+    return fail('image_too_large');
   }
 
   if (costTracker.isCapReached()) {
     log.warn(`Daily cost cap reached — skipping OCR for ${filename}`);
-    return null;
+    return fail('cost_cap');
   }
 
   const mediaType = EXT_TO_MIME[ext.toLowerCase()] || 'image/jpeg';
@@ -389,9 +443,12 @@ export async function ocrImage(imageBuffer, filename, ext, opts = {}) {
     const truncated = response.stop_reason === 'max_tokens';
     const { rawText, structured, parsed } = parseOcrResponse(text, filename, log, { truncated });
 
-    return { rawText, structured, parsed, usage, cost };
+    // pagesExtracted/pagesTotal are structurally null for an image — but the
+    // FIELDS are present, so a consumer can tell "one page, complete" from
+    // "this path never reports completeness" (F7).
+    return success({ rawText, structured, parsed, usage, cost, pagesExtracted: null, pagesTotal: null, truncated });
   } catch (err) {
     log.error(`Image OCR failed for ${filename}`, { error: err.message });
-    return null;
+    return fail('api_error', err.message);
   }
 }

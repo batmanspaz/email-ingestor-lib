@@ -176,7 +176,11 @@ describe('ocr (shared email-ingestor-lib)', () => {
     // documents the "split unavailable" case — see the dedicated pdfSplitter
     // tests below for the "split succeeds" / "split still too big" cases.
     const result = await ocrImagePdf(bigBuffer, 'huge.pdf', { pdfSplitter: async () => null });
-    expect(result).toBeNull();
+    // extraction-result contract v1: a failure now SAYS WHY. It used to be a bare
+    // null shared with four other causes, so no caller could tell a missing `gs`
+    // from a cost cap from an API outage.
+    expect(result.ok).toBe(false);
+    expect(result.failureReason).toBe('split_unavailable');
     expect(mockCreate).not.toHaveBeenCalled();
   });
 
@@ -238,7 +242,8 @@ describe('ocr (shared email-ingestor-lib)', () => {
     const pdfSplitter = vi.fn(async () => ({ buffer: stillTooBig, totalPages: 2 }));
 
     const result = await ocrImagePdf(bigBuffer, 'dense.pdf', { pdfSplitter });
-    expect(result).toBeNull();
+    expect(result.ok).toBe(false);
+    expect(result.failureReason).toBe('split_unavailable');
     expect(mockCreate).not.toHaveBeenCalled();
   });
 
@@ -247,7 +252,8 @@ describe('ocr (shared email-ingestor-lib)', () => {
     const pdfSplitter = vi.fn(async () => { throw new Error('spawn gs ENOENT'); });
 
     const result = await ocrImagePdf(bigBuffer, 'scan.pdf', { pdfSplitter });
-    expect(result).toBeNull();
+    expect(result.ok).toBe(false);
+    expect(result.failureReason).toBe('split_unavailable');
     expect(mockCreate).not.toHaveBeenCalled();
   });
 
@@ -267,7 +273,8 @@ describe('ocr (shared email-ingestor-lib)', () => {
     try {
       const bigBuffer = Buffer.alloc(31 * 1024 * 1024);
       const result = await ocrImagePdf(bigBuffer, 'huge.pdf');
-      expect(result).toBeNull();
+      expect(result.ok).toBe(false);
+      expect(result.failureReason).toBe('split_unavailable');
       expect(mockCreate).not.toHaveBeenCalled();
     } finally {
       process.env.PATH = realPath;
@@ -279,13 +286,22 @@ describe('ocr (shared email-ingestor-lib)', () => {
     const pdfSplitter = vi.fn();
     const result = await ocrImagePdf(Buffer.from('small-pdf'), 'small.pdf', { pdfSplitter });
     expect(pdfSplitter).not.toHaveBeenCalled();
-    expect(result.ocrPartial).toBeUndefined();
+    // Was `toBeUndefined()`, which encoded the very bug the contract fixes (F7):
+    // the completeness fields were spread conditionally, so on the common path
+    // they were ABSENT rather than false. `undefined` is not "complete" — it is
+    // "this extractor declined to say", and consumers doing `if (r.ocrPartial)`
+    // read that as a clean document.
+    expect(result.ocrPartial).toBe(false);
+    expect(result.ocrTruncated).toBe(false);
   });
 
   it('returns null when the injected cost tracker reports the cap reached', async () => {
     const costTracker = makeCostTracker(true);
     const result = await ocrImagePdf(Buffer.from('fake-pdf'), 'test.pdf', { costTracker });
-    expect(result).toBeNull();
+    // 'cost_cap' is recoverable tomorrow; 'image_too_large' never is. Collapsing
+    // both to null is what made retry policy impossible to express.
+    expect(result.ok).toBe(false);
+    expect(result.failureReason).toBe('cost_cap');
     expect(mockCreate).not.toHaveBeenCalled();
   });
 
@@ -299,7 +315,8 @@ describe('ocr (shared email-ingestor-lib)', () => {
   it('handles API errors gracefully', async () => {
     mockCreate.mockRejectedValue(new Error('Rate limited'));
     const result = await ocrImagePdf(Buffer.from('fake-pdf'), 'error.pdf');
-    expect(result).toBeNull();
+    expect(result.ok).toBe(false);
+    expect(result.failureReason).toBe('api_error');
   });
 
   it('handles malformed JSON gracefully', async () => {
@@ -542,9 +559,10 @@ describe('ocr (shared email-ingestor-lib)', () => {
     expect(result.structured.vendor).toBe('Costco Wholesale');
   });
 
-  it('ocrImage returns null when the injected cost tracker reports the cap reached', async () => {
+  it('ocrImage reports cost_cap when the injected cost tracker reports the cap reached', async () => {
     const costTracker = makeCostTracker(true);
     const result = await ocrImage(Buffer.from('fake-image'), 'photo.jpg', '.jpg', { costTracker });
-    expect(result).toBeNull();
+    expect(result.ok).toBe(false);
+    expect(result.failureReason).toBe('cost_cap');
   });
 });
