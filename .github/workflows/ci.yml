@@ -17,7 +17,10 @@ jobs:
           # package.json out of the nested email-ingestor-lib/ subdirectory so
           # `github:` dependents could resolve it. The workflow kept pointing at
           # the old nested path, so every run since has failed at the cache step
-          # ("Some specified paths were not resolved") — CI red for a reason
+          # ("Some specified paths were not resolved") — CI red for a reason.
+          # NOTE: .github/dependabot.yml had the SAME stale path and was missed
+          # when this was fixed (#36) — Dependabot then aborted for five weeks.
+          # Fixed 2026-08-23; tests/dependabot-config.test.js guards it now.
           # unrelated to any code change.
           cache-dependency-path: package-lock.json
       - name: Install dependencies

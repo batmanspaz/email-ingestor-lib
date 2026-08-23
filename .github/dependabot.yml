@@ -1,7 +1,12 @@
 version: 2
 updates:
   - package-ecosystem: "npm"
-    directory: "/email-ingestor-lib"
+    # Repo root since the 2026-08-15 restructure (#34) moved package.json out of
+    # the nested email-ingestor-lib/ subdirectory. This key was missed at the
+    # time and every run aborted with dependency_file_not_found for five weeks —
+    # no dependency security updates reached this repo. tests/dependabot-config
+    # .test.js now fails the suite if a directory here stops holding a manifest.
+    directory: "/"
     schedule:
       interval: "weekly"
     open-pull-requests-limit: 3
