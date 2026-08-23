@@ -24,7 +24,8 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { createTelemetry, HealthReportSchema, AnalyticsBatchSchema } from '@perfectcity/telemetry';
-import { computeProducerStatus, reportProducerHealth, trackProducerRun } from '../producer-health.js';
+import { computeProducerStatus, reportProducerHealth, trackProducerRun, computeTruncationCheck } from '../producer-health.js';
+import { HealthCheckSchema } from '@perfectcity/telemetry';
 
 // Healthy on-disk sluice fixture (empty inbox) so reportProducerHealth's
 // queue.depth check is deterministic — never dependent on the shell's
@@ -78,7 +79,10 @@ describe('reportProducerHealth', () => {
       batchIntervalMs: 0,
       autoStart: false,
     });
-    await reportProducerHealth(telemetry, { fetched: 3, produced: 3, errors: 0 }, { sluiceDir });
+    // truncated: 0 is REQUIRED for an 'ok' report as of 2026-08-23 — a caller that
+    // cannot attest zero truncation gets 'warn', because "missing = healthy" is
+    // banned (dev-rules Sec28.1) and an absent counter is not evidence of absence.
+    await reportProducerHealth(telemetry, { fetched: 3, produced: 3, errors: 0, truncated: 0 }, { sluiceDir });
 
     expect(sent.health.length).toBe(1);
     const report = sent.health[0];
@@ -132,7 +136,10 @@ describe('reportProducerHealth', () => {
       batchIntervalMs: 0,
       autoStart: false,
     });
-    await reportProducerHealth(telemetry, { fetched: 3, produced: 3, errors: 0 }, { sluiceDir });
+    // truncated: 0 is REQUIRED for an 'ok' report as of 2026-08-23 — a caller that
+    // cannot attest zero truncation gets 'warn', because "missing = healthy" is
+    // banned (dev-rules Sec28.1) and an absent counter is not evidence of absence.
+    await reportProducerHealth(telemetry, { fetched: 3, produced: 3, errors: 0, truncated: 0 }, { sluiceDir });
 
     const report = sent.health[0];
     expect(() => HealthReportSchema.parse(report)).not.toThrow();
@@ -207,5 +214,68 @@ describe('trackProducerRun', () => {
     const serialized = JSON.stringify(props);
     expect(serialized).not.toMatch(/@/); // no email addresses
     expect(Object.keys(props).sort()).toEqual(['entity_id', 'errors', 'fetched', 'produced', 'skipped']);
+  });
+});
+
+// ── history.truncation — reported even at zero (dev-rules Sec28.1) ──────────
+// Until 2026-08-23 a truncated history window was a console.warn into a file
+// nothing reads. It fired 44 times on personal while messages fell behind the
+// cursor, and surfaced only via an unrelated audit. "missing = healthy" is
+// banned: absence of truncation must be an asserted zero, not silence.
+
+describe('computeTruncationCheck', () => {
+  it('passes with metric 0 when no window was truncated — an ASSERTED zero, not silence', () => {
+    expect(computeTruncationCheck(0)).toMatchObject({
+      id: 'history.truncation', status: 'pass', metric: 0, unit: 'count',
+    });
+  });
+
+  it('WARNS when any window was truncated — the producer is behind, not broken', () => {
+    const c = computeTruncationCheck(3);
+    expect(c.status).toBe('warn');
+    expect(c.metric).toBe(3);
+  });
+
+  it('is accepted by the real strict HealthCheckSchema in both states', () => {
+    // HealthCheckSchema is .strict(): an extra top-level key does not drop this
+    // check, it makes telemetry.js discard the ENTIRE health report silently.
+    for (const n of [0, 7]) {
+      const r = HealthCheckSchema.safeParse(computeTruncationCheck(n));
+      expect(r.success, JSON.stringify(r.error?.issues)).toBe(true);
+    }
+  });
+
+  it('treats a missing count as unknown-and-not-green rather than zero', () => {
+    // An absent counter must never render as a clean pass — that is exactly the
+    // "missing = healthy" the rule bans.
+    expect(computeTruncationCheck(undefined).status).not.toBe('pass');
+  });
+});
+
+describe('reportProducerHealth — truncation is always in the report', () => {
+  function telemetryFor() {
+    const { sent, transport } = fakeTransport();
+    return {
+      sent,
+      telemetry: createTelemetry({
+        product: 'sluice', module: 'producer.test', version: 'test',
+        transport, heartbeatMs: 0, batchIntervalMs: 0, autoStart: false,
+      }),
+    };
+  }
+
+  it('includes history.truncation even when nothing was truncated', async () => {
+    const { sent, telemetry } = telemetryFor();
+    await reportProducerHealth(telemetry, { fetched: 5, produced: 5, errors: 0, truncated: 0 }, { sluiceDir });
+    const ids = sent.health[0].checks.map((c) => c.id);
+    expect(ids).toContain('history.truncation');
+    expect(() => HealthReportSchema.parse(sent.health[0])).not.toThrow();
+  });
+
+  it('drags overall status off ok when a window was truncated', async () => {
+    const { sent, telemetry } = telemetryFor();
+    await reportProducerHealth(telemetry, { fetched: 5, produced: 5, errors: 0, truncated: 2 }, { sluiceDir });
+    expect(sent.health[0].status).not.toBe('ok');
+    expect(() => HealthReportSchema.parse(sent.health[0])).not.toThrow();
   });
 });

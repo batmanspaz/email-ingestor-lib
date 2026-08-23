@@ -30,8 +30,46 @@ const HEALTH_STATUS_BY_CHECK_STATUS = {
 const HEALTH_SEVERITY = { ok: 0, degraded: 1, down: 2 };
 
 /**
+ * history.truncation — how many history windows getHistory had to truncate.
+ *
+ * Emitted on EVERY report, including at zero. Before 2026-08-23 truncation was
+ * a console.warn into a log nothing reads; it fired 44 times on personal while
+ * messages fell behind the cursor and surfaced only via an unrelated audit.
+ * dev-rules §28.1 bans "missing = healthy", so no-truncation must be an
+ * asserted 0, not an absent check.
+ *
+ * `warn`, never `fail`: with the contiguous-handled watermark in poll.js a
+ * truncated window is no longer lossy — it means the producer is BEHIND and
+ * draining over several runs, which is worth seeing and is not an outage.
+ * An absent/undefined count is treated as unknown and is deliberately not green.
+ *
+ * Shape is constrained by HealthCheckSchema (.strict()): {id, status, detail?,
+ * metric?, unit?} only. An extra key makes telemetry.js discard the WHOLE report.
+ */
+export function computeTruncationCheck(truncatedCount) {
+  if (truncatedCount === undefined || truncatedCount === null) {
+    return {
+      id: 'history.truncation',
+      status: 'warn',
+      unit: 'count',
+      detail: 'truncation count not reported by poll() — cannot assert zero',
+    };
+  }
+  return {
+    id: 'history.truncation',
+    status: truncatedCount > 0 ? 'warn' : 'pass',
+    metric: truncatedCount,
+    unit: 'count',
+    detail:
+      truncatedCount > 0
+        ? `${truncatedCount} history window(s) truncated — producer is behind, draining across runs`
+        : 'no truncated history windows',
+  };
+}
+
+/**
  * @param {import('@perfectcity/telemetry').Telemetry} telemetry
- * @param {{fetched:number, produced:number, errors:number}} stats
+ * @param {{fetched:number, produced:number, errors:number, truncated?:number}} stats
  * @param {{sluiceDir?:string, now?:Date}} [opts] — sluiceDir defaults to
  *   process.env.SLUICE_DIR (the same env the producer wrote envelopes with);
  *   unset/missing reports queue.depth as fail, never green (2026-08-02 rule).
@@ -48,8 +86,16 @@ export async function reportProducerHealth(telemetry, stats, opts = {}) {
   // Overall status is the WORST of the producer's own run and the queue it
   // feeds — a green producer filling a queue nothing drains is an outage,
   // which is exactly what the pre-2026-08-02 report failed to say.
+  const truncationCheck = computeTruncationCheck(stats.truncated);
+
+  // Overall status is the WORST of every check, not just the producer's own run
+  // — a green producer that keeps truncating its window is behind, and a green
+  // producer filling a queue nothing drains is an outage.
   const queueStatus = HEALTH_STATUS_BY_CHECK_STATUS[queueCheck.status];
-  const status = HEALTH_SEVERITY[queueStatus] > HEALTH_SEVERITY[producerStatus] ? queueStatus : producerStatus;
+  const truncationStatus = HEALTH_STATUS_BY_CHECK_STATUS[truncationCheck.status];
+  const status = [producerStatus, queueStatus, truncationStatus].reduce((worst, s) =>
+    HEALTH_SEVERITY[s] > HEALTH_SEVERITY[worst] ? s : worst,
+  );
 
   await telemetry.reportHealth({
     status,
@@ -61,6 +107,7 @@ export async function reportProducerHealth(telemetry, stats, opts = {}) {
         unit: 'count',
       },
       queueCheck,
+      truncationCheck,
     ],
   });
 }

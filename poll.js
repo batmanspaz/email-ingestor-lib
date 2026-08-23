@@ -30,7 +30,7 @@ import { GmailClient } from './gmail.js';
  */
 export async function poll(config, handler) {
   const { clients, statePath, maxPerRun = 50, dryRun = false, invokeHandlerInDryRun = false, archiveAfterProcess = false } = config;
-  const stats = { fetched: 0, processed: 0, errors: 0, forwarded: 0, archived: 0 };
+  const stats = { fetched: 0, processed: 0, errors: 0, forwarded: 0, archived: 0, truncated: 0 };
 
   const state = readState(statePath);
   const seenMessageIds = new Set();
@@ -64,9 +64,9 @@ export async function poll(config, handler) {
     const ringAdd = (id) => { if (!ring.has(id)) { ring.add(id); ringList.push(id); } };
 
     // Fetch new message IDs
-    let messageIds = await client.getHistory(historyId);
+    const history = await client.getHistory(historyId);
 
-    if (messageIds === null) {
+    if (history === null) {
       console.warn(`  [${label}] History expired — resetting historyId`);
       const fresh = await client.getCurrentHistoryId();
       state.accounts[accountKey].lastHistoryId = fresh;
@@ -75,9 +75,51 @@ export async function poll(config, handler) {
       continue;
     }
 
+    const { ids: enumerated, truncated, historyIdById } = history;
+    let messageIds = enumerated;
+
+    // Counted, not just warned. A truncated window is no longer lossy (see the
+    // watermark below) but it means this account is behind, and that must reach
+    // the health report rather than a log file nobody reads.
+    if (truncated) stats.truncated++;
+
+    /**
+     * Where the cursor may safely move to.
+     *
+     * UNtruncated: the whole window was enumerated, so "now" is correct — this
+     * is the long-proven path and is deliberately unchanged.
+     *
+     * TRUNCATED (getHistory hit its cap with more pages pending): "now" would
+     * orphan every message past the cap — they were never listed, never ringed,
+     * and a historyId cursor cannot look backwards. That is the 2026-08-23 mail
+     * loss, 44 occurrences on personal.
+     *
+     * But simply PARKING on a truncated window deadlocks the producer:
+     * getHistory(startId) is deterministic, so the identical window returns
+     * every run, and once all of it is ringed the filter yields empty forever
+     * and the cursor never moves again. Neither "advance to now" nor "never
+     * advance" is correct.
+     *
+     * So: advance to the last CONTIGUOUSLY handled message. Everything at or
+     * before it is in the ring; nothing after it is skipped. Gmail returns
+     * history records in ascending historyId order, which is what makes a
+     * prefix watermark meaningful. A ring hole stops the watermark dead — we
+     * would rather re-list a handled message (the ring absorbs it) than step
+     * over an unhandled one (unrecoverable).
+     */
+    const nextCursor = async () => {
+      if (!truncated) return await client.getCurrentHistoryId();
+      let watermark = null;
+      for (const id of enumerated) {
+        if (!ring.has(id)) break;
+        watermark = historyIdById?.[id] ?? watermark;
+      }
+      return watermark; // null => nothing handled yet => park
+    };
+
     if (messageIds.length === 0) {
-      const fresh = await client.getCurrentHistoryId();
-      state.accounts[accountKey].lastHistoryId = fresh;
+      const fresh = await nextCursor();
+      if (fresh) state.accounts[accountKey].lastHistoryId = fresh;
       state.accounts[accountKey].lastRunAt = new Date().toISOString();
       if (!dryRun) writeState(statePath, state);
       continue;
@@ -94,8 +136,11 @@ export async function poll(config, handler) {
       messageIds = messageIds.slice(0, maxPerRun);
     }
     if (messageIds.length === 0) {
-      const fresh = await client.getCurrentHistoryId();
-      state.accounts[accountKey].lastHistoryId = fresh;
+      // Everything listed is already ringed. Untruncated that genuinely means
+      // caught up; truncated it means "caught up with the part we could see",
+      // which is exactly where the old code jumped to now and lost the rest.
+      const fresh = await nextCursor();
+      if (fresh) state.accounts[accountKey].lastHistoryId = fresh;
       state.accounts[accountKey].lastRunAt = new Date().toISOString();
       if (!dryRun) writeState(statePath, state);
       continue;
@@ -173,10 +218,20 @@ export async function poll(config, handler) {
       console.log(`  [${label}] archived ${toArchive.length} from inbox`);
     }
 
-    // Update historyId for this account — but ONLY when we processed the whole
-    // batch. On overflow we leave the cursor parked at the old historyId; the
-    // ring guarantees next run picks up exactly the deferred remainder.
-    if (!capped) {
+    // Update historyId for this account.
+    //
+    // Untruncated: only when the whole batch was processed. On overflow the
+    // cursor stays parked and the ring re-surfaces the deferred remainder.
+    //
+    // Truncated: always move to the contiguous-handled watermark, capped or
+    // not. Parking would deadlock (same window forever); "now" would orphan
+    // everything past the cap. Note this fires even when !capped — a late run
+    // draining the last 20 of a truncated 500 is precisely when the old code
+    // jumped to now and lost messages 501+.
+    if (truncated) {
+      const watermark = await nextCursor();
+      if (watermark) state.accounts[accountKey].lastHistoryId = watermark;
+    } else if (!capped) {
       const newHistoryId = await client.getCurrentHistoryId();
       state.accounts[accountKey].lastHistoryId = newHistoryId;
     }

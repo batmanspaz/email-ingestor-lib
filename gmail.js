@@ -42,6 +42,11 @@ async function withRetry(fn, label = 'gmail') {
   throw lastErr;
 }
 
+/** Hard cap on ids enumerated per getHistory() call — runaway-cost guard on an
+ *  inbox surge. Hitting it is not lossy so long as the caller honours
+ *  `truncated`; it just means the window drains over several runs. */
+const MAX_HISTORY_IDS_PER_CALL = 500;
+
 export class GmailClient {
   /**
    * @param {object} config
@@ -119,9 +124,21 @@ export class GmailClient {
   /**
    * Get message IDs added since startHistoryId.
    * Returns null if history expired (caller should reset).
+   *
+   * @returns {Promise<null|{ids:string[], truncated:boolean,
+   *   historyIdById:Record<string,string>, lastEnumeratedHistoryId:string|null}>}
+   *
+   * `truncated` is the contract that matters. Before 2026-08-23 this returned a
+   * bare array, so a caller could not tell 500-of-500 from 500-of-5000 — poll()
+   * read a fully-drained window as "caught up" and advanced its cursor past
+   * messages that had never been listed. 44 real losses on personal. A caller
+   * cannot be written correctly against a value that cannot express the failure.
    */
   async getHistory(startHistoryId) {
     const ids = [];
+    const historyIdById = {};
+    let lastEnumeratedHistoryId = null;
+    let truncated = false;
     let pageToken = null;
 
     try {
@@ -138,14 +155,27 @@ export class GmailClient {
           pageToken: pageToken || undefined,
         }), `${this.account}:history.list`);
         for (const record of res.data.history || []) {
+          // record.id is the record's historyId. It was previously discarded,
+          // which is precisely why the caller could not build a safe cursor.
+          if (record.id) lastEnumeratedHistoryId = String(record.id);
           for (const item of record.messagesAdded || []) {
-            if (item.message?.id) ids.push(item.message.id);
+            if (item.message?.id) {
+              ids.push(item.message.id);
+              if (record.id) historyIdById[item.message.id] = String(record.id);
+            }
           }
         }
         pageToken = res.data.nextPageToken || null;
-        // Hard cap: prevent runaway cost on inbox surges (e.g. long gap + burst)
-        if (ids.length >= 500) {
-          console.warn(`[gmail] history.list hit 500-message cap for ${this.account} — truncating`);
+        // Hard cap: prevent runaway cost on inbox surges (e.g. long gap + burst).
+        // Truncation means "we stopped early AND more was waiting" — 500-of-500
+        // with no next page is a COMPLETE window, not a truncated one. Conflating
+        // them is what made the 2026-08-23 mail loss invisible.
+        if (ids.length >= MAX_HISTORY_IDS_PER_CALL && pageToken) {
+          truncated = true;
+          console.warn(
+            `[gmail] history.list hit ${MAX_HISTORY_IDS_PER_CALL}-message cap for ${this.account}` +
+            ` — window TRUNCATED; caller must not advance its cursor past the last handled message`,
+          );
           break;
         }
       } while (pageToken);
@@ -156,7 +186,7 @@ export class GmailClient {
       throw err;
     }
 
-    return ids;
+    return { ids, truncated, historyIdById, lastEnumeratedHistoryId };
   }
 
   /** Fetch a single full message by ID */

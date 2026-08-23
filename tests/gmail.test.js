@@ -5,6 +5,7 @@
  * - Constructor validation (required fields throw descriptive errors)
  * - GmailClient.getHeader (pure static method, no mocks needed)
  * - fromTokenFile error path (file not found)
+ * - getHistory() paging, the 500-cap truncation signal, and historyId exposure
  * - archive() delegates to removeLabels
  * - createDraft() builds valid RFC 2822 base64 raw message
  * - sendEmail() builds valid raw message
@@ -311,5 +312,115 @@ describe('GmailClient#sendEmail', () => {
     });
 
     await client.sendEmail({ to: 'r@example.com', subject: 'Hello', body: 'Body text' });
+  });
+});
+
+// ── getHistory — truncation + historyId watermark ───────────────────────────
+// Added 2026-08-23. getHistory previously had NO direct tests, and it is the
+// function the mail-loss incident rests on: it hard-capped at 500 ids, DISCARDED
+// the pageToken, and returned a bare array — so poll() could not distinguish
+// 500-of-500 from 500-of-5000 and advanced its cursor past messages that were
+// never listed. 44 real occurrences on personal. The caller cannot be written
+// correctly against a return value that cannot express truncation.
+
+describe('GmailClient.getHistory', () => {
+  beforeEach(() => {
+    mockHistoryList.mockReset();
+  });
+
+  /** Build a history.list page: records ascending by historyId. */
+  const page = (records, nextPageToken = null) => ({
+    data: { history: records, nextPageToken },
+  });
+  /** One history record carrying its own historyId (`record.id`). */
+  const rec = (historyId, ...messageIds) => ({
+    id: String(historyId),
+    messagesAdded: messageIds.map((id) => ({ message: { id } })),
+  });
+
+  it('returns every id with truncated:false for a single complete page', async () => {
+    mockHistoryList.mockResolvedValueOnce(page([rec(1001, 'm1', 'm2'), rec(1002, 'm3')]));
+    const r = await new GmailClient(BASE_CONFIG).getHistory('1000');
+    expect(r.ids).toEqual(['m1', 'm2', 'm3']);
+    expect(r.truncated).toBe(false);
+  });
+
+  it('follows pageToken across MULTIPLE pages and still reports truncated:false', async () => {
+    mockHistoryList
+      .mockResolvedValueOnce(page([rec(1001, 'm1')], 'tok'))
+      .mockResolvedValueOnce(page([rec(1002, 'm2')]));
+    const r = await new GmailClient(BASE_CONFIG).getHistory('1000');
+    expect(r.ids).toEqual(['m1', 'm2']);
+    expect(r.truncated).toBe(false);
+    expect(mockHistoryList.mock.calls[1][0].pageToken).toBe('tok');
+  });
+
+  it('reports truncated:true when the 500 cap is struck with a pageToken still pending', async () => {
+    // THE BUG: this is the state that was previously indistinguishable from a
+    // complete window. 500 ids AND more pages waiting.
+    const many = Array.from({ length: 500 }, (_, i) => rec(2000 + i, `m${i}`));
+    mockHistoryList.mockResolvedValueOnce(page(many, 'more-please'));
+    const r = await new GmailClient(BASE_CONFIG).getHistory('1000');
+    expect(r.ids).toHaveLength(500);
+    expect(r.truncated).toBe(true);
+  });
+
+  it('does NOT report truncated when exactly 500 arrive and no page remains', async () => {
+    // 500-of-500 is complete, not truncated. Distinguishing these two is the
+    // entire point; treating the cap value itself as the signal would be wrong.
+    const many = Array.from({ length: 500 }, (_, i) => rec(2000 + i, `m${i}`));
+    mockHistoryList.mockResolvedValueOnce(page(many, null));
+    const r = await new GmailClient(BASE_CONFIG).getHistory('1000');
+    expect(r.ids).toHaveLength(500);
+    expect(r.truncated).toBe(false);
+  });
+
+  it('exposes each message historyId, and the last enumerated historyId', async () => {
+    // record.id is returned by the API today and was being discarded. It is the
+    // information the cursor watermark needs.
+    mockHistoryList.mockResolvedValueOnce(page([rec(1001, 'm1', 'm2'), rec(1005, 'm3')]));
+    const r = await new GmailClient(BASE_CONFIG).getHistory('1000');
+    expect(r.historyIdById).toEqual({ m1: '1001', m2: '1001', m3: '1005' });
+    expect(r.lastEnumeratedHistoryId).toBe('1005');
+  });
+
+  it('preserves ascending historyId order — the watermark depends on it', async () => {
+    mockHistoryList.mockResolvedValueOnce(page([rec(10, 'a'), rec(20, 'b'), rec(30, 'c')]));
+    const r = await new GmailClient(BASE_CONFIG).getHistory('1');
+    const order = r.ids.map((id) => Number(r.historyIdById[id]));
+    expect(order).toEqual([...order].sort((x, y) => x - y));
+  });
+
+  it('returns an empty result (not null) for an empty window', async () => {
+    mockHistoryList.mockResolvedValueOnce(page([]));
+    const r = await new GmailClient(BASE_CONFIG).getHistory('1000');
+    expect(r.ids).toEqual([]);
+    expect(r.truncated).toBe(false);
+    expect(r.lastEnumeratedHistoryId).toBeNull();
+  });
+
+  it('returns EXACTLY the keys poll.js destructures — guards mock/real drift', async () => {
+    // poll.js does: const { ids, truncated, historyIdById } = history
+    // and reads history.lastEnumeratedHistoryId. When getHistory's shape changed
+    // on 2026-08-23, poll.test.js's mocks still returned the OLD bare array and
+    // the whole suite stayed green while poll.js was broken against real
+    // gmail.js. This pins the producer side of that contract; poll.test.js's
+    // historyResult() helper is the consumer side.
+    mockHistoryList.mockResolvedValueOnce(page([rec(1001, 'm1')]));
+    const r = await new GmailClient(BASE_CONFIG).getHistory('1000');
+    expect(Object.keys(r).sort()).toEqual(
+      ['historyIdById', 'ids', 'lastEnumeratedHistoryId', 'truncated'].sort(),
+    );
+  });
+
+  it('still returns null on 404 — history expired, caller resets', async () => {
+    const err = new Error('Requested entity was not found'); err.code = 404;
+    mockHistoryList.mockRejectedValueOnce(err);
+    expect(await new GmailClient(BASE_CONFIG).getHistory('1000')).toBeNull();
+  });
+
+  it('still throws on a non-404 error', async () => {
+    mockHistoryList.mockRejectedValue(new Error('boom'));
+    await expect(new GmailClient(BASE_CONFIG).getHistory('1000')).rejects.toThrow('boom');
   });
 });
