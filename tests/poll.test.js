@@ -631,15 +631,152 @@ describe('poll() — poison messages, stalls, and history expiry', () => {
     expect(s2.maxStalledRuns).toBeGreaterThan(s1.maxStalledRuns);
   });
 
-  it('resets the stall counter once the cursor moves again', async () => {
+  it('resets the stall counter the moment the wedge clears', async () => {
+    // The counter climbs while p1 blocks the record, then drops to 0 on the run
+    // that quarantines it and lets the cursor advance. (It may climb again
+    // afterwards in this fixture, because the mock returns a STATIC window that
+    // never moves past the cursor — real Gmail's startHistoryId is exclusive,
+    // so a drained window comes back empty. The reset is the property under
+    // test, not the steady state.)
     const client = poisonClient('p1');
     seedState({ 'a@example.com': { lastHistoryId: '5' } });
     const handler = vi.fn().mockResolvedValue('processed');
-    let stats;
-    for (let i = 0; i < 5; i++) {
-      stats = await poll({ clients: [{ client, label: 'A' }], statePath, maxPerRun: 10 }, handler);
+    const seen = [];
+    for (let i = 0; i < 4; i++) {
+      const st = await poll({ clients: [{ client, label: 'A' }], statePath, maxPerRun: 10 }, handler);
+      seen.push(st.maxStalledRuns);
     }
-    expect(stats.maxStalledRuns).toBe(0);
+    expect(Math.max(...seen)).toBeGreaterThan(0);          // it did climb
+    expect(seen.slice(1).some((n, i) => n < seen[i])).toBe(true); // and it came back down
+  });
+
+  it('does NOT count a healthy untruncated overflow drain as stalled', async () => {
+    // An untruncated overflow parks the cursor BY DESIGN while the ring drains
+    // forward. Counting that as a stall fails a producer doing exactly what it
+    // should — and personal really did see 480/477/470-message bursts, so this
+    // would have fired on live data. Alarm fatigue is the failure mode the
+    // whole health effort exists to avoid; a check that reddens on healthy
+    // behaviour is as broken as one that can never redden.
+    const many = Array.from({ length: 40 }, (_, i) => `b${i}`);
+    const client = {
+      account: 'a@example.com',
+      getCurrentHistoryId: vi.fn().mockResolvedValue('99999'),
+      getHistory: vi.fn().mockResolvedValue(historyResult(many)), // untruncated
+      fetchMetadata: vi.fn().mockImplementation(async (id) => makeMeta({ id })),
+      _gmail: { users: { messages: { batchModify: vi.fn().mockResolvedValue({}) } } },
+    };
+    seedState({ 'a@example.com': { lastHistoryId: '5' } });
+    const handler = vi.fn().mockResolvedValue('processed');
+    let worst = 0;
+    for (let i = 0; i < 8; i++) {
+      const st = await poll({ clients: [{ client, label: 'A' }], statePath, maxPerRun: 5 }, handler);
+      worst = Math.max(worst, st.maxStalledRuns);
+    }
+    expect(worst).toBeLessThan(6); // must never reach the fail threshold
+  });
+
+  it('DOES count a genuine wedge — nothing handled and no advance', async () => {
+    const client = poisonClient('p1');
+    client.fetchMetadata = vi.fn().mockRejectedValue(new Error('everything fails'));
+    seedState({ 'a@example.com': { lastHistoryId: '5' } });
+    const s1 = await poll({ clients: [{ client, label: 'A' }], statePath, maxPerRun: 10 }, vi.fn());
+    expect(s1.maxStalledRuns).toBe(1);
+  });
+
+  it('resets a stale stall count on an early-exit path that advances the cursor', async () => {
+    // The early `continue` branches neither incremented nor reset the counter,
+    // so a count accrued during a drain survived into a later quiet period and
+    // could tip a healthy account over the threshold.
+    const client = poisonClient('p1');
+    seedState({ 'a@example.com': { lastHistoryId: '5', stalledRuns: 5 } });
+    client.getHistory = vi.fn().mockResolvedValue(historyResult([])); // nothing new
+    await poll({ clients: [{ client, label: 'A' }], statePath, maxPerRun: 10 }, vi.fn());
+    expect(readStateFile().accounts['a@example.com'].stalledRuns).toBe(0);
+  });
+
+  it('records WHICH message was quarantined, so the only deliberate drop is auditable', async () => {
+    const client = poisonClient('p1');
+    seedState({ 'a@example.com': { lastHistoryId: '5' } });
+    const handler = vi.fn().mockResolvedValue('processed');
+    for (let i = 0; i < 3; i++) {
+      await poll({ clients: [{ client, label: 'A' }], statePath, maxPerRun: 10 }, handler);
+    }
+    expect(readStateFile().accounts['a@example.com'].quarantinedIds).toContain('p1');
+  });
+
+  it('parks rather than advancing when an id cannot be attributed to a record', async () => {
+    // Reachable from real gmail.js: it pushes item.message.id unconditionally
+    // but only records historyIdById when record.id is truthy, so a record
+    // without an id yields an unattributable message. Skipping it would let the
+    // watermark advance past a position that was never handled — Blocker 1's
+    // class, one layer down.
+    const client = poisonClient('none');
+    client.getHistory = vi.fn().mockResolvedValue({
+      ids: ['p1', 'p2'], truncated: true,
+      historyIdById: { p1: '10' },           // p2 unattributable
+      lastEnumeratedHistoryId: '10',
+    });
+    seedState({ 'a@example.com': { lastHistoryId: '5' } });
+    await poll({ clients: [{ client, label: 'A' }], statePath, maxPerRun: 10 },
+      vi.fn().mockResolvedValue('processed'));
+    expect(readStateFile().accounts['a@example.com'].lastHistoryId).toBe('5');
+  });
+
+  it('never advances past an unhandled record that sorts BELOW a handled one', async () => {
+    // The BigInt clamp stops regression below the incoming cursor but not
+    // skipping a lower unhandled record if the API ever returns out of order.
+    // Clamping below the minimum unhandled record makes ordering irrelevant.
+    const client = poisonClient('low');
+    client.getHistory = vi.fn().mockResolvedValue(
+      historyResult(['high', 'low'], { truncated: true, historyIdById: { high: '30', low: '20' } }),
+    );
+    client.fetchMetadata = vi.fn().mockImplementation(async (id) => {
+      if (id === 'low') throw new Error('always fails');
+      return makeMeta({ id });
+    });
+    seedState({ 'a@example.com': { lastHistoryId: '5' } });
+    await poll({ clients: [{ client, label: 'A' }], statePath, maxPerRun: 10 },
+      vi.fn().mockResolvedValue('processed'));
+    // record 30 is handled but record 20 is not — advancing to 30 orphans 20.
+    expect(readStateFile().accounts['a@example.com'].lastHistoryId).toBe('5');
+  });
+
+  it('reports the WORST stalled account, not the last one polled', async () => {
+    // Deployed shape is several accounts per run. Last-writer-wins would let a
+    // healthy account mask a wedged one — invisible exactly where it matters.
+    const wedged = poisonClient('p1');
+    wedged.fetchMetadata = vi.fn().mockRejectedValue(new Error('all fail'));
+    const healthy = {
+      account: 'b@example.com',
+      getCurrentHistoryId: vi.fn().mockResolvedValue('99999'),
+      getHistory: vi.fn().mockResolvedValue(historyResult([])),
+      fetchMetadata: vi.fn(),
+      _gmail: { users: { messages: { batchModify: vi.fn().mockResolvedValue({}) } } },
+    };
+    seedState({
+      'a@example.com': { lastHistoryId: '5', stalledRuns: 4 },
+      'b@example.com': { lastHistoryId: '5' },
+    });
+    const stats = await poll({
+      clients: [{ client: wedged, label: 'A' }, { client: healthy, label: 'B' }],
+      statePath, maxPerRun: 10,
+    }, vi.fn());
+    expect(stats.maxStalledRuns).toBe(5); // the wedged account, not b's 0
+  });
+
+  it('bounds the persisted failure map so it cannot grow forever', async () => {
+    const many = Array.from({ length: 60 }, (_, i) => `f${i}`);
+    const client = {
+      account: 'a@example.com',
+      getCurrentHistoryId: vi.fn().mockResolvedValue('99999'),
+      getHistory: vi.fn().mockResolvedValue(historyResult(many)),
+      fetchMetadata: vi.fn().mockRejectedValue(new Error('all fail')),
+      _gmail: { users: { messages: { batchModify: vi.fn().mockResolvedValue({}) } } },
+    };
+    seedState({ 'a@example.com': { lastHistoryId: '5' } });
+    await poll({ clients: [{ client, label: 'A' }], statePath, maxPerRun: 60 }, vi.fn());
+    const n = Object.keys(readStateFile().accounts['a@example.com'].messageFailures).length;
+    expect(n).toBeLessThanOrEqual(50);
   });
 
   it('counts truncation PER ACCOUNT, not once per run', async () => {

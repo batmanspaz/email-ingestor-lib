@@ -107,9 +107,14 @@ describe('poll() + real GmailClient', () => {
     const records = [];
     for (let i = 0; i < 20; i++) records.push(rec(1000 + i, `m${i}a`, `m${i}b`));
     // Exclusive startHistoryId, as Gmail documents: records AFTER the cursor.
-    mockHistoryList.mockImplementation(async ({ startHistoryId }) => {
+    // Honour pageToken, so truncation arises from a modeled multi-page backlog
+    // rather than from the mock re-serving the same records until the cap trips.
+    mockHistoryList.mockImplementation(async ({ startHistoryId, pageToken }) => {
       const remaining = records.filter((r) => BigInt(r.id) > BigInt(startHistoryId));
-      return { data: { history: remaining, nextPageToken: remaining.length ? 'more' : null } };
+      const page = Number(pageToken || 0);
+      const slice = remaining.slice(page * 5, page * 5 + 5);
+      const more = remaining.length > (page + 1) * 5;
+      return { data: { history: slice, nextPageToken: more ? String(page + 1) : null } };
     });
     seed('999');
 

@@ -28,7 +28,7 @@ import { GmailClient } from './gmail.js';
  * @param {function} handler — async (message, client, { dryRun }) => void, called for each new message
  * @returns {Promise<{fetched:number, processed:number, errors:number, forwarded:number,
  *   archived:number, truncated:number, quarantined:number, historyExpired:number,
- *   maxStalledRuns:number}>}>}
+ *   maxStalledRuns:number}>}
  */
 export async function poll(config, handler) {
   const { clients, statePath, maxPerRun = 50, dryRun = false, invokeHandlerInDryRun = false, archiveAfterProcess = false } = config;
@@ -59,8 +59,31 @@ export async function poll(config, handler) {
       };
       if (!dryRun) writeState(statePath, state);
       console.log(`  [${label}] Seeded historyId = ${currentId}`);
-      continue;
+      continue; // first run: no prior cursor, so nothing to call a stall
     }
+
+    // Stall bookkeeping. PROGRESS means the cursor moved OR we handled at least
+    // one message — not the cursor alone. An UNtruncated overflow drain parks
+    // the cursor by design while the ring drains forward, which is healthy and
+    // routine (personal really saw 480/477/470-message bursts), so counting a
+    // parked cursor as stalled would have failed a producer doing exactly what
+    // it should. A check that reddens on healthy behaviour trains people to
+    // ignore it, which is the failure this whole health effort exists to avoid.
+    //
+    // Declared here and called from every exit path below — the early
+    // `continue` branches previously neither incremented nor reset it, so a
+    // count accrued during a drain survived into a later quiet period, and the
+    // wedges that manifest ONLY in those branches (an unattributable id, the
+    // backward clamp) were invisible to the very check built to catch them.
+    const failures = state.accounts[accountKey].messageFailures || {};
+    let handledCount = 0;
+    const noteRun = () => {
+      if (dryRun) return;
+      const acct = state.accounts[accountKey];
+      const advanced = acct.lastHistoryId !== historyId;
+      acct.stalledRuns = advanced || handledCount > 0 ? 0 : (acct.stalledRuns || 0) + 1;
+      if (acct.stalledRuns > stats.maxStalledRuns) stats.maxStalledRuns = acct.stalledRuns;
+    };
 
     // Durable processed-ring (2026-08-04 dup-storm fix): with producers no
     // longer archiving (single-writer contract), a parked cursor re-fetches
@@ -71,17 +94,29 @@ export async function poll(config, handler) {
     // API flakes across separate runs while bounding how long one bad message
     // can hold the cursor: at 2 runs/day it resolves inside two days.
     const MAX_MESSAGE_ATTEMPTS = 3;
+    // Bound on the persisted failure map — see the write site below.
+    const MAX_TRACKED_FAILURES = 50;
     const ringList = state.accounts?.[accountKey]?.processedIds || [];
     const ring = new Set(ringList);
-    const ringAdd = (id) => { if (!ring.has(id)) { ring.add(id); ringList.push(id); } };
+    const ringAdd = (id) => {
+      if (!ring.has(id)) { ring.add(id); ringList.push(id); handledCount++; }
+      delete failures[id]; // every ring path clears the count; no orphans in state
+    };
 
-    // Durable per-message failure counts. A message that fails deterministically
-    // (malformed MIME, a handler crash) is never ringed, so it breaks watermark
-    // contiguity at its own position FOREVER: the cursor freezes, everything
-    // past the enumeration cap is never listed, and after ~7 days the history
-    // window expires and the backlog is lost silently. Retiring the message
-    // after MAX_MESSAGE_ATTEMPTS trades one message for the rest of the queue.
-    const failures = state.accounts[accountKey].messageFailures || {};
+    // Durable per-message failure counts (declared above ringAdd, which clears
+    // them). A message that fails deterministically — malformed MIME, a handler
+    // crash — is never ringed, so it breaks watermark contiguity at its own
+    // position FOREVER: the cursor freezes, everything past the enumeration cap
+    // is never listed, and after ~7 days the history window expires and the
+    // backlog is lost silently. Retiring the message after MAX_MESSAGE_ATTEMPTS
+    // trades one message for the rest of the queue.
+    //
+    // NOTE the asymmetry: this 3-strike protection exists only inside TRUNCATED
+    // windows. On the untruncated path the cursor advances to now, so an errored
+    // message is never re-listed and gets zero strikes — it is simply lost, as
+    // it always has been. Unifying that is a separate change (advance untruncated
+    // to lastEnumeratedHistoryId too); do not read the quarantine block as a
+    // universal guarantee.
 
     // Fetch new message IDs
     const history = await client.getHistory(historyId);
@@ -99,6 +134,7 @@ export async function poll(config, handler) {
       const fresh = await client.getCurrentHistoryId();
       state.accounts[accountKey].lastHistoryId = fresh;
       state.accounts[accountKey].lastRunAt = new Date().toISOString();
+      noteRun();
       if (!dryRun) writeState(statePath, state);
       continue;
     }
@@ -160,11 +196,22 @@ export async function poll(config, handler) {
       }
 
       let watermark = null;
+      let lowestUnhandled = null;
       for (const rec of order) {
-        if (!byRecord.get(rec).every((id) => ring.has(id))) break;
-        watermark = rec;
+        if (byRecord.get(rec).every((id) => ring.has(id))) {
+          if (lowestUnhandled === null) watermark = rec;
+        } else if (lowestUnhandled === null || BigInt(rec) < BigInt(lowestUnhandled)) {
+          lowestUnhandled = rec;
+        }
       }
       if (watermark === null) return null; // nothing fully handled yet => park
+
+      // Clamp below the LOWEST unhandled record, not merely below the first one
+      // encountered. This is what makes the ascending-order assumption
+      // unnecessary rather than merely documented: if records ever arrive out
+      // of order, a handled record sorting above an unhandled one must not
+      // carry the cursor past it.
+      if (lowestUnhandled !== null && BigInt(watermark) >= BigInt(lowestUnhandled)) return null;
 
       // Clamp: never regress. Compared as BigInt — Gmail historyIds are large
       // integers and string compare would order '9' after '100'.
@@ -180,6 +227,7 @@ export async function poll(config, handler) {
       const fresh = await nextCursor();
       if (fresh) state.accounts[accountKey].lastHistoryId = fresh;
       state.accounts[accountKey].lastRunAt = new Date().toISOString();
+      noteRun();
       if (!dryRun) writeState(statePath, state);
       continue;
     }
@@ -201,6 +249,7 @@ export async function poll(config, handler) {
       const fresh = await nextCursor();
       if (fresh) state.accounts[accountKey].lastHistoryId = fresh;
       state.accounts[accountKey].lastRunAt = new Date().toISOString();
+      noteRun();
       if (!dryRun) writeState(statePath, state);
       continue;
     }
@@ -265,8 +314,12 @@ export async function poll(config, handler) {
                 `retiring it so the cursor can advance past its record. This message ` +
                 `is DROPPED and will not be retried.`,
               );
-              ringAdd(id);
-              delete failures[id];
+              ringAdd(id); // also clears failures[id]
+              const q = state.accounts[accountKey].quarantinedIds || [];
+              q.push(id);
+              // Capped: the drop must be auditable, not unbounded. The message
+              // is still in the mailbox — recoverable, but only if its id survived.
+              state.accounts[accountKey].quarantinedIds = q.slice(-200);
               stats.quarantined++;
             }
           }
@@ -309,16 +362,15 @@ export async function poll(config, handler) {
     }
     if (!dryRun) {
       state.accounts[accountKey].processedIds = ringList.slice(-RING_MAX);
-      state.accounts[accountKey].messageFailures = failures;
-
-      // Stall detection: a cursor that does not move across runs while work
-      // remains is the shape every wedge in this module takes. Counted so it
-      // can be health-checked, because "quiet" and "stuck" look identical.
-      const advanced = state.accounts[accountKey].lastHistoryId !== historyId;
-      const stalled = advanced ? 0 : (state.accounts[accountKey].stalledRuns || 0) + 1;
-      state.accounts[accountKey].stalledRuns = stalled;
-      if (stalled > stats.maxStalledRuns) stats.maxStalledRuns = stalled;
+      // Bounded like processedIds: a message that errors once and is never
+      // re-listed (the untruncated path advances regardless of errors) would
+      // otherwise leave its entry in state forever, and state.json is rewritten
+      // in full on every run.
+      state.accounts[accountKey].messageFailures = Object.fromEntries(
+        Object.entries(failures).slice(-MAX_TRACKED_FAILURES),
+      );
     }
+    noteRun();
     state.accounts[accountKey].lastRunAt = new Date().toISOString();
     if (!dryRun) writeState(statePath, state);
   }

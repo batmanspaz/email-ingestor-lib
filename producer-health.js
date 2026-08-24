@@ -29,6 +29,11 @@ const HEALTH_STATUS_BY_CHECK_STATUS = {
 
 const HEALTH_SEVERITY = { ok: 0, degraded: 1, down: 2 };
 
+/** A count is only trustworthy if it is a finite, non-negative number. */
+function invalidCount(n) {
+  return typeof n !== 'number' || !Number.isFinite(n) || n < 0;
+}
+
 /**
  * history.truncation — how many history windows getHistory had to truncate.
  *
@@ -52,7 +57,7 @@ export function computeTruncationCheck(truncatedCount) {
   // string from a consumer wiring this by hand. Both previously rendered as
   // `pass` — "missing = healthy" rebuilt one layer up — and NaN was additionally
   // schema-invalid, which makes telemetry.js discard the WHOLE report.
-  if (typeof truncatedCount !== 'number' || !Number.isFinite(truncatedCount) || truncatedCount < 0) {
+  if (invalidCount(truncatedCount)) {
     return {
       id: 'history.truncation',
       status: 'warn',
@@ -73,11 +78,6 @@ export function computeTruncationCheck(truncatedCount) {
         ? `${truncatedCount} history window(s) truncated — producer is behind, draining across runs`
         : 'no truncated history windows',
   };
-}
-
-/** A count is only trustworthy if it is a finite, non-negative number. */
-function invalidCount(n) {
-  return typeof n !== 'number' || !Number.isFinite(n) || n < 0;
 }
 
 /**
@@ -105,6 +105,38 @@ export function computeHistoryExpiredCheck(count) {
       count > 0
         ? `${count} history window(s) expired before draining — mail in the gap was never enumerated and is NOT recoverable by polling`
         : 'no history windows expired',
+  };
+}
+
+/**
+ * message.quarantined — messages this producer DELIBERATELY dropped after
+ * repeated failure, to stop one bad message wedging the cursor until Gmail's
+ * history aged out and took the whole backlog with it.
+ *
+ * `fail`, like history.expired: this is intentional, permanent loss. Counting
+ * it and writing a console.error would be the exact posture this module
+ * condemns two docblocks up. The message is still in the mailbox and its id is
+ * persisted in account state, so it is recoverable — but only by someone who
+ * knows it happened.
+ */
+export function computeQuarantineCheck(count) {
+  if (invalidCount(count)) {
+    return {
+      id: 'message.quarantined',
+      status: 'warn',
+      unit: 'count',
+      detail: 'quarantine count not reported by poll() — cannot assert zero',
+    };
+  }
+  return {
+    id: 'message.quarantined',
+    status: count > 0 ? 'fail' : 'pass',
+    metric: count,
+    unit: 'count',
+    detail:
+      count > 0
+        ? `${count} message(s) deliberately dropped after repeated failure — ids are in account state under quarantinedIds`
+        : 'no messages quarantined',
   };
 }
 
@@ -159,6 +191,7 @@ export async function reportProducerHealth(telemetry, stats, opts = {}) {
   const truncationCheck = computeTruncationCheck(stats.truncated);
   const expiredCheck = computeHistoryExpiredCheck(stats.historyExpired);
   const stallCheck = computeStallCheck(stats.maxStalledRuns);
+  const quarantineCheck = computeQuarantineCheck(stats.quarantined);
 
   // Overall status is the WORST of EVERY check, not just the producer's own run.
   // A green producer filling a queue nothing drains is an outage (the 2026-08-02
@@ -171,6 +204,7 @@ export async function reportProducerHealth(telemetry, stats, opts = {}) {
     HEALTH_STATUS_BY_CHECK_STATUS[truncationCheck.status],
     HEALTH_STATUS_BY_CHECK_STATUS[expiredCheck.status],
     HEALTH_STATUS_BY_CHECK_STATUS[stallCheck.status],
+    HEALTH_STATUS_BY_CHECK_STATUS[quarantineCheck.status],
   ].reduce((worst, s) => (HEALTH_SEVERITY[s] > HEALTH_SEVERITY[worst] ? s : worst));
 
   await telemetry.reportHealth({
@@ -186,6 +220,7 @@ export async function reportProducerHealth(telemetry, stats, opts = {}) {
       truncationCheck,
       expiredCheck,
       stallCheck,
+      quarantineCheck,
     ],
   });
 }
@@ -194,9 +229,9 @@ export async function reportProducerHealth(telemetry, stats, opts = {}) {
  * @param {import('@perfectcity/telemetry').Telemetry} telemetry
  * @param {{entityId:string, fetched:number, produced:number, skipped:number, errors:number}} params
  */
-export function trackProducerRun(telemetry, { entityId, fetched, produced, skipped, errors }) {
+export function trackProducerRun(telemetry, { entityId, fetched, produced, skipped, errors, quarantined = 0 }) {
   telemetry.track({
     event: 'producer.run',
-    props: { entity_id: entityId, fetched, produced, skipped, errors },
+    props: { entity_id: entityId, fetched, produced, skipped, errors, quarantined },
   });
 }

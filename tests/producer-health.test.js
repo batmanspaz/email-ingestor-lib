@@ -24,7 +24,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { createTelemetry, HealthReportSchema, AnalyticsBatchSchema } from '@perfectcity/telemetry';
-import { computeProducerStatus, reportProducerHealth, trackProducerRun, computeTruncationCheck, computeHistoryExpiredCheck, computeStallCheck } from '../producer-health.js';
+import { computeProducerStatus, reportProducerHealth, trackProducerRun, computeTruncationCheck, computeHistoryExpiredCheck, computeStallCheck, computeQuarantineCheck } from '../producer-health.js';
 import { HealthCheckSchema } from '@perfectcity/telemetry';
 
 // Healthy on-disk sluice fixture (empty inbox) so reportProducerHealth's
@@ -82,7 +82,7 @@ describe('reportProducerHealth', () => {
     // truncated: 0 is REQUIRED for an 'ok' report as of 2026-08-23 — a caller that
     // cannot attest zero truncation gets 'warn', because "missing = healthy" is
     // banned (dev-rules Sec28.1) and an absent counter is not evidence of absence.
-    await reportProducerHealth(telemetry, { fetched: 3, produced: 3, errors: 0, truncated: 0, historyExpired: 0, maxStalledRuns: 0 }, { sluiceDir });
+    await reportProducerHealth(telemetry, { fetched: 3, produced: 3, errors: 0, truncated: 0, historyExpired: 0, maxStalledRuns: 0, quarantined: 0 }, { sluiceDir });
 
     expect(sent.health.length).toBe(1);
     const report = sent.health[0];
@@ -110,7 +110,7 @@ describe('reportProducerHealth', () => {
       batchIntervalMs: 0,
       autoStart: false,
     });
-    await reportProducerHealth(telemetry, { fetched: 2, produced: 0, errors: 2, truncated: 0, historyExpired: 0, maxStalledRuns: 0 }, { sluiceDir });
+    await reportProducerHealth(telemetry, { fetched: 2, produced: 0, errors: 2, truncated: 0, historyExpired: 0, maxStalledRuns: 0, quarantined: 0 }, { sluiceDir });
     const report = sent.health[0];
     expect(() => HealthReportSchema.parse(report)).not.toThrow();
     expect(report.status).toBe('down');
@@ -139,7 +139,7 @@ describe('reportProducerHealth', () => {
     // truncated: 0 is REQUIRED for an 'ok' report as of 2026-08-23 — a caller that
     // cannot attest zero truncation gets 'warn', because "missing = healthy" is
     // banned (dev-rules Sec28.1) and an absent counter is not evidence of absence.
-    await reportProducerHealth(telemetry, { fetched: 3, produced: 3, errors: 0, truncated: 0, historyExpired: 0, maxStalledRuns: 0 }, { sluiceDir });
+    await reportProducerHealth(telemetry, { fetched: 3, produced: 3, errors: 0, truncated: 0, historyExpired: 0, maxStalledRuns: 0, quarantined: 0 }, { sluiceDir });
 
     const report = sent.health[0];
     expect(() => HealthReportSchema.parse(report)).not.toThrow();
@@ -160,7 +160,7 @@ describe('reportProducerHealth', () => {
       batchIntervalMs: 0,
       autoStart: false,
     });
-    await reportProducerHealth(telemetry, { fetched: 1, produced: 1, errors: 0, truncated: 0, historyExpired: 0, maxStalledRuns: 0 }, { sluiceDir: null });
+    await reportProducerHealth(telemetry, { fetched: 1, produced: 1, errors: 0, truncated: 0, historyExpired: 0, maxStalledRuns: 0, quarantined: 0 }, { sluiceDir: null });
 
     const report = sent.health[0];
     expect(() => HealthReportSchema.parse(report)).not.toThrow();
@@ -192,7 +192,7 @@ describe('trackProducerRun', () => {
     expect(batch.length).toBe(1);
     const event = batch[0];
     expect(event.event).toBe('producer.run');
-    expect(event.props).toEqual({ entity_id: 'collagesoup', fetched: 4, produced: 3, skipped: 1, errors: 0 });
+    expect(event.props).toEqual({ entity_id: 'collagesoup', fetched: 4, produced: 3, skipped: 1, errors: 0, quarantined: 0 });
   });
 
   it('never includes raw email addresses, subjects, or message bodies in props', async () => {
@@ -213,7 +213,7 @@ describe('trackProducerRun', () => {
     const props = sent.analytics[0][0].props;
     const serialized = JSON.stringify(props);
     expect(serialized).not.toMatch(/@/); // no email addresses
-    expect(Object.keys(props).sort()).toEqual(['entity_id', 'errors', 'fetched', 'produced', 'skipped']);
+    expect(Object.keys(props).sort()).toEqual(['entity_id', 'errors', 'fetched', 'produced', 'quarantined', 'skipped']);
   });
 });
 
@@ -291,7 +291,7 @@ describe('reportProducerHealth — truncation is always in the report', () => {
 
   it('includes history.truncation even when nothing was truncated', async () => {
     const { sent, telemetry } = telemetryFor();
-    await reportProducerHealth(telemetry, { fetched: 5, produced: 5, errors: 0, truncated: 0, historyExpired: 0, maxStalledRuns: 0 }, { sluiceDir });
+    await reportProducerHealth(telemetry, { fetched: 5, produced: 5, errors: 0, truncated: 0, historyExpired: 0, maxStalledRuns: 0, quarantined: 0 }, { sluiceDir });
     const ids = sent.health[0].checks.map((c) => c.id);
     expect(ids).toContain('history.truncation');
     expect(() => HealthReportSchema.parse(sent.health[0])).not.toThrow();
@@ -299,7 +299,7 @@ describe('reportProducerHealth — truncation is always in the report', () => {
 
   it('drags overall status off ok when a window was truncated', async () => {
     const { sent, telemetry } = telemetryFor();
-    await reportProducerHealth(telemetry, { fetched: 5, produced: 5, errors: 0, truncated: 2, historyExpired: 0, maxStalledRuns: 0 }, { sluiceDir });
+    await reportProducerHealth(telemetry, { fetched: 5, produced: 5, errors: 0, truncated: 2, historyExpired: 0, maxStalledRuns: 0, quarantined: 0 }, { sluiceDir });
     expect(sent.health[0].status).not.toBe('ok');
     expect(() => HealthReportSchema.parse(sent.health[0])).not.toThrow();
   });
@@ -387,6 +387,57 @@ describe('reportProducerHealth — every silent-loss shape reaches the report', 
     await reportProducerHealth(telemetry,
       { fetched: 1, produced: 1, errors: 0, truncated: 0, historyExpired: 1, maxStalledRuns: 0 },
       { sluiceDir });
+    expect(sent.health[0].status).toBe('down');
+    expect(() => HealthReportSchema.parse(sent.health[0])).not.toThrow();
+  });
+});
+
+describe('computeStallCheck — the threshold itself', () => {
+  it('passes one run BELOW the fail threshold and fails AT it', () => {
+    // Untested constants are how `> 0` -> `> 1` survived earlier. At 60 instead
+    // of 6 the check would fire 30 days in — three weeks after the mail is
+    // unrecoverable — while every existing test stayed green.
+    expect(computeStallCheck(5).status).toBe('pass');
+    expect(computeStallCheck(6).status).toBe('fail');
+  });
+});
+
+describe('computeQuarantineCheck', () => {
+  it('passes with an asserted zero when nothing was dropped', () => {
+    expect(computeQuarantineCheck(0)).toMatchObject({
+      id: 'message.quarantined', status: 'pass', metric: 0,
+    });
+  });
+
+  it('FAILS when a message was quarantined — it is deliberate, permanent loss', () => {
+    // Quarantine intentionally DROPS mail to unwedge the cursor. Counting it
+    // and console.error-ing it is the exact posture this module condemns
+    // elsewhere; it must reach the health report like history.expired does.
+    expect(computeQuarantineCheck(1).status).toBe('fail');
+  });
+
+  it('never reports green for an unreported or nonsense count', () => {
+    for (const bad of [undefined, null, NaN, -1, 'x']) {
+      expect(computeQuarantineCheck(bad).status, String(bad)).not.toBe('pass');
+    }
+  });
+
+  it('is schema-valid in every branch', () => {
+    for (const n of [undefined, null, 0, 1, NaN, -1, 'x']) {
+      expect(HealthCheckSchema.safeParse(computeQuarantineCheck(n)).success, String(n)).toBe(true);
+    }
+  });
+
+  it('reaches the health report and drags the overall status down', async () => {
+    const { sent, transport } = fakeTransport();
+    const telemetry = createTelemetry({
+      product: 'sluice', module: 'producer.test', version: 'test',
+      transport, heartbeatMs: 0, batchIntervalMs: 0, autoStart: false,
+    });
+    await reportProducerHealth(telemetry,
+      { fetched: 1, produced: 1, errors: 0, truncated: 0, historyExpired: 0, maxStalledRuns: 0, quarantined: 1 },
+      { sluiceDir });
+    expect(sent.health[0].checks.map((c) => c.id)).toContain('message.quarantined');
     expect(sent.health[0].status).toBe('down');
     expect(() => HealthReportSchema.parse(sent.health[0])).not.toThrow();
   });
