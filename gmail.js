@@ -166,10 +166,10 @@ export class GmailClient {
           }
         }
         pageToken = res.data.nextPageToken || null;
-        // Hard cap: prevent runaway cost on inbox surges (e.g. long gap + burst).
-        // Truncation means "we stopped early AND more was waiting" — 500-of-500
-        // with no next page is a COMPLETE window, not a truncated one. Conflating
-        // them is what made the 2026-08-23 mail loss invisible.
+        // Hard cap: runaway-cost guard on an inbox surge. "Truncated" means we
+        // stopped early AND more was waiting — 500-of-500 with no next page is a
+        // COMPLETE window. Conflating the two is what hid the 2026-08-23 loss;
+        // the full account of it lives in poll.js's nextCursor().
         if (ids.length >= MAX_HISTORY_IDS_PER_CALL && pageToken) {
           truncated = true;
           console.warn(

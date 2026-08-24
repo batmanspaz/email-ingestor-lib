@@ -47,12 +47,20 @@ const HEALTH_SEVERITY = { ok: 0, degraded: 1, down: 2 };
  * metric?, unit?} only. An extra key makes telemetry.js discard the WHOLE report.
  */
 export function computeTruncationCheck(truncatedCount) {
-  if (truncatedCount === undefined || truncatedCount === null) {
+  // Anything that is not a finite, non-negative number is UNKNOWN, never green.
+  // NaN reaches here from Number(process.env.X) or from summing an undefined; a
+  // string from a consumer wiring this by hand. Both previously rendered as
+  // `pass` — "missing = healthy" rebuilt one layer up — and NaN was additionally
+  // schema-invalid, which makes telemetry.js discard the WHOLE report.
+  if (typeof truncatedCount !== 'number' || !Number.isFinite(truncatedCount) || truncatedCount < 0) {
     return {
       id: 'history.truncation',
       status: 'warn',
       unit: 'count',
-      detail: 'truncation count not reported by poll() — cannot assert zero',
+      detail:
+        truncatedCount === undefined || truncatedCount === null
+          ? 'truncation count not reported by poll() — cannot assert zero'
+          : 'truncation count is not a valid non-negative number — cannot assert zero',
     };
   }
   return {
@@ -67,9 +75,74 @@ export function computeTruncationCheck(truncatedCount) {
   };
 }
 
+/** A count is only trustworthy if it is a finite, non-negative number. */
+function invalidCount(n) {
+  return typeof n !== 'number' || !Number.isFinite(n) || n < 0;
+}
+
+/**
+ * history.expired — Gmail's ~7-day history window aged out before the producer
+ * drained it. Everything between the old cursor and now was never enumerated
+ * and CANNOT be recovered by polling: a historyId cursor does not look
+ * backwards. That is known, unrecoverable loss, so this is `fail`, not `warn`.
+ * Emitted at zero like the others — silence is not evidence of absence.
+ */
+export function computeHistoryExpiredCheck(count) {
+  if (invalidCount(count)) {
+    return {
+      id: 'history.expired',
+      status: 'warn',
+      unit: 'count',
+      detail: 'history-expiry count not reported by poll() — cannot assert zero',
+    };
+  }
+  return {
+    id: 'history.expired',
+    status: count > 0 ? 'fail' : 'pass',
+    metric: count,
+    unit: 'count',
+    detail:
+      count > 0
+        ? `${count} history window(s) expired before draining — mail in the gap was never enumerated and is NOT recoverable by polling`
+        : 'no history windows expired',
+  };
+}
+
+/**
+ * cursor.stalled — consecutive runs in which an account's cursor did not move.
+ * Every wedge this module can suffer takes this shape, and "quiet" and "stuck"
+ * are indistinguishable without it. Threshold is 6 runs: at the deployed
+ * 2-runs-a-day cadence that is three days of no forward progress, comfortably
+ * inside Gmail's ~7-day history retention so it fires while recovery is still
+ * possible rather than after the window has aged out.
+ */
+const STALL_FAIL_RUNS = 6;
+
+export function computeStallCheck(consecutiveRuns) {
+  if (invalidCount(consecutiveRuns)) {
+    return {
+      id: 'cursor.stalled',
+      status: 'warn',
+      unit: 'count',
+      detail: 'stall count not reported by poll() — cannot assert the cursor is moving',
+    };
+  }
+  return {
+    id: 'cursor.stalled',
+    status: consecutiveRuns >= STALL_FAIL_RUNS ? 'fail' : 'pass',
+    metric: consecutiveRuns,
+    unit: 'count',
+    detail:
+      consecutiveRuns >= STALL_FAIL_RUNS
+        ? `cursor has not advanced for ${consecutiveRuns} consecutive runs — the producer is stuck, not quiet`
+        : `cursor advancing (${consecutiveRuns} quiet run(s))`,
+  };
+}
+
 /**
  * @param {import('@perfectcity/telemetry').Telemetry} telemetry
- * @param {{fetched:number, produced:number, errors:number, truncated?:number}} stats
+ * @param {{fetched:number, produced:number, errors:number, truncated?:number,
+ *          historyExpired?:number, maxStalledRuns?:number}} stats
  * @param {{sluiceDir?:string, now?:Date}} [opts] — sluiceDir defaults to
  *   process.env.SLUICE_DIR (the same env the producer wrote envelopes with);
  *   unset/missing reports queue.depth as fail, never green (2026-08-02 rule).
@@ -83,19 +156,22 @@ export async function reportProducerHealth(telemetry, stats, opts = {}) {
     now,
   });
 
-  // Overall status is the WORST of the producer's own run and the queue it
-  // feeds — a green producer filling a queue nothing drains is an outage,
-  // which is exactly what the pre-2026-08-02 report failed to say.
   const truncationCheck = computeTruncationCheck(stats.truncated);
+  const expiredCheck = computeHistoryExpiredCheck(stats.historyExpired);
+  const stallCheck = computeStallCheck(stats.maxStalledRuns);
 
-  // Overall status is the WORST of every check, not just the producer's own run
-  // — a green producer that keeps truncating its window is behind, and a green
-  // producer filling a queue nothing drains is an outage.
-  const queueStatus = HEALTH_STATUS_BY_CHECK_STATUS[queueCheck.status];
-  const truncationStatus = HEALTH_STATUS_BY_CHECK_STATUS[truncationCheck.status];
-  const status = [producerStatus, queueStatus, truncationStatus].reduce((worst, s) =>
-    HEALTH_SEVERITY[s] > HEALTH_SEVERITY[worst] ? s : worst,
-  );
+  // Overall status is the WORST of EVERY check, not just the producer's own run.
+  // A green producer filling a queue nothing drains is an outage (the 2026-08-02
+  // lesson); one that keeps truncating its window is behind; one whose cursor
+  // has stopped moving is stuck; one that let its history expire has already
+  // lost mail. None of those may be reported as ok.
+  const status = [
+    producerStatus,
+    HEALTH_STATUS_BY_CHECK_STATUS[queueCheck.status],
+    HEALTH_STATUS_BY_CHECK_STATUS[truncationCheck.status],
+    HEALTH_STATUS_BY_CHECK_STATUS[expiredCheck.status],
+    HEALTH_STATUS_BY_CHECK_STATUS[stallCheck.status],
+  ].reduce((worst, s) => (HEALTH_SEVERITY[s] > HEALTH_SEVERITY[worst] ? s : worst));
 
   await telemetry.reportHealth({
     status,
@@ -108,6 +184,8 @@ export async function reportProducerHealth(telemetry, stats, opts = {}) {
       },
       queueCheck,
       truncationCheck,
+      expiredCheck,
+      stallCheck,
     ],
   });
 }

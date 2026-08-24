@@ -401,7 +401,9 @@ describe('GmailClient.getHistory', () => {
 
   it('returns EXACTLY the keys poll.js destructures — guards mock/real drift', async () => {
     // poll.js does: const { ids, truncated, historyIdById } = history
-    // and reads history.lastEnumeratedHistoryId. When getHistory's shape changed
+    // (lastEnumeratedHistoryId is returned for diagnostics and is not read by
+    // poll — see tests/poll-gmail-composition.test.js for the composed path).
+    // When getHistory's shape changed
     // on 2026-08-23, poll.test.js's mocks still returned the OLD bare array and
     // the whole suite stayed green while poll.js was broken against real
     // gmail.js. This pins the producer side of that contract; poll.test.js's

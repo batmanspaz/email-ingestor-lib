@@ -26,11 +26,19 @@ import { GmailClient } from './gmail.js';
  *   Forwarded messages are also archived (already handled at destination).
  *   Has no effect in dryRun mode.
  * @param {function} handler — async (message, client, { dryRun }) => void, called for each new message
- * @returns {Promise<{fetched: number, processed: number, errors: number, forwarded: number, archived: number}>}
+ * @returns {Promise<{fetched:number, processed:number, errors:number, forwarded:number,
+ *   archived:number, truncated:number, quarantined:number, historyExpired:number,
+ *   maxStalledRuns:number}>}>}
  */
 export async function poll(config, handler) {
   const { clients, statePath, maxPerRun = 50, dryRun = false, invokeHandlerInDryRun = false, archiveAfterProcess = false } = config;
-  const stats = { fetched: 0, processed: 0, errors: 0, forwarded: 0, archived: 0, truncated: 0 };
+  const stats = {
+    fetched: 0, processed: 0, errors: 0, forwarded: 0, archived: 0,
+    truncated: 0,        // history windows getHistory had to cut short
+    quarantined: 0,      // messages retired after repeated deterministic failure
+    historyExpired: 0,   // KNOWN-LOSS events: Gmail's ~7d history aged out
+    maxStalledRuns: 0,   // worst consecutive runs an account's cursor sat still
+  };
 
   const state = readState(statePath);
   const seenMessageIds = new Set();
@@ -59,15 +67,35 @@ export async function poll(config, handler) {
     // the SAME window every run — the ring records what was already handled
     // so overflow drains forward instead of looping on the first batch.
     const RING_MAX = 1000;
+    // Attempts before a message is retired. 3 tolerates transient network and
+    // API flakes across separate runs while bounding how long one bad message
+    // can hold the cursor: at 2 runs/day it resolves inside two days.
+    const MAX_MESSAGE_ATTEMPTS = 3;
     const ringList = state.accounts?.[accountKey]?.processedIds || [];
     const ring = new Set(ringList);
     const ringAdd = (id) => { if (!ring.has(id)) { ring.add(id); ringList.push(id); } };
+
+    // Durable per-message failure counts. A message that fails deterministically
+    // (malformed MIME, a handler crash) is never ringed, so it breaks watermark
+    // contiguity at its own position FOREVER: the cursor freezes, everything
+    // past the enumeration cap is never listed, and after ~7 days the history
+    // window expires and the backlog is lost silently. Retiring the message
+    // after MAX_MESSAGE_ATTEMPTS trades one message for the rest of the queue.
+    const failures = state.accounts[accountKey].messageFailures || {};
 
     // Fetch new message IDs
     const history = await client.getHistory(historyId);
 
     if (history === null) {
-      console.warn(`  [${label}] History expired — resetting historyId`);
+      // KNOWN LOSS. Gmail's history window (~7 days) aged out before we drained
+      // it, so whatever sat between the old cursor and now was never listed and
+      // never will be — a historyId cursor cannot look backwards. Counted and
+      // health-checked as a failure, not warned into a log nobody reads.
+      stats.historyExpired++;
+      console.error(
+        `  [${label}] HISTORY EXPIRED — resetting historyId. Messages between the old` +
+        ` cursor and now were never enumerated and are NOT recoverable by polling.`,
+      );
       const fresh = await client.getCurrentHistoryId();
       state.accounts[accountKey].lastHistoryId = fresh;
       state.accounts[accountKey].lastRunAt = new Date().toISOString();
@@ -100,21 +128,52 @@ export async function poll(config, handler) {
      * and the cursor never moves again. Neither "advance to now" nor "never
      * advance" is correct.
      *
-     * So: advance to the last CONTIGUOUSLY handled message. Everything at or
-     * before it is in the ring; nothing after it is skipped. Gmail returns
-     * history records in ascending historyId order, which is what makes a
-     * prefix watermark meaningful. A ring hole stops the watermark dead — we
-     * would rather re-list a handled message (the ring absorbs it) than step
+     * So: advance to the last fully-handled RECORD. A ring hole stops it dead —
+     * we would rather re-list a handled message (the ring absorbs it) than step
      * over an unhandled one (unrecoverable).
+     *
+     * RECORD granularity, not message granularity, and this distinction is the
+     * whole correctness argument. A history record's `messagesAdded` is an
+     * ARRAY: one record can carry several messages, and the cursor addresses
+     * RECORDS. A first cut of this walked per-message, so a record holding one
+     * ringed and one unringed message committed the cursor TO that record —
+     * and `startHistoryId` is exclusive, so the unringed sibling was never
+     * listed again. That reproduced the very bug this code exists to fix, one
+     * granularity finer; two independent audits caught it on 2026-08-23.
+     *
+     * The result is also clamped to never move backward. Gmail documents
+     * ascending record order, but the cursor is durable state and a regression
+     * would enlarge the next window, re-truncate, re-derive a smaller
+     * watermark, and stall on itself — so we do not take the ordering on trust.
      */
     const nextCursor = async () => {
       if (!truncated) return await client.getCurrentHistoryId();
-      let watermark = null;
+
+      // Group the enumerated ids by their record, preserving first-seen order.
+      const order = [];
+      const byRecord = new Map();
       for (const id of enumerated) {
-        if (!ring.has(id)) break;
-        watermark = historyIdById?.[id] ?? watermark;
+        const rec = historyIdById[id];
+        if (rec === undefined) return null; // unattributable id — refuse to advance
+        if (!byRecord.has(rec)) { byRecord.set(rec, []); order.push(rec); }
+        byRecord.get(rec).push(id);
       }
-      return watermark; // null => nothing handled yet => park
+
+      let watermark = null;
+      for (const rec of order) {
+        if (!byRecord.get(rec).every((id) => ring.has(id))) break;
+        watermark = rec;
+      }
+      if (watermark === null) return null; // nothing fully handled yet => park
+
+      // Clamp: never regress. Compared as BigInt — Gmail historyIds are large
+      // integers and string compare would order '9' after '100'.
+      try {
+        if (BigInt(watermark) <= BigInt(historyId)) return null;
+      } catch {
+        return null; // non-numeric historyId: refuse rather than guess
+      }
+      return watermark;
     };
 
     if (messageIds.length === 0) {
@@ -185,7 +244,7 @@ export async function poll(config, handler) {
         const result = await handler(meta, client, { dryRun });
         if (result === 'forwarded') stats.forwarded++;
         stats.processed++;
-        if (!dryRun) ringAdd(id);
+        if (!dryRun) { ringAdd(id); delete failures[id]; }
         // Per-client archiveAfterProcess overrides the global setting.
         // Set noArchive: true on a client entry to keep that account's inbox intact.
         const shouldArchive = !dryRun && (clientEntry.noArchive ? false : archiveAfterProcess);
@@ -198,6 +257,19 @@ export async function poll(config, handler) {
         } else {
           console.error(`    Error processing ${id}: ${err.message}`);
           stats.errors++;
+          if (!dryRun) {
+            failures[id] = (failures[id] || 0) + 1;
+            if (failures[id] >= MAX_MESSAGE_ATTEMPTS) {
+              console.error(
+                `    QUARANTINED ${id} after ${failures[id]} failed attempts — ` +
+                `retiring it so the cursor can advance past its record. This message ` +
+                `is DROPPED and will not be retried.`,
+              );
+              ringAdd(id);
+              delete failures[id];
+              stats.quarantined++;
+            }
+          }
         }
       }
     }
@@ -237,6 +309,15 @@ export async function poll(config, handler) {
     }
     if (!dryRun) {
       state.accounts[accountKey].processedIds = ringList.slice(-RING_MAX);
+      state.accounts[accountKey].messageFailures = failures;
+
+      // Stall detection: a cursor that does not move across runs while work
+      // remains is the shape every wedge in this module takes. Counted so it
+      // can be health-checked, because "quiet" and "stuck" look identical.
+      const advanced = state.accounts[accountKey].lastHistoryId !== historyId;
+      const stalled = advanced ? 0 : (state.accounts[accountKey].stalledRuns || 0) + 1;
+      state.accounts[accountKey].stalledRuns = stalled;
+      if (stalled > stats.maxStalledRuns) stats.maxStalledRuns = stalled;
     }
     state.accounts[accountKey].lastRunAt = new Date().toISOString();
     if (!dryRun) writeState(statePath, state);
