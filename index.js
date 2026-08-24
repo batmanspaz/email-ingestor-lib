@@ -22,6 +22,9 @@ export { checkAndForward } from './forward.js';
 export { createLogger } from './log.js';
 export { maskEmail, maskFrom, redact } from './mask.js';
 export { shouldRunSluiceProducer, resolveSluiceGate, computeSluiceGateCheck } from './sluice-flag.js';
-export { computeProducerStatus, reportProducerHealth, trackProducerRun } from './producer-health.js';
+export {
+  computeProducerStatus, reportProducerHealth, trackProducerRun,
+  computeTruncationCheck, computeHistoryExpiredCheck, computeStallCheck, computeQuarantineCheck,
+} from './producer-health.js';
 export { computeQueueDepthCheck, DEPTH_WARN_THRESHOLD, AGE_WARN_MS, AGE_FAIL_MS } from './queue-depth.js';
 export { createLocalFileTransport } from './sluice-local-transport.js';

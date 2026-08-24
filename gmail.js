@@ -42,6 +42,11 @@ async function withRetry(fn, label = 'gmail') {
   throw lastErr;
 }
 
+/** Hard cap on ids enumerated per getHistory() call — runaway-cost guard on an
+ *  inbox surge. Hitting it is not lossy so long as the caller honours
+ *  `truncated`; it just means the window drains over several runs. */
+const MAX_HISTORY_IDS_PER_CALL = 500;
+
 export class GmailClient {
   /**
    * @param {object} config
@@ -119,9 +124,22 @@ export class GmailClient {
   /**
    * Get message IDs added since startHistoryId.
    * Returns null if history expired (caller should reset).
+   *
+   * @returns {Promise<null|{ids:string[], truncated:boolean,
+   *   historyIdById:Record<string,string>, lastEnumeratedHistoryId:string|null}>}
+   *
+   * `truncated` is the contract that matters. Before 2026-08-23 this returned a
+   * bare array, so a caller could not tell 500-of-500 from 500-of-5000 — poll()
+   * read a fully-drained window as "caught up" and advanced its cursor past
+   * messages that had never been listed. 44 real losses on personal. A caller
+   * cannot be written correctly against a value that cannot express the failure.
    */
   async getHistory(startHistoryId) {
     const ids = [];
+    const historyIdById = {};
+    let lastEnumeratedHistoryId = null;
+    let truncated = false;
+    let unattributableRecord = false;
     let pageToken = null;
 
     try {
@@ -138,14 +156,49 @@ export class GmailClient {
           pageToken: pageToken || undefined,
         }), `${this.account}:history.list`);
         for (const record of res.data.history || []) {
+          // record.id is the record's historyId. It was previously discarded,
+          // which is precisely why the caller could not build a safe cursor.
+          //
+          // A record with NO id cannot be attributed, and emitting its messages
+          // anyway would hand the caller ids it can never place: poll() would
+          // refuse to advance, on this run and every run after, and quarantine
+          // could not rescue it because those messages are not failing — just
+          // unplaceable. So end the window here instead. Everything before this
+          // record is still enumerated and drainable, and the caller sees
+          // ordinary truncation, which it already knows how to make progress
+          // through, rather than a silent permanent wedge.
+          if (!record.id) {
+            truncated = true;
+            unattributableRecord = true;
+            break;
+          }
+          lastEnumeratedHistoryId = String(record.id);
           for (const item of record.messagesAdded || []) {
-            if (item.message?.id) ids.push(item.message.id);
+            if (item.message?.id) {
+              ids.push(item.message.id);
+              historyIdById[item.message.id] = String(record.id);
+            }
           }
         }
+        if (unattributableRecord) {
+          console.warn(
+            `[gmail] history.list returned a record with no id for ${this.account} —` +
+            ` window ended early at ${lastEnumeratedHistoryId ?? 'the start'} to keep every` +
+            ` returned id attributable to a record.`,
+          );
+          break;
+        }
         pageToken = res.data.nextPageToken || null;
-        // Hard cap: prevent runaway cost on inbox surges (e.g. long gap + burst)
-        if (ids.length >= 500) {
-          console.warn(`[gmail] history.list hit 500-message cap for ${this.account} — truncating`);
+        // Hard cap: runaway-cost guard on an inbox surge. "Truncated" means we
+        // stopped early AND more was waiting — 500-of-500 with no next page is a
+        // COMPLETE window. Conflating the two is what hid the 2026-08-23 loss;
+        // the full account of it lives in poll.js's nextCursor().
+        if (ids.length >= MAX_HISTORY_IDS_PER_CALL && pageToken) {
+          truncated = true;
+          console.warn(
+            `[gmail] history.list hit ${MAX_HISTORY_IDS_PER_CALL}-message cap for ${this.account}` +
+            ` — window TRUNCATED; caller must not advance its cursor past the last handled message`,
+          );
           break;
         }
       } while (pageToken);
@@ -156,7 +209,7 @@ export class GmailClient {
       throw err;
     }
 
-    return ids;
+    return { ids, truncated, historyIdById, lastEnumeratedHistoryId };
   }
 
   /** Fetch a single full message by ID */
