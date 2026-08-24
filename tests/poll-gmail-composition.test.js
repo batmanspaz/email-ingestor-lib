@@ -128,6 +128,24 @@ describe('poll() + real GmailClient', () => {
     expect(handled.length).toBe(new Set(handled).size);    // none processed twice
   });
 
+  it('processes a duplicated id exactly once when a page overlap re-lists it', async () => {
+    // The earlier fixture reached truncation by re-serving the same records,
+    // which accidentally proved poll() survives duplicate enumeration. A Gmail
+    // paging retry or overlap can genuinely double-list a message, so pin the
+    // property deliberately now that the fixture models honest paging.
+    const dup = rec(1001, 'dup1');
+    mockHistoryList.mockImplementation(async ({ pageToken }) => (
+      pageToken
+        ? { data: { history: [dup, rec(1002, 'other')], nextPageToken: null } }
+        : { data: { history: [dup], nextPageToken: 'p1' } }
+    ));
+    seed('999');
+    const handled = [];
+    await poll({ clients: [{ client: client(), label: 'R' }], statePath, maxPerRun: 100 },
+      async (meta) => { handled.push(meta.id); return 'processed'; });
+    expect(handled.filter((id) => id === 'dup1')).toHaveLength(1);
+  });
+
   it('does not treat 500-of-500-with-no-next-page as truncated', async () => {
     const records = [];
     for (let i = 0; i < 250; i++) records.push(rec(1000 + i, `m${i}a`, `m${i}b`));

@@ -77,11 +77,22 @@ export async function poll(config, handler) {
     // backward clamp) were invisible to the very check built to catch them.
     const failures = state.accounts[accountKey].messageFailures || {};
     let handledCount = 0;
-    const noteRun = () => {
+    /**
+     * @param {boolean} caughtUp — the window was empty and complete, i.e. there
+     *   was no work to do. "Quiet" and "stuck" ARE distinguishable, by whether
+     *   work remained. An idle account's cursor does not move because
+     *   getCurrentHistoryId() returns the same profile historyId it was already
+     *   set from — so without this every quiet run counted as a stall and a
+     *   mailbox idle for three days reported DOWN. CollageSoup's normal
+     *   behaviour is exactly that. A genuine wedge always presents a NON-empty
+     *   enumeration, so it still counts.
+     */
+    const noteRun = (caughtUp = false) => {
       if (dryRun) return;
       const acct = state.accounts[accountKey];
       const advanced = acct.lastHistoryId !== historyId;
-      acct.stalledRuns = advanced || handledCount > 0 ? 0 : (acct.stalledRuns || 0) + 1;
+      const progress = advanced || handledCount > 0 || caughtUp;
+      acct.stalledRuns = progress ? 0 : (acct.stalledRuns || 0) + 1;
       if (acct.stalledRuns > stats.maxStalledRuns) stats.maxStalledRuns = acct.stalledRuns;
     };
 
@@ -195,39 +206,43 @@ export async function poll(config, handler) {
         byRecord.get(rec).push(id);
       }
 
-      let watermark = null;
-      let lowestUnhandled = null;
-      for (const rec of order) {
-        if (byRecord.get(rec).every((id) => ring.has(id))) {
-          if (lowestUnhandled === null) watermark = rec;
-        } else if (lowestUnhandled === null || BigInt(rec) < BigInt(lowestUnhandled)) {
-          lowestUnhandled = rec;
-        }
-      }
-      if (watermark === null) return null; // nothing fully handled yet => park
-
-      // Clamp below the LOWEST unhandled record, not merely below the first one
-      // encountered. This is what makes the ascending-order assumption
-      // unnecessary rather than merely documented: if records ever arrive out
-      // of order, a handled record sorting above an unhandled one must not
-      // carry the cursor past it.
-      if (lowestUnhandled !== null && BigInt(watermark) >= BigInt(lowestUnhandled)) return null;
-
-      // Clamp: never regress. Compared as BigInt — Gmail historyIds are large
-      // integers and string compare would order '9' after '100'.
+      // Every comparison is BigInt — Gmail historyIds are large integers and a
+      // string compare would order '9' after '100'. The WHOLE computation is
+      // guarded, not just the final clamp: a non-numeric id must park, never
+      // throw out of poll() and take the entire run down with it. "Refuse
+      // rather than guess" is the module's stance everywhere else.
       try {
-        if (BigInt(watermark) <= BigInt(historyId)) return null;
+        let watermark = null;
+        let lowestUnhandled = null;
+        for (const rec of order) {
+          if (byRecord.get(rec).every((id) => ring.has(id))) {
+            if (lowestUnhandled === null) watermark = rec;
+          } else if (lowestUnhandled === null || BigInt(rec) < BigInt(lowestUnhandled)) {
+            lowestUnhandled = rec;
+          }
+        }
+        if (watermark === null) return null; // nothing fully handled yet => park
+
+        // Clamp below the LOWEST unhandled record, not merely below the first
+        // one encountered. This is what makes the ascending-order assumption
+        // unnecessary rather than merely documented: if records ever arrive out
+        // of order, a handled record sorting above an unhandled one must not
+        // carry the cursor past it.
+        if (lowestUnhandled !== null && BigInt(watermark) >= BigInt(lowestUnhandled)) return null;
+        if (BigInt(watermark) <= BigInt(historyId)) return null; // never regress
+        return watermark;
       } catch {
-        return null; // non-numeric historyId: refuse rather than guess
+        return null;
       }
-      return watermark;
     };
 
     if (messageIds.length === 0) {
       const fresh = await nextCursor();
       if (fresh) state.accounts[accountKey].lastHistoryId = fresh;
       state.accounts[accountKey].lastRunAt = new Date().toISOString();
-      noteRun();
+      // Nothing in the window at all. `truncated` cannot be true here (it needs
+      // a full page of ids), so this is genuinely caught up, not wedged.
+      noteRun(true);
       if (!dryRun) writeState(statePath, state);
       continue;
     }
@@ -249,7 +264,7 @@ export async function poll(config, handler) {
       const fresh = await nextCursor();
       if (fresh) state.accounts[accountKey].lastHistoryId = fresh;
       state.accounts[accountKey].lastRunAt = new Date().toISOString();
-      noteRun();
+      noteRun(!truncated); // untruncated + all ringed = caught up; truncated = wedge
       if (!dryRun) writeState(statePath, state);
       continue;
     }

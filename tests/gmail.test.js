@@ -399,6 +399,25 @@ describe('GmailClient.getHistory', () => {
     expect(r.lastEnumeratedHistoryId).toBeNull();
   });
 
+  it('stops at a record with no id rather than emitting unattributable messages', async () => {
+    // A record without an `id` would put its message ids into `ids` but not
+    // into historyIdById. poll() cannot attribute them to a record, so it
+    // refuses to advance — permanently, on every subsequent run, and quarantine
+    // cannot rescue it because the messages are not failing, just unplaceable.
+    // Ending the window at the last attributable record keeps the cursor able
+    // to move and turns a silent permanent wedge into ordinary truncation.
+    mockHistoryList.mockResolvedValueOnce(page([
+      rec(1001, 'good1'),
+      { messagesAdded: [{ message: { id: 'orphan' } }] }, // no id
+      rec(1003, 'good2'),
+    ]));
+    const r = await new GmailClient(BASE_CONFIG).getHistory('1000');
+    expect(r.ids).toEqual(['good1']);
+    expect(r.truncated).toBe(true);              // more remains, we stopped early
+    expect(r.historyIdById).toEqual({ good1: '1001' });
+    expect(Object.keys(r.historyIdById)).toEqual(r.ids); // every id attributable
+  });
+
   it('returns EXACTLY the keys poll.js destructures — guards mock/real drift', async () => {
     // poll.js does: const { ids, truncated, historyIdById } = history
     // (lastEnumeratedHistoryId is returned for diagnostics and is not read by

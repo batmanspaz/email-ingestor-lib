@@ -139,6 +139,7 @@ export class GmailClient {
     const historyIdById = {};
     let lastEnumeratedHistoryId = null;
     let truncated = false;
+    let unattributableRecord = false;
     let pageToken = null;
 
     try {
@@ -157,13 +158,35 @@ export class GmailClient {
         for (const record of res.data.history || []) {
           // record.id is the record's historyId. It was previously discarded,
           // which is precisely why the caller could not build a safe cursor.
-          if (record.id) lastEnumeratedHistoryId = String(record.id);
+          //
+          // A record with NO id cannot be attributed, and emitting its messages
+          // anyway would hand the caller ids it can never place: poll() would
+          // refuse to advance, on this run and every run after, and quarantine
+          // could not rescue it because those messages are not failing — just
+          // unplaceable. So end the window here instead. Everything before this
+          // record is still enumerated and drainable, and the caller sees
+          // ordinary truncation, which it already knows how to make progress
+          // through, rather than a silent permanent wedge.
+          if (!record.id) {
+            truncated = true;
+            unattributableRecord = true;
+            break;
+          }
+          lastEnumeratedHistoryId = String(record.id);
           for (const item of record.messagesAdded || []) {
             if (item.message?.id) {
               ids.push(item.message.id);
-              if (record.id) historyIdById[item.message.id] = String(record.id);
+              historyIdById[item.message.id] = String(record.id);
             }
           }
+        }
+        if (unattributableRecord) {
+          console.warn(
+            `[gmail] history.list returned a record with no id for ${this.account} —` +
+            ` window ended early at ${lastEnumeratedHistoryId ?? 'the start'} to keep every` +
+            ` returned id attributable to a record.`,
+          );
+          break;
         }
         pageToken = res.data.nextPageToken || null;
         // Hard cap: runaway-cost guard on an inbox surge. "Truncated" means we

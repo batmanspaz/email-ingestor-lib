@@ -675,6 +675,133 @@ describe('poll() — poison messages, stalls, and history expiry', () => {
     expect(worst).toBeLessThan(6); // must never reach the fail threshold
   });
 
+  it('does NOT stall an IDLE, fully caught-up account', async () => {
+    // Third variant of the same alarm-fatigue defect. On a caught-up account
+    // the empty-window path advances to getCurrentHistoryId(), which for an
+    // idle mailbox EQUALS the stored cursor — it was set from that same profile
+    // historyId on the last active run and does not move without activity. So
+    // `advanced` is false, nothing was handled, and every quiet run counted as
+    // a stall: 7 idle runs => fail => producer reported DOWN. At 2 runs/day
+    // that is any account quiet for three days, which is collagesoup's normal
+    // documented behaviour (0 messages across 703 log lines over 3 days).
+    //
+    // "Quiet" and "stuck" ARE distinguishable: by whether work remained. An
+    // empty untruncated window means caught up, not wedged.
+    const IDLE = '12345';
+    const client = {
+      account: 'a@example.com',
+      getCurrentHistoryId: vi.fn().mockResolvedValue(IDLE), // unchanged: no activity
+      getHistory: vi.fn().mockResolvedValue(historyResult([])),
+      fetchMetadata: vi.fn(),
+      _gmail: { users: { messages: { batchModify: vi.fn().mockResolvedValue({}) } } },
+    };
+    seedState({ 'a@example.com': { lastHistoryId: IDLE } });
+    let worst = 0;
+    for (let i = 0; i < 8; i++) {
+      const st = await poll({ clients: [{ client, label: 'A' }], statePath }, vi.fn());
+      worst = Math.max(worst, st.maxStalledRuns);
+    }
+    expect(worst).toBe(0);
+  });
+
+  it('parks rather than throwing when a record id is not numeric', async () => {
+    // The module's stance elsewhere is "refuse rather than guess"; a BigInt on
+    // a non-numeric id must not throw out of poll() and kill the whole run.
+    // The non-numeric record must be UNHANDLED: only then does it reach the
+    // lowestUnhandled comparison, which is where the unguarded BigInt lived.
+    // An earlier version of this test used a handled record and passed against
+    // the broken code (audit, round 3).
+    const client = poisonClient('bad');
+    client.getHistory = vi.fn().mockResolvedValue({
+      ids: ['ok', 'bad'], truncated: true,
+      historyIdById: { ok: '10', bad: 'not-a-number' }, lastEnumeratedHistoryId: '10',
+    });
+    client.fetchMetadata = vi.fn().mockImplementation(async (id) => {
+      if (id === 'bad') throw new Error('flake');
+      return makeMeta({ id });
+    });
+    seedState({ 'a@example.com': { lastHistoryId: '5' } });
+    await expect(poll({ clients: [{ client, label: 'A' }], statePath, maxPerRun: 10 },
+      vi.fn().mockResolvedValue('processed'))).resolves.toBeDefined();
+    expect(readStateFile().accounts['a@example.com'].lastHistoryId).toBe('5');
+  });
+
+  it('counts a TRUNCATED all-ringed window that cannot advance as a stall, not caught-up', async () => {
+    // Surviving mutation: flipping this path's caughtUp flag to `true` stayed
+    // green. It is precisely the wedge state — everything listed is ringed, the
+    // window was truncated, and the watermark is refused — so calling it
+    // "caught up" would blind the stall detector to the very case it exists
+    // for. That was the original round-2 finding, reintroduced by the round-3
+    // idle-account fix if the flag is not conditioned on `truncated`.
+    const client = poisonClient('none');
+    client.getHistory = vi.fn().mockResolvedValue({
+      ids: ['q1', 'q2'], truncated: true,
+      historyIdById: { q1: '10' },              // q2 unattributable -> park
+      lastEnumeratedHistoryId: '10',
+    });
+    seedState({ 'a@example.com': { lastHistoryId: '5', processedIds: ['q1', 'q2'] } });
+    const st = await poll({ clients: [{ client, label: 'A' }], statePath, maxPerRun: 10 }, vi.fn());
+    expect(readStateFile().accounts['a@example.com'].lastHistoryId).toBe('5'); // parked
+    expect(st.maxStalledRuns).toBe(1);                                        // and counted
+  });
+
+  it('clamps below the LOWEST unhandled record when several are out of order', async () => {
+    // Surviving mutation: `BigInt(rec) < BigInt(lowestUnhandled)` -> `>` makes
+    // lowestUnhandled the HIGHEST unhandled record, so the clamp guards the
+    // wrong bound. Invisible with a single unhandled record, where min and max
+    // coincide — this needs two, out of order.
+    const ids = ['h30', 'u40', 'u20'];
+    const map = { h30: '30', u40: '40', u20: '20' };
+    const client = poisonClient('none');
+    client.getHistory = vi.fn().mockResolvedValue(
+      historyResult(ids, { truncated: true, historyIdById: map }),
+    );
+    client.fetchMetadata = vi.fn().mockImplementation(async (id) => {
+      if (id.startsWith('u')) throw new Error('unhandled');
+      return makeMeta({ id });
+    });
+    seedState({ 'a@example.com': { lastHistoryId: '5' } });
+    await poll({ clients: [{ client, label: 'A' }], statePath, maxPerRun: 10 }, vi.fn());
+    // record 20 is unhandled, so the cursor must stay below it — never 30.
+    expect(readStateFile().accounts['a@example.com'].lastHistoryId).toBe('5');
+  });
+
+  it('evicts the OLDEST failure counts, keeping the newest strikes', async () => {
+    // slice(0, N) instead of slice(-N) keeps stale entries and starves new
+    // ones, so a fresh poison message can never reach 3 strikes and quarantine
+    // never fires — the wedge returns permanently.
+    const many = Array.from({ length: 60 }, (_, i) => `f${i}`);
+    const client = {
+      account: 'a@example.com',
+      getCurrentHistoryId: vi.fn().mockResolvedValue('99999'),
+      getHistory: vi.fn().mockResolvedValue(historyResult(many)),
+      fetchMetadata: vi.fn().mockRejectedValue(new Error('all fail')),
+      _gmail: { users: { messages: { batchModify: vi.fn().mockResolvedValue({}) } } },
+    };
+    seedState({ 'a@example.com': { lastHistoryId: '5' } });
+    await poll({ clients: [{ client, label: 'A' }], statePath, maxPerRun: 60 }, vi.fn());
+    const kept = Object.keys(readStateFile().accounts['a@example.com'].messageFailures);
+    expect(kept).toContain('f59');   // newest survives
+    expect(kept).not.toContain('f0'); // oldest evicted
+  });
+
+  it('keeps the NEWEST quarantined ids — the most recent drops are the actionable ones', async () => {
+    const client = poisonClient('p1');
+    seedState({
+      'a@example.com': {
+        lastHistoryId: '5',
+        quarantinedIds: Array.from({ length: 200 }, (_, i) => `old${i}`),
+      },
+    });
+    for (let i = 0; i < 3; i++) {
+      await poll({ clients: [{ client, label: 'A' }], statePath, maxPerRun: 10 },
+        vi.fn().mockResolvedValue('processed'));
+    }
+    const q = readStateFile().accounts['a@example.com'].quarantinedIds;
+    expect(q).toContain('p1');       // the new drop is recorded
+    expect(q).not.toContain('old0'); // the oldest was evicted, not the newest
+  });
+
   it('DOES count a genuine wedge — nothing handled and no advance', async () => {
     const client = poisonClient('p1');
     client.fetchMetadata = vi.fn().mockRejectedValue(new Error('everything fails'));
