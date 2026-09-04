@@ -9,7 +9,7 @@
   },
   "dependencies": {
     "@anthropic-ai/sdk": "^0.107.0",
-    "@perfectcity/telemetry": "git+https://github.com/batmanspaz/telemetry.git#4812d8a93ab5832c7f0185eba419eb67883017c6",
+    "@perfectcity/telemetry": "git+https://github.com/batmanspaz/telemetry.git#ddda4442701d9af6a254b095ccda32be0ca334b1",
     "dotenv": "^17.4.2",
     "googleapis": "^173.0.0"
   },
