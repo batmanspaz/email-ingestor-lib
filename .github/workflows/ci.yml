@@ -23,6 +23,18 @@ jobs:
           # Fixed 2026-08-23; tests/dependabot-config.test.js guards it now.
           # unrelated to any code change.
           cache-dependency-path: package-lock.json
+      - name: Upgrade npm
+        # node-version 22.x ships npm 10.9.8, which has a reproducible arborist
+        # crash ("Cannot read properties of null (reading 'edgesOut')" / "git dep
+        # preparation failed") when reifying a git dependency that carries its own
+        # "prepare" build script — exactly what @perfectcity/telemetry has (tsc).
+        # Verified locally: 100% reproducible on npm 10.9.8 regardless of git
+        # protocol (ssh or https) or SSH credential availability; not present on
+        # npm 11.11.0 with the same Node 22 runtime. Fixed in the sibling
+        # git+https protocol change (avoids a separate, real unauthenticated-ssh
+        # CI failure mode) but that change alone does NOT fix this crash — both
+        # are needed for `npm ci` to be reliably green here.
+        run: npm install -g npm@^11
       - name: Install dependencies
         run: npm ci
       - name: Run tests
