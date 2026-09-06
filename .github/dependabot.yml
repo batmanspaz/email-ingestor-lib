@@ -12,3 +12,12 @@ updates:
     open-pull-requests-limit: 3
     labels:
       - "dependencies"
+    ignore:
+      # PR #42 (2026-09-04) reverted the git+https protocol pin on this dep back
+      # to bare "github:batmanspaz/telemetry" — Dependabot doesn't understand the
+      # https-pin-to-a-specific-commit workaround for the npm-git-fetcher/arborist
+      # crash fixed in PR #47, it just sees a newer commit on the default branch
+      # and proposes bumping to it, silently reintroducing the ssh-resolution CI
+      # break. Ignore all Dependabot-proposed updates to this dependency; bump it
+      # manually (with the same https-protocol pin) when a real update is needed.
+      - dependency-name: "@perfectcity/telemetry"
