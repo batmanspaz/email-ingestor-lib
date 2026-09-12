@@ -169,6 +169,101 @@ describe('reportProducerHealth', () => {
   });
 });
 
+// ── env-var drop-dir resolution — the Aug 2026 Intake rename drift ─────────
+// The rename moved the producer's own drop-dir env var from SLUICE_DIR to
+// INTAKE_DIR (src/sluice-config.js:resolveDropDir() in every consumer repo
+// dual-reads INTAKE_DIR || SLUICE_DIR already). This module's own default —
+// used only when a caller does not pass opts.sluiceDir explicitly — was never
+// updated and still reads ONLY the deprecated SLUICE_DIR, so a producer whose
+// env only has INTAKE_DIR set reports a false queue.depth 'fail' ("inbox dir
+// not configured") even though its real inbox exists and is empty/healthy.
+// This has driven producer.* modules to overall status=down on hx-health-ingest
+// since 2026-09-05 — a false alarm, not real data loss (tasks.db #944).
+describe('reportProducerHealth — default sluiceDir resolution (env-var rename drift)', () => {
+  const ORIGINAL_INTAKE_DIR = process.env.INTAKE_DIR;
+  const ORIGINAL_SLUICE_DIR = process.env.SLUICE_DIR;
+
+  afterEach(() => {
+    if (ORIGINAL_INTAKE_DIR === undefined) delete process.env.INTAKE_DIR;
+    else process.env.INTAKE_DIR = ORIGINAL_INTAKE_DIR;
+    if (ORIGINAL_SLUICE_DIR === undefined) delete process.env.SLUICE_DIR;
+    else process.env.SLUICE_DIR = ORIGINAL_SLUICE_DIR;
+  });
+
+  it('reports queue.depth as pass when only INTAKE_DIR is set and no opts.sluiceDir is passed (the real producer.* call-site shape)', async () => {
+    delete process.env.SLUICE_DIR;
+    process.env.INTAKE_DIR = sluiceDir; // fixture dir already has an empty inbox/
+
+    const { sent, transport } = fakeTransport();
+    const telemetry = createTelemetry({
+      product: 'sluice',
+      module: 'producer.collagesoup',
+      version: 'test',
+      transport,
+      heartbeatMs: 0,
+      batchIntervalMs: 0,
+      autoStart: false,
+    });
+    // No opts.sluiceDir — mirrors every real call site (personal/collagesoup/
+    // perfectcity index.js), all of which call reportProducerHealth(telemetry,
+    // stats) with no third argument at all and rely entirely on this module's
+    // env-var default.
+    await reportProducerHealth(telemetry, { fetched: 1, produced: 1, errors: 0, truncated: 0, historyExpired: 0, maxStalledRuns: 0, quarantined: 0 });
+
+    const report = sent.health[0];
+    expect(() => HealthReportSchema.parse(report)).not.toThrow();
+    const queueCheck = report.checks.find((c) => c.id === 'queue.depth');
+    expect(queueCheck.status).toBe('pass');
+    expect(report.status).toBe('ok');
+  });
+
+  it('still falls back to SLUICE_DIR when INTAKE_DIR is unset (back-compat for any caller not yet migrated)', async () => {
+    delete process.env.INTAKE_DIR;
+    process.env.SLUICE_DIR = sluiceDir;
+
+    const { sent, transport } = fakeTransport();
+    const telemetry = createTelemetry({
+      product: 'sluice', module: 'producer.test', version: 'test',
+      transport, heartbeatMs: 0, batchIntervalMs: 0, autoStart: false,
+    });
+    await reportProducerHealth(telemetry, { fetched: 1, produced: 1, errors: 0, truncated: 0, historyExpired: 0, maxStalledRuns: 0, quarantined: 0 });
+
+    const queueCheck = sent.health[0].checks.find((c) => c.id === 'queue.depth');
+    expect(queueCheck.status).toBe('pass');
+  });
+
+  it('prefers INTAKE_DIR over SLUICE_DIR when both happen to be set', async () => {
+    process.env.SLUICE_DIR = '/nonexistent/stale/sluice/dir';
+    process.env.INTAKE_DIR = sluiceDir;
+
+    const { sent, transport } = fakeTransport();
+    const telemetry = createTelemetry({
+      product: 'sluice', module: 'producer.test', version: 'test',
+      transport, heartbeatMs: 0, batchIntervalMs: 0, autoStart: false,
+    });
+    await reportProducerHealth(telemetry, { fetched: 1, produced: 1, errors: 0, truncated: 0, historyExpired: 0, maxStalledRuns: 0, quarantined: 0 });
+
+    const queueCheck = sent.health[0].checks.find((c) => c.id === 'queue.depth');
+    expect(queueCheck.status).toBe('pass');
+  });
+
+  it('still reports queue.depth as fail when NEITHER INTAKE_DIR nor SLUICE_DIR is set', async () => {
+    delete process.env.INTAKE_DIR;
+    delete process.env.SLUICE_DIR;
+
+    const { sent, transport } = fakeTransport();
+    const telemetry = createTelemetry({
+      product: 'sluice', module: 'producer.test', version: 'test',
+      transport, heartbeatMs: 0, batchIntervalMs: 0, autoStart: false,
+    });
+    await reportProducerHealth(telemetry, { fetched: 1, produced: 1, errors: 0, truncated: 0, historyExpired: 0, maxStalledRuns: 0, quarantined: 0 });
+
+    const queueCheck = sent.health[0].checks.find((c) => c.id === 'queue.depth');
+    expect(queueCheck.status).toBe('fail');
+    expect(sent.health[0].status).toBe('down');
+  });
+});
+
 describe('trackProducerRun', () => {
   it('emits exactly one producer.run event with the entity id and counts, valid against the real schema', async () => {
     const { sent, transport } = fakeTransport();

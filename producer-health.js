@@ -176,11 +176,15 @@ export function computeStallCheck(consecutiveRuns) {
  * @param {{fetched:number, produced:number, errors:number, truncated?:number,
  *          historyExpired?:number, maxStalledRuns?:number}} stats
  * @param {{sluiceDir?:string, now?:Date}} [opts] — sluiceDir defaults to
- *   process.env.SLUICE_DIR (the same env the producer wrote envelopes with);
- *   unset/missing reports queue.depth as fail, never green (2026-08-02 rule).
+ *   process.env.INTAKE_DIR, falling back to the deprecated process.env.SLUICE_DIR
+ *   (the Aug 2026 Intake rename — mirrors src/sluice-config.js:resolveDropDir()
+ *   in every consumer repo, so a caller that doesn't pass opts.sluiceDir
+ *   explicitly still resolves the real drop dir instead of reporting a false
+ *   queue.depth failure); unset/missing (neither var set) reports queue.depth
+ *   as fail, never green (2026-08-02 rule).
  */
 export async function reportProducerHealth(telemetry, stats, opts = {}) {
-  const { sluiceDir = process.env.SLUICE_DIR, now = new Date() } = opts;
+  const { sluiceDir = process.env.INTAKE_DIR || process.env.SLUICE_DIR, now = new Date() } = opts;
   const producerStatus = computeProducerStatus(stats);
 
   const queueCheck = computeQueueDepthCheck({
