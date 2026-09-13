@@ -25,6 +25,7 @@ export { shouldRunSluiceProducer, resolveSluiceGate, computeSluiceGateCheck } fr
 export {
   computeProducerStatus, reportProducerHealth, trackProducerRun,
   computeTruncationCheck, computeHistoryExpiredCheck, computeStallCheck, computeQuarantineCheck,
+  producerHealthStats, producerRunStats,
 } from './producer-health.js';
 export { computeQueueDepthCheck, DEPTH_WARN_THRESHOLD, AGE_WARN_MS, AGE_FAIL_MS } from './queue-depth.js';
 export { createLocalFileTransport } from './sluice-local-transport.js';

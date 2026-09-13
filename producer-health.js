@@ -173,8 +173,15 @@ export function computeStallCheck(consecutiveRuns) {
 
 /**
  * @param {import('@perfectcity/telemetry').Telemetry} telemetry
- * @param {{fetched:number, produced:number, errors:number, truncated?:number,
- *          historyExpired?:number, maxStalledRuns?:number}} stats
+ * @param {{fetched:number, produced:number, errors:number, truncated:number,
+ *          historyExpired:number, maxStalledRuns:number, quarantined:number}} stats
+ *   — all seven fields are REQUIRED, not optional. Each of the last four is
+ *   read through an invalidCount() guard that treats an absent/undefined
+ *   count as UNKNOWN and reports `warn` for it (missing = healthy is banned,
+ *   dev-rules Sec28.1) — marking them `?` here is exactly what licensed every
+ *   call site to hand-build a three-field object and drop the other four,
+ *   which pinned producer.* to a permanent `degraded` (tasks.db #948). Build
+ *   this object with producerHealthStats() below, not by hand.
  * @param {{sluiceDir?:string, now?:Date}} [opts] — sluiceDir defaults to
  *   process.env.INTAKE_DIR, falling back to the deprecated process.env.SLUICE_DIR
  *   (the Aug 2026 Intake rename — mirrors src/sluice-config.js:resolveDropDir()
@@ -238,4 +245,55 @@ export function trackProducerRun(telemetry, { entityId, fetched, produced, skipp
     event: 'producer.run',
     props: { entity_id: entityId, fetched, produced, skipped, errors, quarantined },
   });
+}
+
+/**
+ * Adapter from poll()'s return shape to reportProducerHealth()'s stats
+ * contract — the ONE definition every consumer repo should call, instead of
+ * hand-building `{ fetched, produced, errors }` (tasks.db #948) or pasting an
+ * identical copy of this function into each repo's own src/sluice-config.js
+ * (tasks.db #958 — collagesoup's local copy was the first of what would have
+ * become three).
+ *
+ * poll()'s result is passed THROUGH, with only the one rename the two
+ * contracts disagree on (`processed` -> `produced`), so a count poll() adds
+ * tomorrow reaches the health report without an edit at every call site.
+ * `errors` is passed through, NOT defaulted — computeProducerStatus() reads
+ * it WITHOUT an invalidCount() guard, so a laundered zero would silently
+ * report 'ok'.
+ *
+ * @param {{fetched:number, processed:number, errors:number, truncated?:number,
+ *   historyExpired?:number, maxStalledRuns?:number, quarantined?:number}} stats
+ *   — poll()'s return value.
+ * @returns {object} stats shaped for reportProducerHealth() above.
+ */
+export function producerHealthStats(stats) {
+  return { ...stats, produced: stats.processed };
+}
+
+/**
+ * Adapter from poll()'s return shape to trackProducerRun()'s params contract
+ * — the analytics twin of producerHealthStats() above, and here for the same
+ * reason (tasks.db #948's 3-model review): trackProducerRun() declares
+ * `quarantined = 0` as a DEFAULT PARAMETER, so an omitted field reads as
+ * "none", not "unknown" — the producer.run event would claim zero quarantined
+ * messages on precisely the run whose health report says otherwise.
+ *
+ * `skipped` is genuinely 0 and not a dropped field: poll() has no separate
+ * skipped counter — an idempotent re-run (envelope already exists) still
+ * counts as `processed` from poll()'s point of view.
+ *
+ * @param {string} entityId
+ * @param {{fetched:number, processed:number, errors:number, quarantined?:number}} stats
+ *   — poll()'s return value.
+ */
+export function producerRunStats(entityId, stats) {
+  return {
+    entityId,
+    fetched: stats.fetched,
+    produced: stats.processed,
+    skipped: 0,
+    errors: stats.errors || 0,
+    quarantined: stats.quarantined ?? 0,
+  };
 }
