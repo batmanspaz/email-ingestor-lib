@@ -46,6 +46,7 @@ export async function poll(config, handler) {
   for (const clientEntry of clients) {
     const { client, label } = clientEntry;
     const accountKey = client.account;
+    try {
     const historyId = state.accounts?.[accountKey]?.lastHistoryId;
 
     // First run: seed historyId and skip
@@ -388,6 +389,16 @@ export async function poll(config, handler) {
     noteRun();
     state.accounts[accountKey].lastRunAt = new Date().toISOString();
     if (!dryRun) writeState(statePath, state);
+    } catch (err) {
+      // One account's failure (e.g. a Gmail API auth error from an OAuth
+      // token minted under the wrong client — tasks.db #1042/#1006) must
+      // never take the whole run down: every OTHER account in this cycle
+      // still needs its messages processed, and the caller's end-of-run
+      // health/telemetry reporting still needs to fire for them. Additive
+      // safety net only — the success-path logic above is untouched.
+      stats.errors++;
+      console.error(`  [${label}] Unhandled error polling account — skipping to next account this run: ${err.message}`);
+    }
   }
 
   // Update global stats

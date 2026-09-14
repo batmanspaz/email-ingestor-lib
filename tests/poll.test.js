@@ -259,6 +259,81 @@ describe('poll — normal run', () => {
   });
 });
 
+describe('poll — per-account error isolation (tasks.db #1042)', () => {
+  // Real production case: an account's OAuth token minted under the wrong
+  // client makes EVERY Gmail API call for that account throw. Before this
+  // fix, poll()'s per-client for-loop had no try/catch anywhere in the
+  // per-account body, so that exception propagated straight out of poll(),
+  // aborting the whole run before any later (healthy) account was touched
+  // and before the caller's end-of-run health/telemetry reporting ever ran
+  // for the healthy accounts either — one bad account blacked out
+  // observability for the whole cycle.
+
+  it('does not reject when the FIRST client throws on getCurrentHistoryId (first-run / no-cursor path), and still processes later clients', async () => {
+    const badClient = makeClient({ account: 'bad@example.com' });
+    badClient.getCurrentHistoryId = vi.fn().mockRejectedValue(
+      new Error('invalid_grant: token minted under wrong OAuth client')
+    );
+    // No seeded state for bad@example.com => hits the first-run branch.
+
+    const goodMessages = [makeMeta({ id: 'g1' })];
+    const goodClient = makeClient({ account: 'good@example.com', messages: goodMessages, currentHistoryId: '5000' });
+    seedState({ 'good@example.com': { lastHistoryId: '2000' } });
+
+    const handler = vi.fn().mockResolvedValue('processed');
+
+    let stats;
+    let threw = false;
+    try {
+      stats = await poll(
+        { clients: [{ client: badClient, label: 'BAD' }, { client: goodClient, label: 'GOOD' }], statePath },
+        handler
+      );
+    } catch {
+      threw = true;
+    }
+
+    expect(threw).toBe(false); // poll() must complete, not reject, on a per-account failure
+    expect(handler).toHaveBeenCalledTimes(1);
+    expect(handler).toHaveBeenCalledWith(goodMessages[0], goodClient, { dryRun: false });
+    expect(stats.processed).toBe(1);
+    expect(stats.errors).toBe(1);
+  });
+
+  it('does not reject when the FIRST client throws on getHistory (has-cursor path), and still processes later clients', async () => {
+    const badClient = makeClient({ account: 'bad@example.com' });
+    badClient.getHistory = vi.fn().mockRejectedValue(
+      new Error('invalid_grant: token minted under wrong OAuth client')
+    );
+
+    const goodMessages = [makeMeta({ id: 'g1' })];
+    const goodClient = makeClient({ account: 'good@example.com', messages: goodMessages, currentHistoryId: '5000' });
+    seedState({
+      'bad@example.com': { lastHistoryId: '2000' },
+      'good@example.com': { lastHistoryId: '2000' },
+    });
+
+    const handler = vi.fn().mockResolvedValue('processed');
+
+    let stats;
+    let threw = false;
+    try {
+      stats = await poll(
+        { clients: [{ client: badClient, label: 'BAD' }, { client: goodClient, label: 'GOOD' }], statePath },
+        handler
+      );
+    } catch {
+      threw = true;
+    }
+
+    expect(threw).toBe(false);
+    expect(handler).toHaveBeenCalledTimes(1);
+    expect(handler).toHaveBeenCalledWith(goodMessages[0], goodClient, { dryRun: false });
+    expect(stats.processed).toBe(1);
+    expect(stats.errors).toBe(1);
+  });
+});
+
 describe('poll — dry-run', () => {
   it('does NOT call the handler by default', async () => {
     const client = makeClient({ messages: [makeMeta({ id: 'm1' }), makeMeta({ id: 'm2' })] });
