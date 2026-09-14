@@ -2,8 +2,10 @@
  * gmail.js — GmailClient for email ingestors (ESM, OAuth2 refresh-token based)
  *
  * Two ways to construct:
- *   1. GmailClient.fromTokenFile(account, entity) — reads token file + client credentials from
- *      ~/claude/shared/config/credentials/{account}.json and conductor_paul_client.json
+ *   1. GmailClient.fromTokenFile(account, entity) — reads
+ *      ~/claude/shared/config/credentials/{account}.json for the refresh token AND, when the
+ *      token file carries them, for its own OAuth client_id/client_secret; otherwise falls back
+ *      to the shared conductor_paul_client.json.
  *   2. new GmailClient({ account, refreshToken, clientId, clientSecret, entity }) — explicit
  */
 
@@ -14,6 +16,63 @@ import os from 'os';
 
 const CRED_DIR = path.join(os.homedir(), 'claude/shared/config/credentials');
 const CLIENT_FILE = path.join(CRED_DIR, 'conductor_paul_client.json');
+
+/**
+ * Pull an OAuth client pair out of a parsed credentials blob.
+ * Handles both the installed-app wrapper ({ installed: { client_id, ... } })
+ * and a flat { client_id, client_secret } — the shape google_oauth_multi.py
+ * and google-auth's `to_json()` write into an account's own token file.
+ *
+ * Returns null unless BOTH halves are present: half a client pair can never
+ * mint a working refresh, so a partially-populated token must not shadow the
+ * shared client file.
+ *
+ * @param {object|null} creds
+ * @returns {{clientId: string, clientSecret: string}|null}
+ */
+function extractClientPair(creds) {
+  if (!creds || typeof creds !== 'object') return null;
+  const src = creds.installed || creds.web || creds;
+  const clientId = src.client_id;
+  const clientSecret = src.client_secret;
+  if (!clientId || !clientSecret) return null;
+  return { clientId, clientSecret };
+}
+
+/**
+ * Resolve which OAuth client to refresh an account's token against.
+ *
+ * A Google refresh token is bound to the OAuth client that MINTED it, so the
+ * client is a property of the token — not a global constant. When the token
+ * file is self-describing (carries its own client_id + client_secret) those
+ * always win; only a token that says nothing about its client falls back to
+ * the shared conductor_paul_client.json.
+ *
+ * Why (real incident, 2026-09-13): this function used to be a hardcoded read of
+ * conductor_paul_client.json for EVERY account. Any account re-authorized by a
+ * tool that embeds a different OAuth client (shared/scripts/google_oauth_multi.py
+ * mints under its own) became permanently un-refreshable — deterministic
+ * `unauthorized_client`, unrecoverable by waiting, and it took out live email
+ * ingestion for three accounts before anyone noticed.
+ *
+ * @param {object} tokenData — parsed contents of the account's token file
+ * @param {string} tokenFile — path, for error messages only
+ * @returns {{clientId: string, clientSecret: string}}
+ */
+function resolveClientCredentials(tokenData, tokenFile) {
+  const own = extractClientPair(tokenData);
+  if (own) return own;
+
+  if (!fs.existsSync(CLIENT_FILE)) {
+    throw new Error(
+      `OAuth client file not found: ${CLIENT_FILE} (and ${tokenFile} carries no ` +
+        'client_id/client_secret of its own)',
+    );
+  }
+  const shared = extractClientPair(JSON.parse(fs.readFileSync(CLIENT_FILE, 'utf8')));
+  if (!shared) throw new Error(`Invalid client credentials in ${CLIENT_FILE}`);
+  return shared;
+}
 
 /**
  * Retry a Gmail API call with exponential backoff on 429 / 5xx / network errors.
@@ -72,27 +131,18 @@ export class GmailClient {
 
   /**
    * Create a GmailClient from on-disk token + client credential files.
-   * Reads ~/claude/shared/config/credentials/{account}.json for refresh_token
-   * and conductor_paul_client.json for client_id/client_secret.
+   * Reads ~/claude/shared/config/credentials/{account}.json for refresh_token.
+   * The OAuth client is resolved per-token by resolveClientCredentials(): the
+   * token file's own client_id/client_secret when it has them, otherwise the
+   * shared conductor_paul_client.json.
    *
    * @param {string} account — email address (e.g. paulallensteinberg@gmail.com)
    * @param {string} [entity] — entity name for logging
    * @returns {GmailClient}
    */
   static fromTokenFile(account, entity) {
-    // Load client credentials
-    if (!fs.existsSync(CLIENT_FILE)) {
-      throw new Error(`OAuth client file not found: ${CLIENT_FILE}`);
-    }
-    const clientCreds = JSON.parse(fs.readFileSync(CLIENT_FILE, 'utf8'));
-    const clientId = clientCreds.installed?.client_id || clientCreds.client_id;
-    const clientSecret = clientCreds.installed?.client_secret || clientCreds.client_secret;
-
-    if (!clientId || !clientSecret) {
-      throw new Error(`Invalid client credentials in ${CLIENT_FILE}`);
-    }
-
-    // Load account token file
+    // Load account token file FIRST — it may be self-describing about which
+    // OAuth client minted it, which decides where the client creds come from.
     const tokenFile = path.join(CRED_DIR, `${account}.json`);
     if (!fs.existsSync(tokenFile)) {
       throw new Error(`Token file not found: ${tokenFile} — run OAuth flow for ${account}`);
@@ -103,6 +153,8 @@ export class GmailClient {
     if (!refreshToken) {
       throw new Error(`No refresh_token in ${tokenFile} — re-run OAuth flow for ${account}`);
     }
+
+    const { clientId, clientSecret } = resolveClientCredentials(tokenData, tokenFile);
 
     return new GmailClient({ account, refreshToken, clientId, clientSecret, entity });
   }
