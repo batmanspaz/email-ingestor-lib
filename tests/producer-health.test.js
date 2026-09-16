@@ -65,6 +65,18 @@ describe('computeProducerStatus', () => {
   it('is down when every fetched item errored', () => {
     expect(computeProducerStatus({ fetched: 3, produced: 0, errors: 3 })).toBe('down');
   });
+  // tasks.db #1054: poll.js's outer per-account try/catch (PR #55) increments
+  // stats.errors when an ENTIRE account throws (e.g. an auth failure) before
+  // it ever lists a message — that account contributes 0 to stats.fetched.
+  // If that happens on a run where no OTHER account fetched anything either
+  // (a quiet mailbox, or the only configured account), the aggregate is
+  // {fetched: 0, errors: 1}. The old `fetched === 0 || errors === 0` check
+  // short-circuited on fetched===0 and reported 'ok' — a real account error
+  // reported healthy purely because nothing happened to fetch. Rule-13
+  // "missing = healthy" banned pattern.
+  it('is NOT ok when an account errored outright even though nothing was fetched', () => {
+    expect(computeProducerStatus({ fetched: 0, produced: 0, errors: 1 })).not.toBe('ok');
+  });
 });
 
 describe('reportProducerHealth', () => {
