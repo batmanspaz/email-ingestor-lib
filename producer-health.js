@@ -10,8 +10,22 @@ import path from 'node:path';
 import { computeQueueDepthCheck } from './queue-depth.js';
 
 export function computeProducerStatus({ fetched, errors }) {
-  if (fetched === 0 || errors === 0) return 'ok';
-  if (errors === fetched) return 'down';
+  // errors is not purely "fetched items that failed" — poll.js's outer
+  // per-account try/catch (PR #55) also increments it when an entire account
+  // throws (e.g. an auth failure) before it ever lists a message, so it
+  // contributes 0 to fetched. `fetched === 0` therefore must NOT short-circuit
+  // to 'ok' on its own — a quiet, error-free run and a fully-failed run both
+  // have fetched === 0, and only errors tells them apart (tasks.db #1054).
+  //
+  // `errors >= fetched` (not `===`) for the same reason: errors mixes
+  // per-message failures with whole-account throws, so it can legitimately
+  // exceed fetched (one account fetches 1 message that then errors, a second
+  // account throws outright -> fetched:1, errors:2 -- every fetched item
+  // failed AND an account is dead, which is 'down', not 'degraded'). This is
+  // a partial fix for the unit mismatch, not a full one -- see the follow-up
+  // ticket on splitting account-level vs message-level error counts.
+  if (errors === 0) return 'ok';
+  if (fetched === 0 || errors >= fetched) return 'down';
   return 'degraded';
 }
 
