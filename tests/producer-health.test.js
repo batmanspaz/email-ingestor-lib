@@ -74,8 +74,17 @@ describe('computeProducerStatus', () => {
   // short-circuited on fetched===0 and reported 'ok' — a real account error
   // reported healthy purely because nothing happened to fetch. Rule-13
   // "missing = healthy" banned pattern.
-  it('is NOT ok when an account errored outright even though nothing was fetched', () => {
-    expect(computeProducerStatus({ fetched: 0, produced: 0, errors: 1 })).not.toBe('ok');
+  it('is down (not just non-ok) when an account errored outright even though nothing was fetched', () => {
+    expect(computeProducerStatus({ fetched: 0, produced: 0, errors: 1 })).toBe('down');
+  });
+  // errors mixes per-message failures with whole-account throws (poll.js's
+  // outer try/catch, PR #55), so it can legitimately exceed fetched: one
+  // account fetches 1 message that then errors, a second account throws
+  // outright -> fetched:1, errors:2. Every fetched item failed AND an
+  // account is dead -- that's 'down', not 'degraded'. `errors === fetched`
+  // alone would miss this; needs `errors >= fetched`.
+  it('is down when errors exceed fetched (a fetched item failed and a whole other account threw)', () => {
+    expect(computeProducerStatus({ fetched: 1, produced: 0, errors: 2 })).toBe('down');
   });
 });
 

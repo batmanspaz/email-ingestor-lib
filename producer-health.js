@@ -16,8 +16,16 @@ export function computeProducerStatus({ fetched, errors }) {
   // contributes 0 to fetched. `fetched === 0` therefore must NOT short-circuit
   // to 'ok' on its own — a quiet, error-free run and a fully-failed run both
   // have fetched === 0, and only errors tells them apart (tasks.db #1054).
+  //
+  // `errors >= fetched` (not `===`) for the same reason: errors mixes
+  // per-message failures with whole-account throws, so it can legitimately
+  // exceed fetched (one account fetches 1 message that then errors, a second
+  // account throws outright -> fetched:1, errors:2 -- every fetched item
+  // failed AND an account is dead, which is 'down', not 'degraded'). This is
+  // a partial fix for the unit mismatch, not a full one -- see the follow-up
+  // ticket on splitting account-level vs message-level error counts.
   if (errors === 0) return 'ok';
-  if (fetched === 0 || errors === fetched) return 'down';
+  if (fetched === 0 || errors >= fetched) return 'down';
   return 'degraded';
 }
 
