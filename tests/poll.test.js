@@ -426,6 +426,49 @@ describe('poll — errors are reported per-unit, not conflated (tasks.db #1056)'
     expect(stats.messageErrors).toBe(0);
     expect(stats.accountErrors).toBe(0);
   });
+
+  // tasks.db #1056 defect 2 (Opus + Fable, 3-model audit of PR #59, reproduced via execution).
+  // The outer per-account catch wraps the ENTIRE account body — message loop, forwarding,
+  // archiving, AND the post-processing getCurrentHistoryId() cursor read / writeState() — not
+  // just pre-listing failures, contrary to poll.js's own JSDoc ("a whole account that threw
+  // before listing anything"). Reproduced: every message fetched AND processed successfully,
+  // then a single transient error on the post-processing cursor read -> the whole account was
+  // counted as accountErrors:1 -> computeProducerStatus returned 'down'. Zero mail was lost, but
+  // the producer paged as fully dead — the inverse failure mode of the bug #1056 exists to fix.
+  it('does NOT count a post-listing failure (the cursor read) as an accountError — the account already contributed this run', async () => {
+    const messages = [makeMeta({ id: 'm1' }), makeMeta({ id: 'm2' })];
+    const client = makeClient({ messages });
+    // Both messages are fetched and handled successfully; the failure happens strictly AFTER
+    // that, in the post-processing cursor read (poll.js's `else if (!capped)` branch).
+    client.getCurrentHistoryId = vi.fn().mockRejectedValue(new Error('transient: cursor read failed'));
+    seedState({ 'a@example.com': { lastHistoryId: '2000' } });
+
+    const handler = vi.fn().mockResolvedValue('processed');
+    const stats = await poll({ clients: [{ client, label: 'A' }], statePath }, handler);
+
+    expect(handler).toHaveBeenCalledTimes(2); // both messages were genuinely processed
+    expect(stats.fetched).toBe(2);
+    expect(stats.processed).toBe(2);
+    expect(stats.accountErrors).toBe(0); // NOT a whole-account outage — mail is still arriving
+    expect(stats.messageErrors).toBe(1); // the failure is real and must still be counted somewhere
+    expect(stats.errors).toBe(1);
+  });
+
+  // Contrast case, pinned so the narrowing above cannot regress into "nothing is ever an
+  // accountError": a failure BEFORE anything was listed for this account (this account's
+  // getHistory() itself throws, contributing 0 to stats.fetched) must still count as a genuine
+  // accountError — that account's mail really has stopped arriving.
+  it('still counts a pre-listing failure as an accountError when the account contributed nothing this run', async () => {
+    const client = makeClient({ account: 'dead@example.com' });
+    client.getHistory = vi.fn().mockRejectedValue(new Error('invalid_grant: token is dead'));
+    seedState({ 'dead@example.com': { lastHistoryId: '2000' } });
+
+    const stats = await poll({ clients: [{ client, label: 'DEAD' }], statePath }, vi.fn());
+
+    expect(stats.fetched).toBe(0);
+    expect(stats.accountErrors).toBe(1);
+    expect(stats.messageErrors).toBe(0);
+  });
 });
 
 describe('poll — dry-run', () => {

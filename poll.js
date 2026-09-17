@@ -34,6 +34,15 @@ import { GmailClient } from './gmail.js';
  *   #1056): a message that failed to process is one item of many, a whole account that threw is
  *   an entity whose mail has stopped arriving. Summed, the second hides inside the first on any
  *   busy run.
+ *
+ *   `accountErrors` counts ONLY a failure that leaves this account having fetched nothing this
+ *   run — i.e. it genuinely died before listing anything (auth, quota, a network error on
+ *   getHistory itself). A failure that happens AFTER this account already contributed to
+ *   `fetched` — e.g. the post-processing cursor read/writeState() below, or a batch-archive call
+ *   — is counted as a messageError instead: that account's mail is still arriving, so it must not
+ *   trip a full 'down' (tasks.db #1056 defect 2, reproduced via execution: 2 accounts, 7 messages
+ *   all fetched and processed, one transient error on the post-processing cursor write reported
+ *   the whole producer as fully dead with zero mail actually lost).
  */
 export async function poll(config, handler) {
   const { clients, statePath, maxPerRun = 50, dryRun = false, invokeHandlerInDryRun = false, archiveAfterProcess = false } = config;
@@ -41,8 +50,10 @@ export async function poll(config, handler) {
     fetched: 0, processed: 0, errors: 0, forwarded: 0, archived: 0,
     // Two units, counted apart (tasks.db #1056). `errors` stays their sum so every existing
     // caller keeps its meaning; computeProducerStatus() reads the split when it is present.
-    messageErrors: 0,    // a fetched message the handler could not process
-    accountErrors: 0,    // a whole account that threw before listing anything (auth, quota, API)
+    messageErrors: 0,    // a fetched message the handler could not process, OR a post-listing
+                          // account failure (this account had already contributed to `fetched`)
+    accountErrors: 0,    // a whole account that threw before listing anything this run (auth,
+                          // quota, API) — contributed 0 to `fetched`
     truncated: 0,        // history windows getHistory had to cut short
     quarantined: 0,      // messages retired after repeated deterministic failure
     historyExpired: 0,   // KNOWN-LOSS events: Gmail's ~7d history aged out
@@ -55,6 +66,10 @@ export async function poll(config, handler) {
   for (const clientEntry of clients) {
     const { client, label } = clientEntry;
     const accountKey = client.account;
+    // Captured BEFORE the try block so the catch below can tell "died before listing anything"
+    // (accountError) apart from "failed after already contributing this run" (messageError) —
+    // see the accountErrors doc above (tasks.db #1056 defect 2).
+    const fetchedBeforeAccount = stats.fetched;
     try {
     const historyId = state.accounts?.[accountKey]?.lastHistoryId;
 
@@ -407,8 +422,20 @@ export async function poll(config, handler) {
       // health/telemetry reporting still needs to fire for them. Additive
       // safety net only — the success-path logic above is untouched.
       stats.errors++;
-      stats.accountErrors++;
-      console.error(`  [${label}] Unhandled error polling account — skipping to next account this run: ${err.message}`);
+      // tasks.db #1056 defect 2: this catch wraps the WHOLE account body, not just the
+      // pre-listing setup — a failure in the post-processing cursor read/writeState() lands
+      // here too, on an account that already fetched and processed everything cleanly. Only
+      // count it as a genuine accountError (which computeProducerStatus treats as an
+      // unconditional 'down') when this account contributed NOTHING to stats.fetched this run —
+      // i.e. it really did die before listing anything. Anything after a successful listing is a
+      // messageError: real, but not evidence the account's mail has stopped arriving.
+      if (stats.fetched === fetchedBeforeAccount) {
+        stats.accountErrors++;
+        console.error(`  [${label}] Unhandled error polling account before listing anything — skipping to next account this run: ${err.message}`);
+      } else {
+        stats.messageErrors++;
+        console.error(`  [${label}] Unhandled error polling account AFTER it fetched/processed messages this run — not counting it as an account outage: ${err.message}`);
+      }
     }
   }
 

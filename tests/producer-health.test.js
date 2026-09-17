@@ -170,6 +170,33 @@ describe('computeProducerStatus — split account vs message error counts (#1056
       computeProducerStatus({ fetched: 5, produced: 4, errors: 2, messageErrors: NaN, accountErrors: 0 }),
     ).toBe('degraded');
   });
+
+  // tasks.db #1056 defect 2b (Opus, 3-model audit of PR #59). A caller can hand in a valid, VALID
+  // split (messageErrors:0, accountErrors:0) alongside a summed `errors` that disagrees with it.
+  // That shape is structurally impossible on pre-PR main — there was only one number — and the
+  // split branch above must not trust a zeroed split into reporting 'ok' when the summed `errors`
+  // it was supposedly split FROM is itself a valid, nonzero count. An incoherent split is not
+  // evidence of health; it is evidence the split itself is wrong (a bug in poll(), or a
+  // hand-built stats object), and must never be more lenient than the legacy summed read.
+  it('never reports ok when the split is zeroed but the summed errors is a valid nonzero count (incoherent split)', () => {
+    expect(
+      computeProducerStatus({ fetched: 4, produced: 2, errors: 2, messageErrors: 0, accountErrors: 0 }),
+    ).not.toBe('ok');
+  });
+
+  it('an incoherent split still resolves via the legacy summed comparator, not a guess', () => {
+    // fetched:4, errors:2 -> degraded under the legacy comparator (errors < fetched). The
+    // incoherent split must land on exactly that answer, not 'ok' and not an unrelated 'down'.
+    expect(
+      computeProducerStatus({ fetched: 4, produced: 2, errors: 2, messageErrors: 0, accountErrors: 0 }),
+    ).toBe('degraded');
+  });
+
+  it('a COHERENT zeroed split (errors also 0) is still a clean ok', () => {
+    expect(
+      computeProducerStatus({ fetched: 4, produced: 4, errors: 0, messageErrors: 0, accountErrors: 0 }),
+    ).toBe('ok');
+  });
 });
 
 describe('reportProducerHealth', () => {
@@ -855,5 +882,65 @@ describe('producerRunStats', () => {
     expect(out).toMatchObject({
       entityId: 'collagesoup', fetched: 12, produced: 10, skipped: 0, errors: 0, quarantined: 0,
     });
+  });
+
+  // tasks.db #1056 defect 1 — 3-model audit of PR #59, all three reviewers. The health half of
+  // the split (producerHealthStats) spreads poll()'s result and so forwards messageErrors/
+  // accountErrors automatically. This, its analytics twin, HAND-ENUMERATES the output object and
+  // silently dropped both new fields — the exact "cherry-picked three-field shape" #948 already
+  // fixed once, reopened for the two newest counts. trackProducerRun() defaults both to 0 when
+  // absent, so a real dead-account run reported account_errors:0 on the wire: the one metric a
+  // dashboard would filter on to catch #1056 in the first place was DOA.
+  it('forwards messageErrors and accountErrors, not a defaulted zero', () => {
+    const out = producerRunStats('collagesoup', { ...fullPollStats(), errors: 1, messageErrors: 0, accountErrors: 1 });
+    expect(out.accountErrors).toBe(1);
+    expect(out.messageErrors).toBe(0);
+  });
+});
+
+// ── composition seam: trackProducerRun(producerRunStats(...)) — tasks.db #1056 defect 1 ──
+//
+// Each half (producerRunStats, trackProducerRun) was tested in isolation and both passed; the
+// SEAM between them — what a real consumer actually calls — was never exercised, and that is
+// exactly where the bug lived: producerRunStats dropped the two new fields, so trackProducerRun's
+// own defaulting silently replaced them with 0 no matter what poll() actually returned.
+describe('trackProducerRun(producerRunStats(...)) composition — tasks.db #1056 defect 1', () => {
+  it('emits account_errors: 1 for a real dead-account poll() fixture, not a laundered 0', async () => {
+    const { sent, transport } = fakeTransport();
+    const telemetry = createTelemetry({
+      product: 'sluice',
+      module: 'producer.collagesoup',
+      version: 'test',
+      transport,
+      heartbeatMs: 0,
+      batchIntervalMs: 0,
+      autoStart: false,
+      batchSize: 1,
+    });
+
+    // The live emilee.stone@collagesoup.com shape: a busy, otherwise-healthy run where exactly
+    // one account died before listing anything. This is poll()'s REAL return shape, not a
+    // hand-built params object — the composition is the point.
+    const deadAccountFixture = {
+      fetched: 20,
+      processed: 20,
+      errors: 1,
+      messageErrors: 0,
+      accountErrors: 1,
+      forwarded: 0,
+      archived: 20,
+      truncated: 0,
+      quarantined: 0,
+      historyExpired: 0,
+      maxStalledRuns: 0,
+    };
+
+    trackProducerRun(telemetry, producerRunStats('collagesoup', deadAccountFixture));
+    await telemetry.flush();
+
+    const batch = sent.analytics[0];
+    expect(() => AnalyticsBatchSchema.parse(batch)).not.toThrow();
+    expect(batch[0].props.account_errors).toBe(1);
+    expect(batch[0].props.message_errors).toBe(0);
   });
 });

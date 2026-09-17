@@ -27,11 +27,23 @@ export function computeProducerStatus({ fetched, errors, messageErrors, accountE
   if (validCount(accountErrors) && accountErrors > 0) return 'down';
 
   if (validCount(accountErrors) && validCount(messageErrors)) {
-    if (messageErrors === 0) return 'ok';
-    // fetched === 0 with a message error is arithmetically impossible (an error is counted per
-    // fetched item), so it means a caller hand-built an incoherent stats object. Not green.
-    if (fetched === 0 || messageErrors >= fetched) return 'down';
-    return 'degraded';
+    // Coherence guard (tasks.db #1056 defect 2b, Opus — 3-model audit of PR #59). accountErrors
+    // is already excluded above when it is a valid > 0, so reaching here means accountErrors is
+    // 0. A caller can still hand in a valid, ZEROED split (messageErrors:0, accountErrors:0)
+    // beside a summed `errors` that disagrees with it — {errors:2, messageErrors:0,
+    // accountErrors:0} is structurally impossible on pre-PR main (there was only one number to
+    // report) and must never be trusted into 'ok' just because the split says nothing happened.
+    // An incoherent split is evidence the split itself is wrong (a bug in poll(), or a hand-built
+    // stats object), not evidence of health, so it falls through to the legacy summed comparator
+    // below, which reads `errors` directly and cannot go green on a nonzero count.
+    const splitIsCoherent = !validCount(errors) || errors === messageErrors + accountErrors;
+    if (splitIsCoherent) {
+      if (messageErrors === 0) return 'ok';
+      // fetched === 0 with a message error is arithmetically impossible (an error is counted per
+      // fetched item), so it means a caller hand-built an incoherent stats object. Not green.
+      if (fetched === 0 || messageErrors >= fetched) return 'down';
+      return 'degraded';
+    }
   }
 
   // LEGACY SUMMED SHAPE. The three consumer repos pin this lib by git SHA and upgrade
@@ -343,9 +355,17 @@ export function producerHealthStats(stats) {
  * skipped counter — an idempotent re-run (envelope already exists) still
  * counts as `processed` from poll()'s point of view.
  *
+ * `messageErrors` / `accountErrors` are forwarded the same way (tasks.db #1056 defect 1, 3-model
+ * audit of PR #59): this function used to hand-enumerate its return object and silently dropped
+ * both fields, so trackProducerRun()'s own `= 0` default parameters replaced a REAL dead-account
+ * run with a laundered zero on the wire — the exact metric a dashboard would filter on to catch
+ * this class of incident never arrived. Forwarded directly, not through `|| 0`: poll() always
+ * initializes both to a real number, so there is nothing to default, and defaulting here would
+ * silently reintroduce the same masking one layer up if that ever stopped being true.
+ *
  * @param {string} entityId
- * @param {{fetched:number, processed:number, errors:number, quarantined?:number}} stats
- *   — poll()'s return value.
+ * @param {{fetched:number, processed:number, errors:number, messageErrors?:number,
+ *   accountErrors?:number, quarantined?:number}} stats — poll()'s return value.
  */
 export function producerRunStats(entityId, stats) {
   return {
@@ -354,6 +374,8 @@ export function producerRunStats(entityId, stats) {
     produced: stats.processed,
     skipped: 0,
     errors: stats.errors || 0,
+    messageErrors: stats.messageErrors,
+    accountErrors: stats.accountErrors,
     quarantined: stats.quarantined ?? 0,
   };
 }
