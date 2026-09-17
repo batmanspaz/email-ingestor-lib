@@ -20,7 +20,10 @@ export function computeProducerStatus({ fetched, errors, messageErrors, accountE
   // Summed, the second hides inside the first on any busy run: a dead account alongside four
   // healthy ones is {fetched: 5, errors: 2}, which reads as "2 of 5 items had trouble" and lands
   // on 'degraded'. The more mail the healthy accounts carry, the better the dead one hides. That
-  // is the live emilee.stone@collagesoup.com shape.
+  // was the shape of the emilee.stone@collagesoup.com auth-dead incident (tasks.db #1056,
+  // diagnosed 2026-09-14; the account was re-seeded that day and has been fetching mail normally
+  // on every run since — see ~/claude/shared/logs/email-ingestor-collagesoup.log. Historical
+  // example of the failure class, not a live account issue).
   //
   // So: any account error is 'down' on its own, regardless of how well everything else went.
   // A message error is weighed against fetched, as before.
@@ -55,7 +58,22 @@ export function computeProducerStatus({ fetched, errors, messageErrors, accountE
   // "missing = healthy" banned pattern). `errors >= fetched` (not `===`) because the summed count
   // can legitimately exceed fetched: one account fetches 1 message that errors, a second account
   // throws outright -> fetched:1, errors:2.
-  if (errors === 0) return 'ok';
+  //
+  // Coherence guard (tasks.db #1056 round 2, M-5, Opus). A split field that is PRESENT but not a
+  // usable number (a string, NaN, negative) is different from one that is simply ABSENT — absent
+  // means "this caller is on the legacy shape", present-but-invalid means a caller tried to report
+  // a split and the value is garbage. validCount()'s own docblock already says an invalid count
+  // must never stand in for zero, but reaching this branch at all meant BOTH validCount() checks
+  // above already failed silently on that garbage value — nothing stopped it from falling all the
+  // way through to `errors === 0` and reporting a clean 'ok'
+  // (computeProducerStatus({fetched:0, errors:0, messageErrors:0, accountErrors:'3'}) did exactly
+  // that). Floors the result at 'degraded' when garbage is present: never promotes an already-worse
+  // legacy verdict, only ever prevents a false 'ok'.
+  const accountErrorsPresentButInvalid = accountErrors !== undefined && !validCount(accountErrors);
+  const messageErrorsPresentButInvalid = messageErrors !== undefined && !validCount(messageErrors);
+  const splitFieldPresentButInvalid = accountErrorsPresentButInvalid || messageErrorsPresentButInvalid;
+
+  if (errors === 0) return splitFieldPresentButInvalid ? 'degraded' : 'ok';
   if (fetched === 0 || errors >= fetched) return 'down';
   return 'degraded';
 }

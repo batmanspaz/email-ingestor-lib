@@ -96,11 +96,13 @@ describe('computeProducerStatus', () => {
 // listed anything (the per-account try/catch from PR #55, poll.js ~399). computeProducerStatus
 // then has to GUESS the unit from one summed number.
 //
-// The cell that guess still gets wrong is the dangerous one, and it is the LIVE shape: one dead
-// account on a BUSY run. emilee.stone@collagesoup.com is auth-dead; the other accounts are not.
-// {fetched: 5, errors: 2} reads as "2 of 5 items had trouble" => degraded, and a whole entity's
-// mail silently stops being collected behind a green-ish status. The more mail the healthy
-// accounts carry, the more thoroughly the dead one hides.
+// The cell that guess still gets wrong is the dangerous one, and it was a REAL incident shape:
+// one dead account on a BUSY run — emilee.stone@collagesoup.com went auth-dead while the other
+// accounts kept fetching fine (diagnosed 2026-09-14; re-seeded that day and fetching normally on
+// every run since — this is a historical example of the failure class, not a current account
+// issue). {fetched: 5, errors: 2} reads as "2 of 5 items had trouble" => degraded, and a whole
+// entity's mail silently stops being collected behind a green-ish status. The more mail the
+// healthy accounts carry, the more thoroughly the dead one hides.
 //
 // Fix: poll() reports messageErrors and accountErrors separately (keeping `errors` as their sum
 // for every existing caller), and the status derives DOWN from any accountErrors > 0 rather than
@@ -197,6 +199,28 @@ describe('computeProducerStatus — split account vs message error counts (#1056
       computeProducerStatus({ fetched: 4, produced: 4, errors: 0, messageErrors: 0, accountErrors: 0 }),
     ).toBe('ok');
   });
+
+  // tasks.db #1056 round 2, DEFECT M-5 (Opus, 3-model audit of PR #59). A PRESENT but INVALID
+  // accountErrors (a string, not simply absent) fell through both split checks above (each
+  // requires validCount(accountErrors)) and landed on the legacy `errors === 0` comparator, which
+  // read the also-zero `errors`/`messageErrors` fields and returned a clean 'ok' — a caller who
+  // sent garbage in accountErrors got the SAME answer as a caller who sent nothing at all.
+  // validCount()'s own docblock says an invalid count must never stand in for zero; this is that
+  // guarantee reaching the one branch it didn't cover yet.
+  it('never reports ok when a split field is present but not a usable number, even if errors is also 0 (M-5)', () => {
+    expect(
+      computeProducerStatus({ fetched: 0, errors: 0, messageErrors: 0, accountErrors: '3' }),
+    ).not.toBe('ok');
+    expect(
+      computeProducerStatus({ fetched: 0, errors: 0, messageErrors: 0, accountErrors: '3' }),
+    ).toBe('degraded');
+  });
+
+  it('a present-but-invalid messageErrors is floored the same way as accountErrors (M-5)', () => {
+    expect(
+      computeProducerStatus({ fetched: 0, errors: 0, messageErrors: 'zero', accountErrors: 0 }),
+    ).toBe('degraded');
+  });
 });
 
 describe('reportProducerHealth', () => {
@@ -263,7 +287,8 @@ describe('reportProducerHealth', () => {
       batchIntervalMs: 0,
       autoStart: false,
     });
-    // The live emilee.stone@collagesoup.com shape: four accounts pulling mail fine, one
+    // The emilee.stone@collagesoup.com shape (2026-09-14 incident, since resolved — the account
+    // was re-seeded and has been fetching normally): four accounts pulling mail fine, one
     // auth-dead. Summed, `errors: 1` against `fetched: 20` used to read as 'degraded'.
     await reportProducerHealth(
       telemetry,
@@ -918,7 +943,8 @@ describe('trackProducerRun(producerRunStats(...)) composition — tasks.db #1056
       batchSize: 1,
     });
 
-    // The live emilee.stone@collagesoup.com shape: a busy, otherwise-healthy run where exactly
+    // The emilee.stone@collagesoup.com shape (2026-09-14 incident, since resolved — the account
+    // was re-seeded and has been fetching normally): a busy, otherwise-healthy run where exactly
     // one account died before listing anything. This is poll()'s REAL return shape, not a
     // hand-built params object — the composition is the point.
     const deadAccountFixture = {

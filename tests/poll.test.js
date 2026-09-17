@@ -469,6 +469,63 @@ describe('poll — errors are reported per-unit, not conflated (tasks.db #1056)'
     expect(stats.accountErrors).toBe(1);
     expect(stats.messageErrors).toBe(0);
   });
+
+  // tasks.db #1056 round 2, DEFECT H-2 (Fable and Opus, both reproduced via execution
+  // independently). The narrowing above was still incomplete: it inferred "this account listed
+  // successfully" from `stats.fetched === fetchedBeforeAccount`, but a quiet, successful listing
+  // (0 new mail) contributes 0 to `fetched` BY DESIGN — so the comparison could never tell a
+  // genuinely quiet account apart from one that died before listing anything. Both zero-new-mail
+  // exit paths (nothing in the window at all; everything already ringed) call getHistory()
+  // successfully and THEN call nextCursor() -> getCurrentHistoryId() / writeState() — a transient
+  // failure there was misclassified as an accountError purely because fetched never moved.
+  it('does NOT count a transient failure after a quiet zero-new-mail listing as an accountError (H-2, quiet account alone)', async () => {
+    const client = makeClient({ account: 'quiet@example.com', messages: [] });
+    // getHistory() succeeds with 0 new messages (the zero-new-mail early-exit path,
+    // poll.js ~264-273); the failure happens strictly AFTER that, in nextCursor()'s
+    // getCurrentHistoryId() call.
+    client.getCurrentHistoryId = vi.fn().mockRejectedValue(new Error('transient: cursor read failed'));
+    seedState({ 'quiet@example.com': { lastHistoryId: '2000' } });
+
+    const stats = await poll({ clients: [{ client, label: 'QUIET' }], statePath }, vi.fn());
+
+    expect(client.getHistory).toHaveBeenCalledTimes(1); // the listing itself genuinely succeeded
+    expect(stats.fetched).toBe(0); // quiet run — nothing to fetch is not evidence of failure
+    expect(stats.accountErrors).toBe(0); // NOT a whole-account outage — it listed fine
+    expect(stats.messageErrors).toBe(1); // the failure is real and must still be counted somewhere
+    expect(stats.errors).toBe(1);
+  });
+
+  // Same bug, the live regression shape: one busy healthy account alongside one quiet account
+  // hitting the identical post-listing transient failure. Pre-H-2 this misclassified the quiet
+  // account as accountErrors:1 -> computeProducerStatus('down') for the WHOLE producer, even
+  // though 3/3 messages on the busy account were fetched and processed cleanly — a regression vs
+  // current main, which would have returned 'degraded' for this exact shape (a single errors:1
+  // against fetched:3).
+  it('keeps a quiet-account post-listing failure apart from a busy healthy account on the same run (H-2, mixed busy+quiet)', async () => {
+    const busyMessages = [makeMeta({ id: 'b1' }), makeMeta({ id: 'b2' }), makeMeta({ id: 'b3' })];
+    const busyClient = makeClient({ account: 'busy@example.com', messages: busyMessages, currentHistoryId: '9000' });
+
+    const quietClient = makeClient({ account: 'quiet@example.com', messages: [] });
+    quietClient.getCurrentHistoryId = vi.fn().mockRejectedValue(new Error('transient: cursor read failed'));
+
+    seedState({
+      'busy@example.com': { lastHistoryId: '2000' },
+      'quiet@example.com': { lastHistoryId: '2000' },
+    });
+
+    const handler = vi.fn().mockResolvedValue('processed');
+    const stats = await poll(
+      { clients: [{ client: busyClient, label: 'BUSY' }, { client: quietClient, label: 'QUIET' }], statePath },
+      handler,
+    );
+
+    expect(handler).toHaveBeenCalledTimes(3); // the busy account's 3 messages were genuinely processed
+    expect(stats.fetched).toBe(3);
+    expect(stats.processed).toBe(3);
+    expect(stats.accountErrors).toBe(0); // REGRESSION CHECK: must not read as 'down' for the whole producer
+    expect(stats.messageErrors).toBe(1);
+    expect(stats.errors).toBe(1);
+  });
 });
 
 describe('poll — dry-run', () => {
