@@ -26,14 +26,43 @@ import { GmailClient } from './gmail.js';
  *   Forwarded messages are also archived (already handled at destination).
  *   Has no effect in dryRun mode.
  * @param {function} handler — async (message, client, { dryRun }) => void, called for each new message
- * @returns {Promise<{fetched:number, processed:number, errors:number, forwarded:number,
- *   archived:number, truncated:number, quarantined:number, historyExpired:number,
- *   maxStalledRuns:number}>}
+ * @returns {Promise<{fetched:number, processed:number, errors:number, messageErrors:number,
+ *   accountErrors:number, forwarded:number, archived:number, truncated:number,
+ *   quarantined:number, historyExpired:number, maxStalledRuns:number}>}
+ *   `errors` is messageErrors + accountErrors. The two are reported separately because they are
+ *   DIFFERENT UNITS and a health status cannot be derived correctly from their sum (tasks.db
+ *   #1056): a message that failed to process is one item of many, a whole account that threw is
+ *   an entity whose mail has stopped arriving. Summed, the second hides inside the first on any
+ *   busy run.
+ *
+ *   `accountErrors` counts ONLY a failure that happens before this account's `getHistory()` call
+ *   resolved successfully — i.e. it genuinely died before listing anything (auth, quota, a
+ *   network error on getHistory itself). A failure that happens AFTER a successful listing — e.g.
+ *   the post-processing cursor read/writeState() below, or a batch-archive call — is counted as a
+ *   messageError instead: that account's mail is still arriving (or there genuinely was none this
+ *   run), so it must not trip a full 'down' (tasks.db #1056 defect 2, reproduced via execution: 2
+ *   accounts, 7 messages all fetched and processed, one transient error on the post-processing
+ *   cursor write reported the whole producer as fully dead with zero mail actually lost).
+ *
+ *   This is tracked with an explicit `listed` flag set the moment `getHistory()` resolves, NOT
+ *   inferred from whether `stats.fetched` moved (tasks.db #1056 round 2, H-2, reproduced twice
+ *   independently by Fable and Opus): a `fetched`-delta comparison misclassifies the two
+ *   zero-new-mail exit paths below (nothing in the window at all; everything already ringed) as
+ *   accountErrors, because a quiet, successful listing contributes 0 to `fetched` by design. Both
+ *   paths still call `nextCursor()` / `writeState()` after `getHistory()` succeeded, and a
+ *   transient failure there was being counted as the whole account dying, on the exact incident
+ *   class this fix exists for.
  */
 export async function poll(config, handler) {
   const { clients, statePath, maxPerRun = 50, dryRun = false, invokeHandlerInDryRun = false, archiveAfterProcess = false } = config;
   const stats = {
     fetched: 0, processed: 0, errors: 0, forwarded: 0, archived: 0,
+    // Two units, counted apart (tasks.db #1056). `errors` stays their sum so every existing
+    // caller keeps its meaning; computeProducerStatus() reads the split when it is present.
+    messageErrors: 0,    // a fetched message the handler could not process, OR a post-listing
+                          // account failure (this account had already contributed to `fetched`)
+    accountErrors: 0,    // a whole account that threw before listing anything this run (auth,
+                          // quota, API) — contributed 0 to `fetched`
     truncated: 0,        // history windows getHistory had to cut short
     quarantined: 0,      // messages retired after repeated deterministic failure
     historyExpired: 0,   // KNOWN-LOSS events: Gmail's ~7d history aged out
@@ -46,6 +75,12 @@ export async function poll(config, handler) {
   for (const clientEntry of clients) {
     const { client, label } = clientEntry;
     const accountKey = client.account;
+    // Set the moment getHistory() resolves — declared here so the catch below can tell "died
+    // before listing anything" (accountError) apart from "failed after a successful listing"
+    // (messageError), see the accountErrors doc above (tasks.db #1056 defect 2, H-2). Deliberately
+    // NOT inferred from stats.fetched: a quiet, successful listing (0 new mail) contributes 0 to
+    // `fetched`, which is exactly the case H-2 fixes.
+    let listed = false;
     try {
     const historyId = state.accounts?.[accountKey]?.lastHistoryId;
 
@@ -132,6 +167,10 @@ export async function poll(config, handler) {
 
     // Fetch new message IDs
     const history = await client.getHistory(historyId);
+    // getHistory() resolved — this account genuinely listed, no matter what the result contains
+    // (empty window, historyExpired null, or a real batch). Everything below this line that fails
+    // is a messageError, never an accountError (tasks.db #1056 H-2).
+    listed = true;
 
     if (history === null) {
       // KNOWN LOSS. Gmail's history window (~7 days) aged out before we drained
@@ -322,6 +361,7 @@ export async function poll(config, handler) {
         } else {
           console.error(`    Error processing ${id}: ${err.message}`);
           stats.errors++;
+          stats.messageErrors++;
           if (!dryRun) {
             failures[id] = (failures[id] || 0) + 1;
             if (failures[id] >= MAX_MESSAGE_ATTEMPTS) {
@@ -397,7 +437,23 @@ export async function poll(config, handler) {
       // health/telemetry reporting still needs to fire for them. Additive
       // safety net only — the success-path logic above is untouched.
       stats.errors++;
-      console.error(`  [${label}] Unhandled error polling account — skipping to next account this run: ${err.message}`);
+      // tasks.db #1056 defect 2 / H-2: this catch wraps the WHOLE account body, not just the
+      // pre-listing setup — a failure in the post-processing cursor read/writeState() lands
+      // here too, including on the two zero-new-mail exit paths where the account already
+      // listed successfully but contributed nothing to stats.fetched. Classify on whether
+      // getHistory() itself ever resolved (`listed`), NOT on whether stats.fetched moved — a
+      // fetched-delta comparison misclassifies a quiet, successful listing as an accountError
+      // (H-2, reproduced independently by Fable and Opus). Only count it as a genuine
+      // accountError (which computeProducerStatus treats as an unconditional 'down') when this
+      // account never listed anything at all. Anything after a successful listing is a
+      // messageError: real, but not evidence the account's mail has stopped arriving.
+      if (!listed) {
+        stats.accountErrors++;
+        console.error(`  [${label}] Unhandled error polling account before listing anything — skipping to next account this run: ${err.message}`);
+      } else {
+        stats.messageErrors++;
+        console.error(`  [${label}] Unhandled error polling account AFTER it listed successfully this run — not counting it as an account outage: ${err.message}`);
+      }
     }
   }
 

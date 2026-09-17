@@ -88,7 +88,7 @@ describe('poll — first run (no historyId)', () => {
     const stats = await poll({ clients: [{ client, label: 'A' }], statePath }, handler);
 
     expect(handler).not.toHaveBeenCalled();
-    expect(stats).toEqual({ fetched: 0, processed: 0, errors: 0, forwarded: 0, archived: 0 , truncated: 0 , quarantined: 0, historyExpired: 0, maxStalledRuns: 0 });
+    expect(stats).toEqual({ fetched: 0, processed: 0, errors: 0, messageErrors: 0, accountErrors: 0, forwarded: 0, archived: 0 , truncated: 0 , quarantined: 0, historyExpired: 0, maxStalledRuns: 0 });
     expect(readStateFile().accounts['a@example.com'].lastHistoryId).toBe('1234');
   });
 
@@ -112,7 +112,7 @@ describe('poll — normal run', () => {
 
     expect(handler).toHaveBeenCalledTimes(2);
     expect(handler).toHaveBeenCalledWith(messages[0], client, { dryRun: false });
-    expect(stats).toEqual({ fetched: 2, processed: 2, errors: 0, forwarded: 0, archived: 0 , truncated: 0 , quarantined: 0, historyExpired: 0, maxStalledRuns: 0 });
+    expect(stats).toEqual({ fetched: 2, processed: 2, errors: 0, messageErrors: 0, accountErrors: 0, forwarded: 0, archived: 0 , truncated: 0 , quarantined: 0, historyExpired: 0, maxStalledRuns: 0 });
     const state = readStateFile();
     expect(state.accounts['a@example.com'].lastHistoryId).toBe('3000');
     expect(state.totalProcessed).toBe(2);
@@ -334,6 +334,200 @@ describe('poll — per-account error isolation (tasks.db #1042)', () => {
   });
 });
 
+// ── tasks.db #1056: per-message and per-account errors are different units ──
+//
+// poll() incremented ONE `errors` counter from two places that mean different things: a message
+// that failed to process (the inner per-message catch) and a whole account that threw before it
+// listed anything (the per-account catch added by PR #55). computeProducerStatus then had to
+// guess the unit from the sum, and on a busy run a dead account hides inside it —
+// {fetched: 5, errors: 2} reads as "2 of 5 items had trouble", not "an entity's mail has stopped
+// arriving". See tests/producer-health.test.js for the status-derivation half.
+//
+// `errors` is deliberately KEPT as the sum. The three consumer repos spread poll()'s return
+// through producerHealthStats unchanged, so the new fields flow to telemetry with no consumer
+// change, and nothing that reads `errors` today changes meaning.
+describe('poll — errors are reported per-unit, not conflated (tasks.db #1056)', () => {
+  it('counts a whole-account throw as an accountError, not a messageError', async () => {
+    const badClient = makeClient({ account: 'bad@example.com' });
+    badClient.getHistory = vi.fn().mockRejectedValue(new Error('invalid_grant: token is dead'));
+
+    const goodMessages = [makeMeta({ id: 'g1' }), makeMeta({ id: 'g2' })];
+    const goodClient = makeClient({ account: 'good@example.com', messages: goodMessages, currentHistoryId: '5000' });
+    seedState({
+      'bad@example.com': { lastHistoryId: '2000' },
+      'good@example.com': { lastHistoryId: '2000' },
+    });
+
+    const stats = await poll(
+      { clients: [{ client: badClient, label: 'BAD' }, { client: goodClient, label: 'GOOD' }], statePath },
+      vi.fn().mockResolvedValue('processed'),
+    );
+
+    expect(stats.accountErrors).toBe(1);
+    expect(stats.messageErrors).toBe(0);
+    expect(stats.errors).toBe(1); // still the sum — no existing caller changes meaning
+  });
+
+  it('counts a failing handler as a messageError, not an accountError', async () => {
+    const client = makeClient({ messages: [makeMeta({ id: 'm1' }), makeMeta({ id: 'm2' })] });
+    seedState({ 'a@example.com': { lastHistoryId: '2000' } });
+
+    const handler = vi
+      .fn()
+      .mockRejectedValueOnce(new Error('handler blew up'))
+      .mockResolvedValue('processed');
+
+    const stats = await poll({ clients: [{ client, label: 'A' }], statePath }, handler);
+
+    expect(stats.messageErrors).toBe(1);
+    expect(stats.accountErrors).toBe(0);
+    expect(stats.errors).toBe(1);
+  });
+
+  it('keeps the two apart when BOTH happen in one run — the live shape a summed count hides', async () => {
+    // One dead account plus one bad message on a healthy, busy account. Summed this is
+    // {fetched: 2, errors: 2} and reads as "every fetched item failed"; split it is
+    // "one account is gone AND one message failed", which are two different pages.
+    const badClient = makeClient({ account: 'bad@example.com' });
+    badClient.getHistory = vi.fn().mockRejectedValue(new Error('invalid_grant: token is dead'));
+
+    const goodClient = makeClient({
+      account: 'good@example.com',
+      messages: [makeMeta({ id: 'g1' }), makeMeta({ id: 'g2' })],
+      currentHistoryId: '5000',
+    });
+    seedState({
+      'bad@example.com': { lastHistoryId: '2000' },
+      'good@example.com': { lastHistoryId: '2000' },
+    });
+
+    const handler = vi
+      .fn()
+      .mockRejectedValueOnce(new Error('handler blew up'))
+      .mockResolvedValue('processed');
+
+    const stats = await poll(
+      { clients: [{ client: badClient, label: 'BAD' }, { client: goodClient, label: 'GOOD' }], statePath },
+      handler,
+    );
+
+    expect(stats.fetched).toBe(2);
+    expect(stats.accountErrors).toBe(1);
+    expect(stats.messageErrors).toBe(1);
+    expect(stats.errors).toBe(2);
+  });
+
+  it('reports both counters at zero on a clean run — an absent counter is not evidence of absence', async () => {
+    const client = makeClient({ messages: [makeMeta({ id: 'm1' })] });
+    seedState({ 'a@example.com': { lastHistoryId: '2000' } });
+
+    const stats = await poll({ clients: [{ client, label: 'A' }], statePath }, vi.fn().mockResolvedValue('processed'));
+
+    expect(stats.messageErrors).toBe(0);
+    expect(stats.accountErrors).toBe(0);
+  });
+
+  // tasks.db #1056 defect 2 (Opus + Fable, 3-model audit of PR #59, reproduced via execution).
+  // The outer per-account catch wraps the ENTIRE account body — message loop, forwarding,
+  // archiving, AND the post-processing getCurrentHistoryId() cursor read / writeState() — not
+  // just pre-listing failures, contrary to poll.js's own JSDoc ("a whole account that threw
+  // before listing anything"). Reproduced: every message fetched AND processed successfully,
+  // then a single transient error on the post-processing cursor read -> the whole account was
+  // counted as accountErrors:1 -> computeProducerStatus returned 'down'. Zero mail was lost, but
+  // the producer paged as fully dead — the inverse failure mode of the bug #1056 exists to fix.
+  it('does NOT count a post-listing failure (the cursor read) as an accountError — the account already contributed this run', async () => {
+    const messages = [makeMeta({ id: 'm1' }), makeMeta({ id: 'm2' })];
+    const client = makeClient({ messages });
+    // Both messages are fetched and handled successfully; the failure happens strictly AFTER
+    // that, in the post-processing cursor read (poll.js's `else if (!capped)` branch).
+    client.getCurrentHistoryId = vi.fn().mockRejectedValue(new Error('transient: cursor read failed'));
+    seedState({ 'a@example.com': { lastHistoryId: '2000' } });
+
+    const handler = vi.fn().mockResolvedValue('processed');
+    const stats = await poll({ clients: [{ client, label: 'A' }], statePath }, handler);
+
+    expect(handler).toHaveBeenCalledTimes(2); // both messages were genuinely processed
+    expect(stats.fetched).toBe(2);
+    expect(stats.processed).toBe(2);
+    expect(stats.accountErrors).toBe(0); // NOT a whole-account outage — mail is still arriving
+    expect(stats.messageErrors).toBe(1); // the failure is real and must still be counted somewhere
+    expect(stats.errors).toBe(1);
+  });
+
+  // Contrast case, pinned so the narrowing above cannot regress into "nothing is ever an
+  // accountError": a failure BEFORE anything was listed for this account (this account's
+  // getHistory() itself throws, contributing 0 to stats.fetched) must still count as a genuine
+  // accountError — that account's mail really has stopped arriving.
+  it('still counts a pre-listing failure as an accountError when the account contributed nothing this run', async () => {
+    const client = makeClient({ account: 'dead@example.com' });
+    client.getHistory = vi.fn().mockRejectedValue(new Error('invalid_grant: token is dead'));
+    seedState({ 'dead@example.com': { lastHistoryId: '2000' } });
+
+    const stats = await poll({ clients: [{ client, label: 'DEAD' }], statePath }, vi.fn());
+
+    expect(stats.fetched).toBe(0);
+    expect(stats.accountErrors).toBe(1);
+    expect(stats.messageErrors).toBe(0);
+  });
+
+  // tasks.db #1056 round 2, DEFECT H-2 (Fable and Opus, both reproduced via execution
+  // independently). The narrowing above was still incomplete: it inferred "this account listed
+  // successfully" from `stats.fetched === fetchedBeforeAccount`, but a quiet, successful listing
+  // (0 new mail) contributes 0 to `fetched` BY DESIGN — so the comparison could never tell a
+  // genuinely quiet account apart from one that died before listing anything. Both zero-new-mail
+  // exit paths (nothing in the window at all; everything already ringed) call getHistory()
+  // successfully and THEN call nextCursor() -> getCurrentHistoryId() / writeState() — a transient
+  // failure there was misclassified as an accountError purely because fetched never moved.
+  it('does NOT count a transient failure after a quiet zero-new-mail listing as an accountError (H-2, quiet account alone)', async () => {
+    const client = makeClient({ account: 'quiet@example.com', messages: [] });
+    // getHistory() succeeds with 0 new messages (the zero-new-mail early-exit path,
+    // poll.js ~264-273); the failure happens strictly AFTER that, in nextCursor()'s
+    // getCurrentHistoryId() call.
+    client.getCurrentHistoryId = vi.fn().mockRejectedValue(new Error('transient: cursor read failed'));
+    seedState({ 'quiet@example.com': { lastHistoryId: '2000' } });
+
+    const stats = await poll({ clients: [{ client, label: 'QUIET' }], statePath }, vi.fn());
+
+    expect(client.getHistory).toHaveBeenCalledTimes(1); // the listing itself genuinely succeeded
+    expect(stats.fetched).toBe(0); // quiet run — nothing to fetch is not evidence of failure
+    expect(stats.accountErrors).toBe(0); // NOT a whole-account outage — it listed fine
+    expect(stats.messageErrors).toBe(1); // the failure is real and must still be counted somewhere
+    expect(stats.errors).toBe(1);
+  });
+
+  // Same bug, the live regression shape: one busy healthy account alongside one quiet account
+  // hitting the identical post-listing transient failure. Pre-H-2 this misclassified the quiet
+  // account as accountErrors:1 -> computeProducerStatus('down') for the WHOLE producer, even
+  // though 3/3 messages on the busy account were fetched and processed cleanly — a regression vs
+  // current main, which would have returned 'degraded' for this exact shape (a single errors:1
+  // against fetched:3).
+  it('keeps a quiet-account post-listing failure apart from a busy healthy account on the same run (H-2, mixed busy+quiet)', async () => {
+    const busyMessages = [makeMeta({ id: 'b1' }), makeMeta({ id: 'b2' }), makeMeta({ id: 'b3' })];
+    const busyClient = makeClient({ account: 'busy@example.com', messages: busyMessages, currentHistoryId: '9000' });
+
+    const quietClient = makeClient({ account: 'quiet@example.com', messages: [] });
+    quietClient.getCurrentHistoryId = vi.fn().mockRejectedValue(new Error('transient: cursor read failed'));
+
+    seedState({
+      'busy@example.com': { lastHistoryId: '2000' },
+      'quiet@example.com': { lastHistoryId: '2000' },
+    });
+
+    const handler = vi.fn().mockResolvedValue('processed');
+    const stats = await poll(
+      { clients: [{ client: busyClient, label: 'BUSY' }, { client: quietClient, label: 'QUIET' }], statePath },
+      handler,
+    );
+
+    expect(handler).toHaveBeenCalledTimes(3); // the busy account's 3 messages were genuinely processed
+    expect(stats.fetched).toBe(3);
+    expect(stats.processed).toBe(3);
+    expect(stats.accountErrors).toBe(0); // REGRESSION CHECK: must not read as 'down' for the whole producer
+    expect(stats.messageErrors).toBe(1);
+    expect(stats.errors).toBe(1);
+  });
+});
+
 describe('poll — dry-run', () => {
   it('does NOT call the handler by default', async () => {
     const client = makeClient({ messages: [makeMeta({ id: 'm1' }), makeMeta({ id: 'm2' })] });
@@ -346,7 +540,7 @@ describe('poll — dry-run', () => {
     );
 
     expect(handler).not.toHaveBeenCalled();
-    expect(stats).toEqual({ fetched: 2, processed: 2, errors: 0, forwarded: 0, archived: 0 , truncated: 0 , quarantined: 0, historyExpired: 0, maxStalledRuns: 0 });
+    expect(stats).toEqual({ fetched: 2, processed: 2, errors: 0, messageErrors: 0, accountErrors: 0, forwarded: 0, archived: 0 , truncated: 0 , quarantined: 0, historyExpired: 0, maxStalledRuns: 0 });
   });
 
   it('logs a "[DRY] would process" preview line per message', async () => {
