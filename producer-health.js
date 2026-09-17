@@ -52,6 +52,23 @@ export function computeProducerStatus({ fetched, errors, messageErrors, accountE
       // not a full outage. Gating on `fetched > 0` instead of dropping the check outright keeps
       // the real "every fetched item failed" case ('down' when messageErrors >= fetched > 0)
       // intact.
+      //
+      // `fetched` guard (tasks.db #1070, defense-in-depth). It is the one count this branch reads,
+      // and round 3 left it as the only one WITHOUT a validCount() check. Note what the `fetched >
+      // 0` gate actually does: it DE-ESCALATES — it is the sole reason the "every fetched item
+      // failed" verdict ever softens from 'down' to 'degraded'. So an unusable fetched bought the
+      // lenient answer for free ({fetched:-1, messageErrors:1, accountErrors:0} returned
+      // 'degraded'), which is "missing = healthy" rebuilt in the denominator instead of the
+      // numerator (dev-rules §28.1). Only a trustworthy fetched can establish that a failure was
+      // partial, so an untrustworthy one may not claim it — same convention validCount() already
+      // enforces on messageErrors/accountErrors, and the same asymmetry as honouring a valid
+      // accountErrors when messageErrors is missing: the bad news is never the optional half.
+      //
+      // validCount(0) is true, so the quiet-account shape round 3 was written for is untouched.
+      // Structurally unreachable via poll.js — stats.fetched is initialized to 0 and only ever
+      // incremented — so this is here to make a malformed caller fail loud rather than silently
+      // shift severity as a side effect of some future unrelated refactor.
+      if (!validCount(fetched)) return 'down';
       if (fetched > 0 && messageErrors >= fetched) return 'down';
       return 'degraded';
     }

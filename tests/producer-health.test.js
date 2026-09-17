@@ -235,6 +235,53 @@ describe('computeProducerStatus — split account vs message error counts (#1056
       computeProducerStatus({ fetched: 0, errors: 0, messageErrors: 'zero', accountErrors: 0 }),
     ).toBe('degraded');
   });
+
+  // tasks.db #1070 — defense-in-depth, LOW. `fetched` was the one count in this branch read
+  // WITHOUT a validCount() guard (only messageErrors/accountErrors had one). Round 3's
+  // `fetched > 0` gate is a DE-ESCALATION: it is the only thing that can turn the
+  // "every fetched item failed" verdict from 'down' back into 'degraded'. An unusable fetched
+  // therefore silently bought the lenient answer — {fetched:-1, messageErrors:1, accountErrors:0}
+  // returned 'degraded' where pre-round-3 it returned 'down' — which is "missing = healthy"
+  // rebuilt one layer up in the denominator instead of the numerator (dev-rules §28.1).
+  //
+  // Matching the guard convention already established for the other two counts: an unusable count
+  // is UNKNOWN, and unknown may never stand in for the benign reading. Here the benign reading is
+  // "the failure was partial", and only a trustworthy fetched can establish that — so an unusable
+  // one cannot soften the verdict. Same asymmetry as 'honours a valid accountErrors even when
+  // messageErrors is missing' above: the bad news is never the optional half.
+  //
+  // UNREACHABLE through poll.js by construction — stats.fetched is initialized to 0 and only ever
+  // incremented, never settable to a negative or non-number. This guard exists so a malformed
+  // caller fails loud instead of quietly changing severity as a side effect of a future refactor.
+  it('is down, not degraded, when fetched is not a usable count alongside a real message error (#1070)', () => {
+    expect(
+      computeProducerStatus({ fetched: -1, errors: 1, messageErrors: 1, accountErrors: 0 }),
+    ).toBe('down');
+  });
+
+  it('treats every unusable fetched shape alike — negative, NaN, a string, Infinity, absent (#1070)', () => {
+    for (const fetched of [-1, NaN, '3', Infinity, undefined]) {
+      expect(
+        computeProducerStatus({ fetched, errors: 1, messageErrors: 1, accountErrors: 0 }),
+      ).toBe('down');
+    }
+  });
+
+  it('still softens to degraded for the VALID fetched:0 quiet account — the #1070 guard must not undo round 3', () => {
+    // validCount(0) is true, so the one shape round 3 was written for stays exactly as it was.
+    expect(
+      computeProducerStatus({ fetched: 0, errors: 1, messageErrors: 1, accountErrors: 0 }),
+    ).toBe('degraded');
+  });
+
+  it('a usable fetched still decides partial vs total on its own merits, unchanged by the #1070 guard', () => {
+    expect(
+      computeProducerStatus({ fetched: 5, errors: 1, messageErrors: 1, accountErrors: 0 }),
+    ).toBe('degraded');
+    expect(
+      computeProducerStatus({ fetched: 3, errors: 3, messageErrors: 3, accountErrors: 0 }),
+    ).toBe('down');
+  });
 });
 
 describe('reportProducerHealth', () => {
