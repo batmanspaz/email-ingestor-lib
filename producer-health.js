@@ -9,21 +9,40 @@
 import path from 'node:path';
 import { computeQueueDepthCheck } from './queue-depth.js';
 
-export function computeProducerStatus({ fetched, errors }) {
-  // errors is not purely "fetched items that failed" — poll.js's outer
-  // per-account try/catch (PR #55) also increments it when an entire account
-  // throws (e.g. an auth failure) before it ever lists a message, so it
-  // contributes 0 to fetched. `fetched === 0` therefore must NOT short-circuit
-  // to 'ok' on its own — a quiet, error-free run and a fully-failed run both
-  // have fetched === 0, and only errors tells them apart (tasks.db #1054).
+export function computeProducerStatus({ fetched, errors, messageErrors, accountErrors }) {
+  // TWO UNITS, not one number (tasks.db #1056). poll() counts a message the handler could not
+  // process and a whole account that threw before listing anything in SEPARATE counters, because
+  // they mean different things:
   //
-  // `errors >= fetched` (not `===`) for the same reason: errors mixes
-  // per-message failures with whole-account throws, so it can legitimately
-  // exceed fetched (one account fetches 1 message that then errors, a second
-  // account throws outright -> fetched:1, errors:2 -- every fetched item
-  // failed AND an account is dead, which is 'down', not 'degraded'). This is
-  // a partial fix for the unit mismatch, not a full one -- see the follow-up
-  // ticket on splitting account-level vs message-level error counts.
+  //   messageErrors — n of the fetched items had trouble. Partial, usually transient.
+  //   accountErrors — an entity's mail has stopped arriving at all. Not partial, not transient.
+  //
+  // Summed, the second hides inside the first on any busy run: a dead account alongside four
+  // healthy ones is {fetched: 5, errors: 2}, which reads as "2 of 5 items had trouble" and lands
+  // on 'degraded'. The more mail the healthy accounts carry, the better the dead one hides. That
+  // is the live emilee.stone@collagesoup.com shape.
+  //
+  // So: any account error is 'down' on its own, regardless of how well everything else went.
+  // A message error is weighed against fetched, as before.
+  if (validCount(accountErrors) && accountErrors > 0) return 'down';
+
+  if (validCount(accountErrors) && validCount(messageErrors)) {
+    if (messageErrors === 0) return 'ok';
+    // fetched === 0 with a message error is arithmetically impossible (an error is counted per
+    // fetched item), so it means a caller hand-built an incoherent stats object. Not green.
+    if (fetched === 0 || messageErrors >= fetched) return 'down';
+    return 'degraded';
+  }
+
+  // LEGACY SUMMED SHAPE. The three consumer repos pin this lib by git SHA and upgrade
+  // independently, so a caller on an older poll() keeps sending only `errors` for a while. That
+  // path must not change meaning, so it is preserved verbatim, including its own history:
+  //
+  // `fetched === 0` must NOT short-circuit to 'ok' — a quiet error-free run and a fully-failed
+  // run both have fetched === 0, and only errors tells them apart (tasks.db #1054, the Rule-13
+  // "missing = healthy" banned pattern). `errors >= fetched` (not `===`) because the summed count
+  // can legitimately exceed fetched: one account fetches 1 message that errors, a second account
+  // throws outright -> fetched:1, errors:2.
   if (errors === 0) return 'ok';
   if (fetched === 0 || errors >= fetched) return 'down';
   return 'degraded';
@@ -46,6 +65,13 @@ const HEALTH_SEVERITY = { ok: 0, degraded: 1, down: 2 };
 /** A count is only trustworthy if it is a finite, non-negative number. */
 function invalidCount(n) {
   return typeof n !== 'number' || !Number.isFinite(n) || n < 0;
+}
+
+/** Inverse of invalidCount, for the places that read better in the positive. NaN from a
+ *  Number(...) coercion and a string from a hand-wired consumer are both rejected: neither is
+ *  evidence of anything, so neither may quietly stand in for zero (dev-rules §28.1). */
+function validCount(n) {
+  return !invalidCount(n);
 }
 
 /**
@@ -245,11 +271,31 @@ export async function reportProducerHealth(telemetry, stats, opts = {}) {
 
 /**
  * @param {import('@perfectcity/telemetry').Telemetry} telemetry
- * @param {{entityId:string, fetched:number, produced:number, skipped:number, errors:number}} params
+ * @param {{entityId:string, fetched:number, produced:number, skipped:number, errors:number,
+ *          messageErrors:number, accountErrors:number, quarantined:number}} params
+ *
+ * `message_errors` / `account_errors` are emitted alongside the summed `errors`, not instead of
+ * it (tasks.db #1056). Health status is only one consumer of these counts — a dashboard
+ * reasoning over a single summed column is equally unable to tell "3 of 40 messages had trouble"
+ * from "an entity's mail stopped arriving", and Rule 13 makes analytics a Phase-0 invariant
+ * alongside health. Both are emitted AT ZERO on a clean run: an absent counter is not evidence
+ * of absence (dev-rules §28.1).
  */
-export function trackProducerRun(telemetry, { entityId, fetched, produced, skipped, errors, quarantined = 0 }) {
+export function trackProducerRun(
+  telemetry,
+  { entityId, fetched, produced, skipped, errors, messageErrors = 0, accountErrors = 0, quarantined = 0 },
+) {
   telemetry.track({
     event: 'producer.run',
-    props: { entity_id: entityId, fetched, produced, skipped, errors, quarantined },
+    props: {
+      entity_id: entityId,
+      fetched,
+      produced,
+      skipped,
+      errors,
+      message_errors: messageErrors,
+      account_errors: accountErrors,
+      quarantined,
+    },
   });
 }

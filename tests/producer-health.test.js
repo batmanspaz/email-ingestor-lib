@@ -88,6 +88,90 @@ describe('computeProducerStatus', () => {
   });
 });
 
+// ── tasks.db #1056: per-message and per-account errors are different units ──
+//
+// PR #58 (#1054) patched the comparator to `errors >= fetched`, which closed ONE cell of the
+// mis-report table. The conflation itself survived: poll.js increments a single `errors` for
+// BOTH a message that failed to process (poll.js ~324) and a whole account that threw before it
+// listed anything (the per-account try/catch from PR #55, poll.js ~399). computeProducerStatus
+// then has to GUESS the unit from one summed number.
+//
+// The cell that guess still gets wrong is the dangerous one, and it is the LIVE shape: one dead
+// account on a BUSY run. emilee.stone@collagesoup.com is auth-dead; the other accounts are not.
+// {fetched: 5, errors: 2} reads as "2 of 5 items had trouble" => degraded, and a whole entity's
+// mail silently stops being collected behind a green-ish status. The more mail the healthy
+// accounts carry, the more thoroughly the dead one hides.
+//
+// Fix: poll() reports messageErrors and accountErrors separately (keeping `errors` as their sum
+// for every existing caller), and the status derives DOWN from any accountErrors > 0 rather than
+// reasoning over one field whose unit is ambiguous. Recommended independently by Sonnet, Opus and
+// Fable reviewing PR #58.
+describe('computeProducerStatus — split account vs message error counts (#1056)', () => {
+  it('is down when a whole account threw, even on a busy run where errors < fetched', () => {
+    // THE BUG. Summed alone this is `{fetched: 5, errors: 2}` -> 'degraded'.
+    expect(
+      computeProducerStatus({ fetched: 5, produced: 4, errors: 2, messageErrors: 1, accountErrors: 1 }),
+    ).toBe('down');
+  });
+
+  it('is down for a dead account even when every other account had a perfect run', () => {
+    expect(
+      computeProducerStatus({ fetched: 20, produced: 20, errors: 1, messageErrors: 0, accountErrors: 1 }),
+    ).toBe('down');
+  });
+
+  it('is still only degraded when the SAME error count is all per-message — the split must not just escalate everything', () => {
+    expect(
+      computeProducerStatus({ fetched: 5, produced: 3, errors: 2, messageErrors: 2, accountErrors: 0 }),
+    ).toBe('degraded');
+  });
+
+  it('is down when every fetched item failed, with no account error involved', () => {
+    expect(
+      computeProducerStatus({ fetched: 3, produced: 0, errors: 3, messageErrors: 3, accountErrors: 0 }),
+    ).toBe('down');
+  });
+
+  it('is ok when both counts are zero', () => {
+    expect(
+      computeProducerStatus({ fetched: 4, produced: 4, errors: 0, messageErrors: 0, accountErrors: 0 }),
+    ).toBe('ok');
+  });
+
+  it('is down when the only account there is died and nothing was fetched', () => {
+    expect(
+      computeProducerStatus({ fetched: 0, produced: 0, errors: 1, messageErrors: 0, accountErrors: 1 }),
+    ).toBe('down');
+  });
+
+  // The three consumer repos pin this lib by git SHA and upgrade independently, so a caller on an
+  // older poll() will keep sending the summed shape for a while. It must not change meaning.
+  it('falls back to the summed comparator when the split counts are absent', () => {
+    expect(computeProducerStatus({ fetched: 4, produced: 2, errors: 2 })).toBe('degraded');
+    expect(computeProducerStatus({ fetched: 0, produced: 0, errors: 1 })).toBe('down');
+    expect(computeProducerStatus({ fetched: 1, produced: 0, errors: 2 })).toBe('down');
+    expect(computeProducerStatus({ fetched: 5, produced: 5, errors: 0 })).toBe('ok');
+  });
+
+  it('honours a valid accountErrors even when messageErrors is missing — the bad news is never the optional half', () => {
+    // Asymmetric on purpose. A known dead account is a fact; the absence of the other counter
+    // does not soften it. Rounding a partial split DOWN to the lenient legacy answer is how
+    // "missing = healthy" gets rebuilt one layer up (dev-rules §28.1).
+    expect(computeProducerStatus({ fetched: 5, produced: 4, errors: 2, accountErrors: 1 })).toBe('down');
+  });
+
+  it('falls back to the summed comparator when a split count is not a usable number', () => {
+    // NaN from a Number(...) coercion, or a string from a consumer wiring this by hand. Neither
+    // is evidence of anything, so neither may quietly stand in for zero.
+    expect(
+      computeProducerStatus({ fetched: 5, produced: 4, errors: 2, messageErrors: 1, accountErrors: 'one' }),
+    ).toBe('degraded');
+    expect(
+      computeProducerStatus({ fetched: 5, produced: 4, errors: 2, messageErrors: NaN, accountErrors: 0 }),
+    ).toBe('degraded');
+  });
+});
+
 describe('reportProducerHealth', () => {
   it('sends a passing health report tagged with the entity as the module name, valid against the real schema', async () => {
     const { sent, transport } = fakeTransport();
@@ -132,6 +216,37 @@ describe('reportProducerHealth', () => {
       autoStart: false,
     });
     await reportProducerHealth(telemetry, { fetched: 2, produced: 0, errors: 2, truncated: 0, historyExpired: 0, maxStalledRuns: 0, quarantined: 0 }, { sluiceDir });
+    const report = sent.health[0];
+    expect(() => HealthReportSchema.parse(report)).not.toThrow();
+    expect(report.status).toBe('down');
+    expect(report.checks.find((c) => c.id === 'producer_run').status).toBe('fail');
+  });
+
+  // tasks.db #1056 end-to-end: this is what a consumer actually calls, with poll()'s real return
+  // spread straight through. The unit tests above pin the derivation; this pins the wiring, which
+  // is where #944/#948 both went wrong.
+  it('reports DOWN when one account is dead on an otherwise-busy, otherwise-healthy run', async () => {
+    const { sent, transport } = fakeTransport();
+    const telemetry = createTelemetry({
+      product: 'sluice',
+      module: 'producer.collagesoup',
+      version: 'test',
+      transport,
+      heartbeatMs: 0,
+      batchIntervalMs: 0,
+      autoStart: false,
+    });
+    // The live emilee.stone@collagesoup.com shape: four accounts pulling mail fine, one
+    // auth-dead. Summed, `errors: 1` against `fetched: 20` used to read as 'degraded'.
+    await reportProducerHealth(
+      telemetry,
+      {
+        fetched: 20, produced: 20, errors: 1, messageErrors: 0, accountErrors: 1,
+        truncated: 0, historyExpired: 0, maxStalledRuns: 0, quarantined: 0,
+      },
+      { sluiceDir },
+    );
+
     const report = sent.health[0];
     expect(() => HealthReportSchema.parse(report)).not.toThrow();
     expect(report.status).toBe('down');
@@ -308,7 +423,7 @@ describe('trackProducerRun', () => {
     expect(batch.length).toBe(1);
     const event = batch[0];
     expect(event.event).toBe('producer.run');
-    expect(event.props).toEqual({ entity_id: 'collagesoup', fetched: 4, produced: 3, skipped: 1, errors: 0, quarantined: 0 });
+    expect(event.props).toEqual({ entity_id: 'collagesoup', fetched: 4, produced: 3, skipped: 1, errors: 0, message_errors: 0, account_errors: 0, quarantined: 0 });
   });
 
   it('never includes raw email addresses, subjects, or message bodies in props', async () => {
@@ -329,7 +444,76 @@ describe('trackProducerRun', () => {
     const props = sent.analytics[0][0].props;
     const serialized = JSON.stringify(props);
     expect(serialized).not.toMatch(/@/); // no email addresses
-    expect(Object.keys(props).sort()).toEqual(['entity_id', 'errors', 'fetched', 'produced', 'quarantined', 'skipped']);
+    expect(Object.keys(props).sort()).toEqual([
+      'account_errors',
+      'entity_id',
+      'errors',
+      'fetched',
+      'message_errors',
+      'produced',
+      'quarantined',
+      'skipped',
+    ]);
+  });
+
+  // tasks.db #1056 — the same conflation, in the analytics half. Health status is only one
+  // consumer of these counts; a dashboard reasoning over a single summed `errors` column is
+  // just as unable to tell "3 of 40 messages had trouble" from "an entity's mail stopped
+  // arriving". Rule 13 makes analytics a Phase-0 invariant alongside health, so the split has
+  // to reach both or the fix is half-done.
+  it('emits message_errors and account_errors as separate props', async () => {
+    const { sent, transport } = fakeTransport();
+    const telemetry = createTelemetry({
+      product: 'sluice',
+      module: 'producer.collagesoup',
+      version: 'test',
+      transport,
+      heartbeatMs: 0,
+      batchIntervalMs: 0,
+      autoStart: false,
+      batchSize: 1,
+    });
+    trackProducerRun(telemetry, {
+      entityId: 'collagesoup',
+      fetched: 5,
+      produced: 4,
+      skipped: 0,
+      errors: 2,
+      messageErrors: 1,
+      accountErrors: 1,
+    });
+    await telemetry.flush();
+
+    const batch = sent.analytics[0];
+    expect(() => AnalyticsBatchSchema.parse(batch)).not.toThrow();
+    expect(batch[0].props).toEqual({
+      entity_id: 'collagesoup',
+      fetched: 5,
+      produced: 4,
+      skipped: 0,
+      errors: 2,
+      message_errors: 1,
+      account_errors: 1,
+      quarantined: 0,
+    });
+  });
+
+  it('emits both at zero on a clean run — silence is not evidence of absence (dev-rules §28.1)', async () => {
+    const { sent, transport } = fakeTransport();
+    const telemetry = createTelemetry({
+      product: 'sluice',
+      module: 'producer.personal',
+      version: 'test',
+      transport,
+      heartbeatMs: 0,
+      batchIntervalMs: 0,
+      autoStart: false,
+      batchSize: 1,
+    });
+    trackProducerRun(telemetry, { entityId: 'personal', fetched: 1, produced: 1, skipped: 0, errors: 0 });
+    await telemetry.flush();
+
+    expect(sent.analytics[0][0].props).toMatchObject({ message_errors: 0, account_errors: 0 });
   });
 });
 

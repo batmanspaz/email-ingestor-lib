@@ -26,14 +26,23 @@ import { GmailClient } from './gmail.js';
  *   Forwarded messages are also archived (already handled at destination).
  *   Has no effect in dryRun mode.
  * @param {function} handler — async (message, client, { dryRun }) => void, called for each new message
- * @returns {Promise<{fetched:number, processed:number, errors:number, forwarded:number,
- *   archived:number, truncated:number, quarantined:number, historyExpired:number,
- *   maxStalledRuns:number}>}
+ * @returns {Promise<{fetched:number, processed:number, errors:number, messageErrors:number,
+ *   accountErrors:number, forwarded:number, archived:number, truncated:number,
+ *   quarantined:number, historyExpired:number, maxStalledRuns:number}>}
+ *   `errors` is messageErrors + accountErrors. The two are reported separately because they are
+ *   DIFFERENT UNITS and a health status cannot be derived correctly from their sum (tasks.db
+ *   #1056): a message that failed to process is one item of many, a whole account that threw is
+ *   an entity whose mail has stopped arriving. Summed, the second hides inside the first on any
+ *   busy run.
  */
 export async function poll(config, handler) {
   const { clients, statePath, maxPerRun = 50, dryRun = false, invokeHandlerInDryRun = false, archiveAfterProcess = false } = config;
   const stats = {
     fetched: 0, processed: 0, errors: 0, forwarded: 0, archived: 0,
+    // Two units, counted apart (tasks.db #1056). `errors` stays their sum so every existing
+    // caller keeps its meaning; computeProducerStatus() reads the split when it is present.
+    messageErrors: 0,    // a fetched message the handler could not process
+    accountErrors: 0,    // a whole account that threw before listing anything (auth, quota, API)
     truncated: 0,        // history windows getHistory had to cut short
     quarantined: 0,      // messages retired after repeated deterministic failure
     historyExpired: 0,   // KNOWN-LOSS events: Gmail's ~7d history aged out
@@ -322,6 +331,7 @@ export async function poll(config, handler) {
         } else {
           console.error(`    Error processing ${id}: ${err.message}`);
           stats.errors++;
+          stats.messageErrors++;
           if (!dryRun) {
             failures[id] = (failures[id] || 0) + 1;
             if (failures[id] >= MAX_MESSAGE_ATTEMPTS) {
@@ -397,6 +407,7 @@ export async function poll(config, handler) {
       // health/telemetry reporting still needs to fire for them. Additive
       // safety net only — the success-path logic above is untouched.
       stats.errors++;
+      stats.accountErrors++;
       console.error(`  [${label}] Unhandled error polling account — skipping to next account this run: ${err.message}`);
     }
   }

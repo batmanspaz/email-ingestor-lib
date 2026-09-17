@@ -88,7 +88,7 @@ describe('poll — first run (no historyId)', () => {
     const stats = await poll({ clients: [{ client, label: 'A' }], statePath }, handler);
 
     expect(handler).not.toHaveBeenCalled();
-    expect(stats).toEqual({ fetched: 0, processed: 0, errors: 0, forwarded: 0, archived: 0 , truncated: 0 , quarantined: 0, historyExpired: 0, maxStalledRuns: 0 });
+    expect(stats).toEqual({ fetched: 0, processed: 0, errors: 0, messageErrors: 0, accountErrors: 0, forwarded: 0, archived: 0 , truncated: 0 , quarantined: 0, historyExpired: 0, maxStalledRuns: 0 });
     expect(readStateFile().accounts['a@example.com'].lastHistoryId).toBe('1234');
   });
 
@@ -112,7 +112,7 @@ describe('poll — normal run', () => {
 
     expect(handler).toHaveBeenCalledTimes(2);
     expect(handler).toHaveBeenCalledWith(messages[0], client, { dryRun: false });
-    expect(stats).toEqual({ fetched: 2, processed: 2, errors: 0, forwarded: 0, archived: 0 , truncated: 0 , quarantined: 0, historyExpired: 0, maxStalledRuns: 0 });
+    expect(stats).toEqual({ fetched: 2, processed: 2, errors: 0, messageErrors: 0, accountErrors: 0, forwarded: 0, archived: 0 , truncated: 0 , quarantined: 0, historyExpired: 0, maxStalledRuns: 0 });
     const state = readStateFile();
     expect(state.accounts['a@example.com'].lastHistoryId).toBe('3000');
     expect(state.totalProcessed).toBe(2);
@@ -334,6 +334,100 @@ describe('poll — per-account error isolation (tasks.db #1042)', () => {
   });
 });
 
+// ── tasks.db #1056: per-message and per-account errors are different units ──
+//
+// poll() incremented ONE `errors` counter from two places that mean different things: a message
+// that failed to process (the inner per-message catch) and a whole account that threw before it
+// listed anything (the per-account catch added by PR #55). computeProducerStatus then had to
+// guess the unit from the sum, and on a busy run a dead account hides inside it —
+// {fetched: 5, errors: 2} reads as "2 of 5 items had trouble", not "an entity's mail has stopped
+// arriving". See tests/producer-health.test.js for the status-derivation half.
+//
+// `errors` is deliberately KEPT as the sum. The three consumer repos spread poll()'s return
+// through producerHealthStats unchanged, so the new fields flow to telemetry with no consumer
+// change, and nothing that reads `errors` today changes meaning.
+describe('poll — errors are reported per-unit, not conflated (tasks.db #1056)', () => {
+  it('counts a whole-account throw as an accountError, not a messageError', async () => {
+    const badClient = makeClient({ account: 'bad@example.com' });
+    badClient.getHistory = vi.fn().mockRejectedValue(new Error('invalid_grant: token is dead'));
+
+    const goodMessages = [makeMeta({ id: 'g1' }), makeMeta({ id: 'g2' })];
+    const goodClient = makeClient({ account: 'good@example.com', messages: goodMessages, currentHistoryId: '5000' });
+    seedState({
+      'bad@example.com': { lastHistoryId: '2000' },
+      'good@example.com': { lastHistoryId: '2000' },
+    });
+
+    const stats = await poll(
+      { clients: [{ client: badClient, label: 'BAD' }, { client: goodClient, label: 'GOOD' }], statePath },
+      vi.fn().mockResolvedValue('processed'),
+    );
+
+    expect(stats.accountErrors).toBe(1);
+    expect(stats.messageErrors).toBe(0);
+    expect(stats.errors).toBe(1); // still the sum — no existing caller changes meaning
+  });
+
+  it('counts a failing handler as a messageError, not an accountError', async () => {
+    const client = makeClient({ messages: [makeMeta({ id: 'm1' }), makeMeta({ id: 'm2' })] });
+    seedState({ 'a@example.com': { lastHistoryId: '2000' } });
+
+    const handler = vi
+      .fn()
+      .mockRejectedValueOnce(new Error('handler blew up'))
+      .mockResolvedValue('processed');
+
+    const stats = await poll({ clients: [{ client, label: 'A' }], statePath }, handler);
+
+    expect(stats.messageErrors).toBe(1);
+    expect(stats.accountErrors).toBe(0);
+    expect(stats.errors).toBe(1);
+  });
+
+  it('keeps the two apart when BOTH happen in one run — the live shape a summed count hides', async () => {
+    // One dead account plus one bad message on a healthy, busy account. Summed this is
+    // {fetched: 2, errors: 2} and reads as "every fetched item failed"; split it is
+    // "one account is gone AND one message failed", which are two different pages.
+    const badClient = makeClient({ account: 'bad@example.com' });
+    badClient.getHistory = vi.fn().mockRejectedValue(new Error('invalid_grant: token is dead'));
+
+    const goodClient = makeClient({
+      account: 'good@example.com',
+      messages: [makeMeta({ id: 'g1' }), makeMeta({ id: 'g2' })],
+      currentHistoryId: '5000',
+    });
+    seedState({
+      'bad@example.com': { lastHistoryId: '2000' },
+      'good@example.com': { lastHistoryId: '2000' },
+    });
+
+    const handler = vi
+      .fn()
+      .mockRejectedValueOnce(new Error('handler blew up'))
+      .mockResolvedValue('processed');
+
+    const stats = await poll(
+      { clients: [{ client: badClient, label: 'BAD' }, { client: goodClient, label: 'GOOD' }], statePath },
+      handler,
+    );
+
+    expect(stats.fetched).toBe(2);
+    expect(stats.accountErrors).toBe(1);
+    expect(stats.messageErrors).toBe(1);
+    expect(stats.errors).toBe(2);
+  });
+
+  it('reports both counters at zero on a clean run — an absent counter is not evidence of absence', async () => {
+    const client = makeClient({ messages: [makeMeta({ id: 'm1' })] });
+    seedState({ 'a@example.com': { lastHistoryId: '2000' } });
+
+    const stats = await poll({ clients: [{ client, label: 'A' }], statePath }, vi.fn().mockResolvedValue('processed'));
+
+    expect(stats.messageErrors).toBe(0);
+    expect(stats.accountErrors).toBe(0);
+  });
+});
+
 describe('poll — dry-run', () => {
   it('does NOT call the handler by default', async () => {
     const client = makeClient({ messages: [makeMeta({ id: 'm1' }), makeMeta({ id: 'm2' })] });
@@ -346,7 +440,7 @@ describe('poll — dry-run', () => {
     );
 
     expect(handler).not.toHaveBeenCalled();
-    expect(stats).toEqual({ fetched: 2, processed: 2, errors: 0, forwarded: 0, archived: 0 , truncated: 0 , quarantined: 0, historyExpired: 0, maxStalledRuns: 0 });
+    expect(stats).toEqual({ fetched: 2, processed: 2, errors: 0, messageErrors: 0, accountErrors: 0, forwarded: 0, archived: 0 , truncated: 0 , quarantined: 0, historyExpired: 0, maxStalledRuns: 0 });
   });
 
   it('logs a "[DRY] would process" preview line per message', async () => {
