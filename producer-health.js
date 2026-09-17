@@ -42,9 +42,17 @@ export function computeProducerStatus({ fetched, errors, messageErrors, accountE
     const splitIsCoherent = !validCount(errors) || errors === messageErrors + accountErrors;
     if (splitIsCoherent) {
       if (messageErrors === 0) return 'ok';
-      // fetched === 0 with a message error is arithmetically impossible (an error is counted per
-      // fetched item), so it means a caller hand-built an incoherent stats object. Not green.
-      if (fetched === 0 || messageErrors >= fetched) return 'down';
+      // Round 3 fix (tasks.db #1056, verified by execution). `fetched === 0` used to short-circuit
+      // straight to 'down' on the premise that fetched:0 with a messageError is arithmetically
+      // impossible garbage input — true before the `listed`-flag fix to poll.js, false now: a
+      // quiet account (getHistory succeeds, 0 new mail) whose subsequent
+      // getCurrentHistoryId()/writeState() throws legitimately counts as a messageError with
+      // fetched still 0. accountErrors is already confirmed valid-and-zero to reach this branch,
+      // so that shape is one quiet-but-healthy account having a real transient blip — 'degraded',
+      // not a full outage. Gating on `fetched > 0` instead of dropping the check outright keeps
+      // the real "every fetched item failed" case ('down' when messageErrors >= fetched > 0)
+      // intact.
+      if (fetched > 0 && messageErrors >= fetched) return 'down';
       return 'degraded';
     }
   }

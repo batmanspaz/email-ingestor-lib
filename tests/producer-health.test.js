@@ -134,6 +134,20 @@ describe('computeProducerStatus — split account vs message error counts (#1056
     ).toBe('down');
   });
 
+  // Round 3 finding (tasks.db #1056, verified by execution): the `fetched === 0` half of the old
+  // `if (fetched === 0 || messageErrors >= fetched) return 'down'` OR was written on the premise
+  // that fetched:0 with a messageError is arithmetically impossible garbage input. The `listed`
+  // flag fix to poll.js made it a real, valid shape: a quiet account (getHistory succeeds, 0 new
+  // mail) whose subsequent getCurrentHistoryId()/writeState() throws now counts as a messageError,
+  // not an accountError — {fetched:0, messageErrors:1, accountErrors:0}. accountErrors is already
+  // confirmed valid-and-zero by the time this branch runs, so this is one quiet-but-healthy
+  // account with a real transient blip — degraded, not a full outage.
+  it('is degraded, not down, for a quiet account with a real transient message error and no account error (round 3, #1056)', () => {
+    expect(
+      computeProducerStatus({ fetched: 0, errors: 1, messageErrors: 1, accountErrors: 0 }),
+    ).toBe('degraded');
+  });
+
   it('is ok when both counts are zero', () => {
     expect(
       computeProducerStatus({ fetched: 4, produced: 4, errors: 0, messageErrors: 0, accountErrors: 0 }),
