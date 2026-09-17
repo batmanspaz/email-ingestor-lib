@@ -24,7 +24,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { createTelemetry, HealthReportSchema, AnalyticsBatchSchema } from '@perfectcity/telemetry';
-import { computeProducerStatus, reportProducerHealth, trackProducerRun, computeTruncationCheck, computeHistoryExpiredCheck, computeStallCheck, computeQuarantineCheck } from '../producer-health.js';
+import { computeProducerStatus, reportProducerHealth, trackProducerRun, computeTruncationCheck, computeHistoryExpiredCheck, computeStallCheck, computeQuarantineCheck, producerHealthStats, producerRunStats } from '../producer-health.js';
 import { HealthCheckSchema } from '@perfectcity/telemetry';
 
 // Healthy on-disk sluice fixture (empty inbox) so reportProducerHealth's
@@ -556,5 +556,120 @@ describe('computeQuarantineCheck', () => {
     expect(sent.health[0].checks.map((c) => c.id)).toContain('message.quarantined');
     expect(sent.health[0].status).toBe('down');
     expect(() => HealthReportSchema.parse(sent.health[0])).not.toThrow();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// producerHealthStats / producerRunStats — tasks.db #958, fast-follow to #948.
+//
+// #948 found that every call site built reportProducerHealth()'s stats
+// argument by hand as `{ fetched, produced, errors }` — three fields
+// cherry-picked out of the nine poll() actually returns — and that the missing
+// four (truncated, historyExpired, maxStalledRuns, quarantined) render as
+// permanent `warn`s (missing = healthy is banned, dev-rules Sec28.1), pinning
+// producer.* to a permanent `degraded`. collagesoup fixed its own call site
+// with a local adapter (src/sluice-config.js); #958 moves that adapter here so
+// personal/perfectcity consume ONE definition instead of pasting a second and
+// third copy of it.
+//
+// This lib already reads every one of poll()'s nine keys (the checks above),
+// so the adapter itself is trivial: pass poll()'s result through, renaming
+// only the one field name the two contracts disagree on (processed -> produced).
+// ---------------------------------------------------------------------------
+
+function fullPollStats() {
+  return {
+    fetched: 12,
+    processed: 10,
+    errors: 0,
+    forwarded: 1,
+    archived: 10,
+    truncated: 0,
+    quarantined: 0,
+    historyExpired: 0,
+    maxStalledRuns: 0,
+  };
+}
+
+describe('producerHealthStats', () => {
+  it('forwards every count poll() reports — the four that used to be dropped included', () => {
+    const out = producerHealthStats(fullPollStats());
+    for (const field of ['truncated', 'historyExpired', 'maxStalledRuns', 'quarantined']) {
+      expect(Object.hasOwn(out, field), `${field} must be present as an asserted count, not absent`).toBe(true);
+      expect(out[field]).toBe(0);
+    }
+    expect(out.fetched).toBe(12);
+  });
+
+  it("maps poll()'s `processed` onto the lib's `produced`", () => {
+    expect(producerHealthStats(fullPollStats()).produced).toBe(10);
+  });
+
+  // `errors` must be passed through, NEVER defaulted: computeProducerStatus()
+  // reads it WITHOUT an invalidCount() guard, so a laundered zero silently
+  // yields 'ok'.
+  it('does NOT default a missing error count to zero', () => {
+    const { errors, ...noErrors } = fullPollStats();
+    expect(Object.hasOwn(producerHealthStats(noErrors), 'errors')).toBe(false);
+  });
+
+  it('passes a real error count through untouched', () => {
+    expect(producerHealthStats({ ...fullPollStats(), errors: 4 }).errors).toBe(4);
+  });
+
+  it('passes non-zero counts through untouched — it reports, it does not sanitize', () => {
+    const out = producerHealthStats({ ...fullPollStats(), truncated: 3, quarantined: 1, historyExpired: 2, maxStalledRuns: 7 });
+    expect(out.truncated).toBe(3);
+    expect(out.quarantined).toBe(1);
+    expect(out.historyExpired).toBe(2);
+    expect(out.maxStalledRuns).toBe(7);
+  });
+
+  it('a clean poll() run reports ok on the wire through the REAL telemetry client — not degraded', async () => {
+    const { sent, transport } = fakeTransport();
+    const telemetry = createTelemetry({
+      product: 'sluice', module: 'producer.test', version: 'test',
+      transport, heartbeatMs: 0, batchIntervalMs: 0, autoStart: false,
+    });
+    await reportProducerHealth(telemetry, producerHealthStats(fullPollStats()), { sluiceDir });
+    expect(sent.health.length).toBe(1);
+    const report = sent.health[0];
+    expect(() => HealthReportSchema.parse(report)).not.toThrow();
+    const unknown = report.checks.filter((c) => /not reported by poll\(\)/.test(c.detail ?? ''));
+    expect(unknown).toEqual([]);
+    expect(report.status).toBe('ok');
+  });
+
+  // Regression anchor: the OLD hand-built three-field shape must keep producing
+  // degraded. If this ever goes green, the lib has started guessing zeroes and
+  // #948/#958 are back in a new form.
+  it('the old cherry-picked three-field shape still reproduces degraded (regression anchor)', async () => {
+    const { sent, transport } = fakeTransport();
+    const telemetry = createTelemetry({
+      product: 'sluice', module: 'producer.test', version: 'test',
+      transport, heartbeatMs: 0, batchIntervalMs: 0, autoStart: false,
+    });
+    const st = fullPollStats();
+    await reportProducerHealth(telemetry, { fetched: st.fetched, produced: st.processed, errors: st.errors }, { sluiceDir });
+    expect(sent.health[0].status).toBe('degraded');
+  });
+});
+
+describe('producerRunStats', () => {
+  // trackProducerRun() declares `quarantined = 0` as a DEFAULT PARAMETER, so an
+  // omitted field reads as "none", not "unknown" — the producer.run analytics
+  // event would claim zero quarantined messages on precisely the run whose
+  // health report says otherwise. This is "missing = healthy" rebuilt one layer
+  // up (#948's 3-model review).
+  it('forwards the real quarantined count, never a defaulted zero', () => {
+    expect(producerRunStats('personal', { ...fullPollStats(), quarantined: 3 }).quarantined).toBe(3);
+    expect(producerRunStats('personal', fullPollStats()).quarantined).toBe(0);
+  });
+
+  it('maps entityId, fetched, produced, errors correctly and defaults skipped to 0', () => {
+    const out = producerRunStats('collagesoup', fullPollStats());
+    expect(out).toMatchObject({
+      entityId: 'collagesoup', fetched: 12, produced: 10, skipped: 0, errors: 0, quarantined: 0,
+    });
   });
 });
