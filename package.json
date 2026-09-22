@@ -11,7 +11,7 @@
     "@anthropic-ai/sdk": "^0.125.0",
     "@perfectcity/telemetry": "git+https://github.com/batmanspaz/telemetry.git#83fa9c6909a24e6d5d84cac160e87e20aa7e6fea",
     "dotenv": "^17.4.2",
-    "googleapis": "^180.0.0"
+    "googleapis": "^181.0.0"
   },
   "devDependencies": {
     "ajv": "^8.20.0",
