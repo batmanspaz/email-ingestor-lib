@@ -9,6 +9,17 @@
 // Matches a plain email address anywhere inside a larger string.
 const EMAIL_RE = /[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}/;
 
+// Matches maskEmail()'s own output format (e.g. "p***@gmail.com"). EMAIL_RE's
+// local-part character class does not include "*", so an already-masked
+// address never matches it — without this check, re-masking an
+// already-masked From value falls through to the generic '[redacted]'
+// branch instead of being a no-op, breaking idempotency (found while writing
+// tests for tasks.db #1327; no PII ever leaked, but downstream consumers
+// that re-mask a value — e.g. a retried log write — would silently see it
+// mutate from a stable masked address to a different, less informative
+// constant).
+const ALREADY_MASKED_RE = /^.\*\*\*@[A-Za-z0-9.-]+\.[A-Za-z]{2,}$/;
+
 /**
  * Mask a bare email address.
  * Returns first char of the local part + "***@" + domain.
@@ -31,11 +42,14 @@ export function maskEmail(email) {
  *
  * Example: "Paul Steinberg" <paul.steinberg@gmail.com> → p***@gmail.com
  *
+ * Idempotent: calling this again on its own output is a no-op.
+ *
  * @param {*} from — raw From header value
  * @returns {*} masked sender, or the original value if not a string
  */
 export function maskFrom(from) {
   if (!from || typeof from !== 'string') return from;
+  if (ALREADY_MASKED_RE.test(from)) return from;
   const m = from.match(EMAIL_RE);
   if (!m) return '[redacted]';
   return maskEmail(m[0]);
