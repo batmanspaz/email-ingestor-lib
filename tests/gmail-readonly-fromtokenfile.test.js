@@ -5,23 +5,28 @@
  */
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 
-const { apiCalls, mockExistsSync, mockReadFileSync } = vi.hoisted(() => ({
-  apiCalls: [], mockExistsSync: vi.fn(), mockReadFileSync: vi.fn(),
+const { apiCalls, mockExistsSync, mockReadFileSync, appended } = vi.hoisted(() => ({
+  apiCalls: [], mockExistsSync: vi.fn(), mockReadFileSync: vi.fn(), appended: [],
 }));
 
 vi.mock('googleapis', () => {
   function OAuth2() { this.setCredentials = () => {}; }
   const modify = () => { apiCalls.push('users.messages.modify'); return Promise.resolve({}); };
-  return {
-    google: { auth: { OAuth2 }, gmail: vi.fn().mockReturnValue({ users: { messages: { modify } } }) },
-  };
+  const gmail = vi.fn().mockReturnValue({ users: { messages: { modify } } });
+  // readOnly clients are built from their OWN GoogleApis instance (A2), not the shared singleton.
+  function GoogleApis() { this.auth = { OAuth2 }; this.gmail = gmail; }
+  return { google: { auth: { OAuth2 }, gmail }, GoogleApis };
 });
 vi.mock('fs', () => {
-  const api = { existsSync: mockExistsSync, readFileSync: mockReadFileSync };
+  const api = {
+    existsSync: mockExistsSync, readFileSync: mockReadFileSync,
+    appendFileSync: (_p, line) => { appended.push(line); }, mkdirSync: () => {},
+  };
   return { default: api, ...api };
 });
 
 import { GmailClient } from '../gmail.js';
+import { createLogger } from '../log.js';
 import { ReadOnlyScopeError } from '../readonly-guard.js';
 
 const ADDR = 'read.only.person@example.com';
@@ -111,5 +116,111 @@ describe('L4 — fromTokenFile({readOnly}) fails closed unless scopes are exactl
     expect(GmailClient.fromTokenFile(ADDR, 'test-entity').readOnly).toBe(false);
     tokenWith({});
     expect(GmailClient.fromTokenFile(ADDR, 'test-entity').readOnly).toBe(false);
+  });
+});
+
+// A4 (Opus): 'exactly [gmail.readonly]' means ONE entry. The old Set() de-duplication let
+// [ro, ro] through.
+describe('A4 — duplicate scope entries are rejected ("exactly" means one entry)', () => {
+  const tokenWith = (extra) => mockReadFileSync.mockImplementation(() => JSON.stringify({
+    refresh_token: 'SECRET-REFRESH-VALUE', client_id: 'FAKE-id', client_secret: 'SECRET-CLIENT-VALUE', ...extra,
+  }));
+  const build = () => GmailClient.fromTokenFile(ADDR, 'test-entity', { readOnly: true });
+  it.each([
+    ['[ro, ro]', [READONLY, READONLY]],
+    ['[ro, ro, ro]', [READONLY, READONLY, READONLY]],
+    ['[ro, modify, ro]', [READONLY, 'https://www.googleapis.com/auth/gmail.modify', READONLY]],
+  ])('rejects %s', (_n, scopes) => {
+    tokenWith({ scopes });
+    expect(build).toThrow(ReadOnlyScopeError);
+  });
+  it('the duplicate error is typed, masked, and says why', () => {
+    tokenWith({ scopes: [READONLY, READONLY] });
+    let err;
+    try { build(); } catch (e) { err = e; }
+    expect(err).toBeInstanceOf(ReadOnlyScopeError);
+    expect(err.message).toContain('r***@example.com');
+    expect(err.message).toMatch(/more than once|duplicate/i);
+    expect(err.message).not.toMatch(/SECRET-REFRESH-VALUE|SECRET-CLIENT-VALUE/);
+  });
+  it('a single [ro] still passes', () => {
+    tokenWith({ scopes: [READONLY] });
+    expect(build().readOnly).toBe(true);
+  });
+});
+
+// A3 (Opus, real leak): a JSON.parse SyntaxError quotes part of the malformed file, which
+// can include a bare token value. The error must name only the masked address + a fixed reason.
+describe('A3 — a malformed token file never leaks its contents through the error', () => {
+  const SECRET = '1//0gFAKE-BARE-REFRESH-TOKEN-ZZZ';
+  const CSECRET = 'GOCSPX-FAKE-CLIENT-SECRET-QQQ';
+  const malformed = [
+    ['bare token value', SECRET],
+    ['unquoted value after key', `{"refresh_token": ${SECRET}, "client_secret": "${CSECRET}"}`],
+    ['truncated mid-secret', `{"refresh_token": "${SECRET}", "client_secret": "${CSECRET.slice(0, 12)}`],
+    ['missing comma', `{"refresh_token": "${SECRET}" "client_secret": "${CSECRET}"}`],
+    ['trailing garbage', `{"refresh_token": "${SECRET}"} ${CSECRET}`],
+    ['single quotes', `{'refresh_token': '${SECRET}'}`],
+  ];
+  const capture = (readOnly) => {
+    let err;
+    try { GmailClient.fromTokenFile(ADDR, 'test-entity', readOnly ? { readOnly: true } : undefined); } catch (e) { err = e; }
+    return err;
+  };
+
+  it.each(malformed)('%s: message/stack/log line carry none of the file', (_n, body) => {
+    for (const readOnly of [true, false]) {
+      mockReadFileSync.mockImplementation(() => body);
+      appended.length = 0;
+      const err = capture(readOnly);
+      expect(err, 'expected an error').toBeInstanceOf(Error);
+      expect(err.name).toBe('TokenFileInvalidError');
+      expect(err.code).toBe('TOKEN_FILE_INVALID');
+      expect(err.message).toContain('r***@example.com');
+      expect(err.message).toContain('token file is not valid JSON');
+      expect(err.message).not.toContain(ADDR);
+      expect(err).not.toBeInstanceOf(SyntaxError);
+      expect(err.cause).toBeUndefined();
+      const logger = createLogger('test-entity', '/tmp/never-written.jsonl');
+      logger.error('fromTokenFile', err);
+      const everything = [err.message, err.stack, ...appended, JSON.stringify(err)].join('\n');
+      for (const needle of [SECRET, CSECRET, CSECRET.slice(0, 12), 'refresh_token', 'Unexpected token', 'in JSON at position']) {
+        expect(everything, `leaked ${needle}`).not.toContain(needle);
+      }
+      expect(appended).toHaveLength(1);
+    }
+  });
+
+  it('valid JSON that is not an object (string/array/null) fails the same clean way', () => {
+    for (const body of [`"${SECRET}"`, `["${SECRET}"]`, 'null', '42']) {
+      mockReadFileSync.mockImplementation(() => body);
+      const err = capture(true);
+      expect(err.name).toBe('TokenFileInvalidError');
+      expect(`${err.message}\n${err.stack}`).not.toContain(SECRET);
+    }
+  });
+
+  it('a malformed shared OAuth-client file (fallback) is also masked', () => {
+    mockReadFileSync.mockImplementation((p) => (String(p).endsWith('conductor_paul_client.json')
+      ? `{"installed": {"client_secret": ${CSECRET}}`
+      : JSON.stringify({ refresh_token: 'FAKE', scopes: [READONLY] })));
+    const err = capture(true);
+    expect(err).toBeInstanceOf(Error);
+    expect(`${err.message}\n${err.stack}`).not.toContain(CSECRET);
+    expect(err.message).toContain('not valid JSON');
+  });
+});
+
+// A4 (docs): fromTokenFile WITHOUT opts builds a WRITABLE client — other callers rely on it.
+// This is deliberate, and README says so plainly.
+describe('A4 — fromTokenFile without opts is WRITABLE (documented, deliberately unchanged)', () => {
+  it('no opts, opts:{} and readOnly:false all build a writable client that reaches modify', async () => {
+    for (const opts of [undefined, {}, { readOnly: false }]) {
+      apiCalls.length = 0;
+      const c = GmailClient.fromTokenFile(ADDR, 'test-entity', opts);
+      expect(c.readOnly).toBe(false);
+      await c._gmail.users.messages.modify({ userId: 'me', id: 'm1' });
+      expect(apiCalls).toEqual(['users.messages.modify']);
+    }
   });
 });

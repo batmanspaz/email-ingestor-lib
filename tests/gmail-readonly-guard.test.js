@@ -82,19 +82,17 @@ vi.mock('googleapis', () => {
     },
   };
   // getProfile/watch/stop etc. must run with `this` = users too
-  return {
-    google: {
-      auth: { OAuth2 },
-      // Real googleapis defines `users` as a read-only, NON-configurable data property;
-      // a Proxy that targets the real object then violates the get-trap invariant and
-      // throws TypeError on first access (found by a smoke test against the real lib).
-      gmail: vi.fn().mockImplementation(() => {
-        const root = { context: { ok: true } };
-        Object.defineProperty(root, 'users', { value: users, writable: false, configurable: false, enumerable: true });
-        return root;
-      }),
-    },
-  };
+  // Real googleapis defines `users` as a read-only, NON-configurable data property;
+  // a Proxy that targets the real object then violates the get-trap invariant and
+  // throws TypeError on first access (found by a smoke test against the real lib).
+  const gmail = vi.fn().mockImplementation(() => {
+    const root = { context: { ok: true } };
+    Object.defineProperty(root, 'users', { value: users, writable: false, configurable: false, enumerable: true });
+    return root;
+  });
+  // readOnly clients are built from their own GoogleApis instance, not the singleton.
+  function GoogleApis() { this.auth = { OAuth2 }; this.gmail = gmail; }
+  return { google: { auth: { OAuth2 }, gmail }, GoogleApis };
 });
 
 import { GmailClient } from '../gmail.js';

@@ -15,7 +15,12 @@
  *                   `params` and `options` arguments are allowlisted as well —
  *                   googleapis Object.assigns caller options over the request's
  *                   url/method, so `get(params, {url: '.../modify', method: 'POST'})`
- *                   would otherwise turn an allowed read into a write.
+ *                   would otherwise turn an allowed read into a write. Each is
+ *                   COPIED ONCE into a fresh null-prototype object holding only
+ *                   allowlisted keys and primitive/validated values (every caller
+ *                   property is read exactly once); googleapis is handed ONLY the
+ *                   copy, so a Proxy or getter that changes after the check
+ *                   (TOCTOU) has nothing left to change.
  *   2. FLAG       — GmailClient.readOnly / ._gmail are non-writable and
  *                   non-configurable on a readOnly client, and the OAuth2 client is
  *                   a private field (#oauth2), not reachable to build a side client.
@@ -77,7 +82,27 @@ export class ReadOnlyScopeError extends Error {
   }
 }
 
+/**
+ * Thrown by GmailClient.fromTokenFile() when a credentials file cannot be parsed. Deliberately
+ * carries NO parser text and NO `cause`: a JSON.parse SyntaxError quotes part of the malformed
+ * input, which can include a bare token / client-secret value. Only the masked address and a
+ * fixed reason ever appear in the message, stack or any log line built from them.
+ */
+export class TokenFileInvalidError extends Error {
+  /**
+   * @param {string} account — address (masked in message)
+   * @param {string} reason — fixed, secret-free text, e.g. 'token file is not valid JSON'
+   */
+  constructor(account, reason) {
+    super(`${maskEmail(account)}: ${reason} — re-run the OAuth flow for this account`);
+    this.name = 'TokenFileInvalidError';
+    this.code = 'TOKEN_FILE_INVALID';
+    this.account = maskEmail(account);
+  }
+}
+
 let denialSink = null;
+let sinkWarned = false;
 /**
  * Route every denial to a durable sink (e.g. the entity JSONL logger, dev-rules §17.1).
  * Called with a PII-free record: { op, account (masked), attempted }. A throwing sink
@@ -86,12 +111,25 @@ let denialSink = null;
  */
 export function setReadOnlyDenialSink(fn) {
   denialSink = typeof fn === 'function' ? fn : null;
+  sinkWarned = false; // a freshly registered sink gets its own one-time warning
 }
 
 /** Emit a masked denial record to the sink (never throws). */
 export function emitDenial(op, account, attempted) {
   if (!denialSink) return;
-  try { denialSink({ op, account: maskEmail(account), attempted }); } catch { /* the denial still stands */ }
+  try {
+    denialSink({ op, account: maskEmail(account), attempted });
+  } catch {
+    // The denial still stands, but the operator must learn the durable log is down — ONCE, and
+    // without the sink's own error text (it may quote a path or a record).
+    if (!sinkWarned) {
+      sinkWarned = true;
+      console.warn(
+        `[readonly-guard] WARNING: the denial sink threw for ${maskEmail(account)} — denials are ` +
+        'still enforced and logged to the console, but NOT to the durable log (further sink errors suppressed).',
+      );
+    }
+  }
 }
 
 /**
@@ -124,6 +162,28 @@ export const SAFE_PARAM_KEYS = new Set([
 
 const isPrimitive = (v) => v === null || v === undefined || ['string', 'number', 'boolean'].includes(typeof v);
 
+/** Upper bound on an array-valued param (labelIds / metadataHeaders / historyTypes are tiny). */
+const MAX_ARRAY_PARAM = 100;
+
+/** A real AbortSignal (brand-checked via its internal slot; a Proxy or look-alike throws). */
+function isRealAbortSignal(v) {
+  try {
+    const desc = Object.getOwnPropertyDescriptor(AbortSignal.prototype, 'aborted');
+    desc.get.call(v);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/** Per-option value validators — anything else is refused. */
+const OPTION_VALUE_OK = {
+  signal: isRealAbortSignal,
+  timeout: (v) => typeof v === 'number',
+  responseType: (v) => typeof v === 'string',
+  retry: (v) => typeof v === 'boolean' || typeof v === 'number',
+};
+
 /** Every enumerable key, own AND inherited (googleapis deep-extends with for..in), plus symbols. */
 function allKeys(obj) {
   const keys = [];
@@ -131,37 +191,88 @@ function allKeys(obj) {
   return { keys, symbols: Object.getOwnPropertySymbols(obj) };
 }
 
-/** @returns {string|null} the reason the arguments are unsafe for a read, or null */
-function unsafeReadArgs(args) {
-  const [params, second, third, ...rest] = args;
-  if (rest.length) return 'unexpected extra arguments';
-  if (params !== undefined) {
-    if (typeof params !== 'object' || params === null || Array.isArray(params)) return 'params is not an object';
-    const { keys, symbols } = allKeys(params);
-    if (symbols.length) return 'symbol-keyed params';
-    for (const k of keys) {
-      if (!SAFE_PARAM_KEYS.has(k)) return `params.${k} is not an allowed read parameter`;
-      const v = params[k];
-      const ok = isPrimitive(v) || (Array.isArray(v) && v.every(isPrimitive));
-      if (!ok) return `params.${k} is not a plain value`;
+/**
+ * Copy `params` ONCE into a fresh null-prototype object. Every property is read exactly once
+ * (`v = src[k]`) and the value validated on the very value that is stored, so nothing the caller
+ * controls (Proxy traps, getters, mutated-after-check objects) is consulted again.
+ * @returns {{copy:object}|{why:string}}
+ */
+function copyParams(src) {
+  if (typeof src !== 'object' || src === null || Array.isArray(src)) return { why: 'params is not an object' };
+  const { keys, symbols } = allKeys(src);
+  if (symbols.length) return { why: 'symbol-keyed params' };
+  const copy = Object.create(null);
+  for (const k of keys) {
+    if (!SAFE_PARAM_KEYS.has(k)) return { why: `params.${k} is not an allowed read parameter` };
+    const v = src[k]; // the ONE read
+    if (isPrimitive(v)) {
+      copy[k] = v;
+    } else if (Array.isArray(v)) {
+      const len = v.length; // read once
+      if (typeof len !== 'number' || !(len >= 0) || len > MAX_ARRAY_PARAM) return { why: `params.${k} is not a plain value` };
+      const arr = [];
+      for (let i = 0; i < len; i++) {
+        const item = v[i]; // read once
+        if (!isPrimitive(item)) return { why: `params.${k} is not a plain value` };
+        arr.push(item);
+      }
+      copy[k] = arr;
+    } else {
+      return { why: `params.${k} is not a plain value` };
     }
+  }
+  return { copy };
+}
+
+/** Same idea for the per-call options: allowlisted keys, one read, validated value. */
+function copyOptions(src) {
+  if (typeof src !== 'object' || src === null || Array.isArray(src)) return { why: 'options is not an object' };
+  const { keys, symbols } = allKeys(src);
+  if (symbols.length) return { why: 'symbol-keyed options' };
+  const copy = Object.create(null);
+  for (const k of keys) {
+    if (!SAFE_OPTION_KEYS.has(k)) return { why: `option "${k}" can redirect or re-verb the request` };
+    const d = Object.getOwnPropertyDescriptor(src, k);
+    if (!d || 'get' in d || 'set' in d) return { why: `option "${k}" is not a plain data property` };
+    const v = src[k]; // the ONE read
+    if (v !== undefined && !OPTION_VALUE_OK[k](v)) return { why: `option "${k}" has an unsafe value` };
+    copy[k] = v;
+  }
+  return { copy };
+}
+
+/**
+ * Validate AND sanitise the arguments of a read call.
+ * @returns {{why:string}|{args:any[]}} the reason they are unsafe, or the arguments googleapis
+ *   may receive — fresh copies only; the caller's own objects are never passed on.
+ */
+function sanitizeReadArgs(args) {
+  const [params, second, third, ...rest] = args;
+  if (rest.length) return { why: 'unexpected extra arguments' };
+  let paramsCopy;
+  if (params !== undefined) {
+    const r = copyParams(params);
+    if (r.why) return r;
+    paramsCopy = r.copy;
   }
   // Signatures: (params), (params, cb), (params, options), (params, options, cb)
-  let options = second;
+  let optionsCopy;
   let cb = third;
-  if (typeof second === 'function') { options = undefined; cb = second; if (third !== undefined) return 'callback must be last'; }
-  if (cb !== undefined && typeof cb !== 'function') return 'third argument is not a callback';
-  if (options !== undefined) {
-    if (typeof options !== 'object' || options === null || Array.isArray(options)) return 'options is not an object';
-    const { keys, symbols } = allKeys(options);
-    if (symbols.length) return 'symbol-keyed options';
-    for (const k of keys) {
-      if (!SAFE_OPTION_KEYS.has(k)) return `option "${k}" can redirect or re-verb the request`;
-      const d = Object.getOwnPropertyDescriptor(options, k);
-      if (!d || 'get' in d || 'set' in d) return `option "${k}" is not a plain data property`;
-    }
+  if (typeof second === 'function') {
+    if (third !== undefined) return { why: 'callback must be last' };
+    cb = second;
+  } else if (second !== undefined) {
+    const r = copyOptions(second);
+    if (r.why) return r;
+    optionsCopy = r.copy;
   }
-  return null;
+  if (cb !== undefined && typeof cb !== 'function') return { why: 'third argument is not a callback' };
+
+  const out = [];
+  if (args.length >= 1) out.push(paramsCopy);
+  if (args.length >= 2) out.push(typeof second === 'function' ? cb : optionsCopy);
+  if (args.length >= 3) out.push(cb);
+  return { args: out };
 }
 
 /** googleapis internals that hold the OAuth2 client / request config — never exposed. */
@@ -191,10 +302,11 @@ export function guardGmailApi(gmail, account) {
             if (!READ_VERBS.has(prop)) {
               denyWrite(account, here.join('.'));
             }
-            const why = unsafeReadArgs(args);
-            if (why) denyWrite(account, `${here.join('.')} with unsafe arguments (${why})`);
-            // Resource methods rely on `this` (e.g. this.context) — call on the real object.
-            return value.apply(obj, args);
+            const safe = sanitizeReadArgs(args);
+            if (safe.why) denyWrite(account, `${here.join('.')} with unsafe arguments (${safe.why})`);
+            // Resource methods rely on `this` (e.g. this.context) — call on the real object,
+            // with the sanitised COPIES only (never the caller's objects: TOCTOU).
+            return value.apply(obj, safe.args);
           };
         }
         if (value && typeof value === 'object') return wrap(value, here);

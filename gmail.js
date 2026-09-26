@@ -9,14 +9,41 @@
  *   2. new GmailClient({ account, refreshToken, clientId, clientSecret, entity }) — explicit
  */
 
-import { google } from 'googleapis';
+import { google, GoogleApis } from 'googleapis';
 import fs from 'fs';
 import path from 'path';
 import os from 'os';
-import { guardGmailApi, denyWrite, emitDenial, ReadOnlyScopeError, READONLY_SCOPE } from './readonly-guard.js';
+import {
+  guardGmailApi, denyWrite, emitDenial, ReadOnlyScopeError, TokenFileInvalidError, READONLY_SCOPE,
+} from './readonly-guard.js';
 
 const CRED_DIR = path.join(os.homedir(), 'claude/shared/config/credentials');
 const CLIENT_FILE = path.join(CRED_DIR, 'conductor_paul_client.json');
+
+/**
+ * Parse a credentials file WITHOUT ever surfacing the parser's message: a JSON.parse
+ * SyntaxError quotes a slice of the malformed input, which can include a bare token or
+ * client-secret value (Opus review, real leak). On any failure throw a typed error naming
+ * only the masked address and a fixed reason — no cause, no parser text.
+ *
+ * @param {string} text
+ * @param {string} account
+ * @param {string} what — 'token file' | 'OAuth client file' (fixed strings only)
+ * @returns {object}
+ * @throws {TokenFileInvalidError}
+ */
+function parseCredentialsJson(text, account, what) {
+  let data;
+  try {
+    data = JSON.parse(text);
+  } catch {
+    throw new TokenFileInvalidError(account, `${what} is not valid JSON`);
+  }
+  if (typeof data !== 'object' || data === null || Array.isArray(data)) {
+    throw new TokenFileInvalidError(account, `${what} is not a JSON object`);
+  }
+  return data;
+}
 
 /**
  * Pull an OAuth client pair out of a parsed credentials blob.
@@ -58,9 +85,10 @@ function extractClientPair(creds) {
  *
  * @param {object} tokenData — parsed contents of the account's token file
  * @param {string} tokenFile — path, for error messages only
+ * @param {string} account — address, for the (masked) parse-error message
  * @returns {{clientId: string, clientSecret: string}}
  */
-function resolveClientCredentials(tokenData, tokenFile) {
+function resolveClientCredentials(tokenData, tokenFile, account) {
   const own = extractClientPair(tokenData);
   if (own) return own;
 
@@ -70,7 +98,7 @@ function resolveClientCredentials(tokenData, tokenFile) {
         'client_id/client_secret of its own)',
     );
   }
-  const shared = extractClientPair(JSON.parse(fs.readFileSync(CLIENT_FILE, 'utf8')));
+  const shared = extractClientPair(parseCredentialsJson(fs.readFileSync(CLIENT_FILE, 'utf8'), account, 'OAuth client file'));
   if (!shared) throw new Error(`Invalid client credentials in ${CLIENT_FILE}`);
   return shared;
 }
@@ -92,11 +120,65 @@ function assertReadOnlyScopes(account, tokenData) {
     emitDenial('readonly_scope_rejected', account, 'token scopes missing or malformed');
     throw new ReadOnlyScopeError(account, [], 'token file has no valid `scopes` array (cannot prove gmail.readonly-only)');
   }
+  assertExactlyReadonly(account, scopes, 'token file');
+}
+
+/**
+ * "Exactly gmail.readonly" means ONE entry, and it is gmail.readonly. A Set() would let
+ * [ro, ro] through; a wider entry, a different read scope or an empty list all fail.
+ * @param {string} account
+ * @param {string[]} scopes
+ * @param {string} source — 'token file' | 'token refresh response' (fixed text)
+ * @throws {ReadOnlyScopeError}
+ */
+function assertExactlyReadonly(account, scopes, source) {
   const extra = [...new Set(scopes)].filter(s => s !== READONLY_SCOPE);
-  if (extra.length > 0 || !scopes.includes(READONLY_SCOPE)) {
-    emitDenial('readonly_scope_rejected', account, 'token scopes wider than gmail.readonly');
-    throw new ReadOnlyScopeError(account, extra);
+  if (extra.length > 0) {
+    emitDenial('readonly_scope_rejected', account, `${source} scopes wider than gmail.readonly`);
+    throw new ReadOnlyScopeError(account, extra, `${source} grants scopes beyond gmail.readonly: ${extra.join(', ')}`);
   }
+  if (scopes.length !== 1) {
+    emitDenial('readonly_scope_rejected', account, `${source} scopes not exactly one entry`);
+    throw new ReadOnlyScopeError(
+      account, [], `${source} lists scopes ${scopes.length === 0 ? 'as empty' : 'more than once'} (exactly ONE gmail.readonly entry is required)`,
+    );
+  }
+}
+
+/**
+ * Layer 3b: verify the scope GOOGLE returns on a token refresh (the token response), not just
+ * the token file's own claim. A response that is wider than exactly [gmail.readonly] — or that
+ * does not state its scope, so it cannot be proven — is refused before the access token is
+ * kept, so no Gmail request is ever made with it. Only `scope` is inspected; nothing from the
+ * response is ever put in the error.
+ *
+ * @param {string} account
+ * @param {{scope?: unknown}|undefined} tokens — the refresh response body
+ * @throws {ReadOnlyScopeError}
+ */
+function assertRefreshScope(account, tokens) {
+  const raw = tokens?.scope;
+  if (typeof raw !== 'string') {
+    emitDenial('readonly_scope_rejected', account, 'token refresh response did not state its scope');
+    throw new ReadOnlyScopeError(account, [], 'token refresh response did not state its scope (cannot prove gmail.readonly-only)');
+  }
+  assertExactlyReadonly(account, raw.split(/\s+/).filter(Boolean), 'token refresh response');
+}
+
+/**
+ * OAuth2 client for a readOnly account: identical to the stock one, except every token
+ * refresh response has its `scope` verified (assertRefreshScope) before the credentials are
+ * kept. `refreshToken`/`refreshAccessToken`/`getAccessToken`/every API request funnel through
+ * refreshTokenNoCache, so one override covers them all.
+ */
+function readOnlyOAuth2Class(Base, account) {
+  return class ReadOnlyOAuth2 extends Base {
+    async refreshTokenNoCache(refreshToken) {
+      const r = await super.refreshTokenNoCache(refreshToken);
+      assertRefreshScope(account, r?.tokens);
+      return r;
+    }
+  };
 }
 
 /**
@@ -158,13 +240,20 @@ export class GmailClient {
     this.account = config.account;
     this.entity = config.entity || 'Unknown';
 
-    this.#oauth2 = new google.auth.OAuth2(config.clientId, config.clientSecret);
-    this.#oauth2.setCredentials({ refresh_token: config.refreshToken });
     const readOnly = config.readOnly === true;
+    // A readOnly client gets its OWN GoogleApis instance (own _options, own AuthPlus): the
+    // shared `google` singleton is process-global, so `google.options({adapter, params:{...}})`
+    // from any other module would otherwise change every request this client makes.
+    // NOT isolated: OAuth2Client.prototype (shared class) — patching it is out of scope; only
+    // the gmail.readonly-only token stops that. See README.
+    const apis = readOnly ? new GoogleApis() : google;
+    const OAuth2 = readOnly ? readOnlyOAuth2Class(apis.auth.OAuth2, this.account) : apis.auth.OAuth2;
+    this.#oauth2 = new OAuth2(config.clientId, config.clientSecret);
+    this.#oauth2.setCredentials({ refresh_token: config.refreshToken });
     // Non-writable + non-configurable: `client.readOnly = false` must not switch the
     // poll()/forward guards off (throws in strict mode, is ignored in sloppy mode).
     Object.defineProperty(this, 'readOnly', { value: readOnly, writable: false, configurable: false, enumerable: true });
-    const gmail = google.gmail({ version: 'v1', auth: this.#oauth2 });
+    const gmail = apis.gmail({ version: 'v1', auth: this.#oauth2 });
     if (readOnly) {
       // The guarded client cannot be swapped for an unguarded one after construction.
       Object.defineProperty(this, '_gmail', {
@@ -185,7 +274,9 @@ export class GmailClient {
    * @param {string} account — email address (e.g. paulallensteinberg@gmail.com)
    * @param {string} [entity] — entity name for logging
    * @param {object} [opts]
-   * @param {boolean} [opts.readOnly=false] — refuse every Gmail write for this account
+   * @param {boolean} [opts.readOnly=false] — refuse every Gmail write for this account.
+   *   NOTE: called WITHOUT `{ readOnly: true }` this builds a WRITABLE client (other callers
+   *   depend on it); a protected mailbox must always pass the option.
    * @returns {GmailClient}
    */
   static fromTokenFile(account, entity, opts = {}) {
@@ -195,7 +286,7 @@ export class GmailClient {
     if (!fs.existsSync(tokenFile)) {
       throw new Error(`Token file not found: ${tokenFile} — run OAuth flow for ${account}`);
     }
-    const tokenData = JSON.parse(fs.readFileSync(tokenFile, 'utf8'));
+    const tokenData = parseCredentialsJson(fs.readFileSync(tokenFile, 'utf8'), account, 'token file');
     const refreshToken = tokenData.refresh_token;
 
     if (!refreshToken) {
@@ -204,7 +295,7 @@ export class GmailClient {
 
     if (opts?.readOnly === true) assertReadOnlyScopes(account, tokenData);
 
-    const { clientId, clientSecret } = resolveClientCredentials(tokenData, tokenFile);
+    const { clientId, clientSecret } = resolveClientCredentials(tokenData, tokenFile, account);
 
     return new GmailClient({ account, refreshToken, clientId, clientSecret, entity, readOnly: opts?.readOnly === true });
   }

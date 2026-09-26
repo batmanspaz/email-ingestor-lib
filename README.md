@@ -24,20 +24,40 @@ import { GmailClient, poll, checkAndForward, createLogger } from '../../../share
      every other call (modify, batchModify, trash, send, drafts, labels, settings, watch, and any method
      added later) throws `ReadOnlyAccountError` (`code: 'READ_ONLY_ACCOUNT'`). Per-call `params` and
      `options` are allowlisted too (googleapis lets a caller override `url`/`method` via options), and
-     googleapis internals (`context`, `_options`, `auth`) are not exposed.
+     googleapis internals (`context`, `_options`, `auth`) are not exposed. Each argument is copied
+     once — every caller property is read exactly once, in a single pass, into a fresh null-prototype
+     object of allowlisted keys and validated primitive values — and googleapis receives ONLY that
+     copy, so a Proxy or getter that changes after the check (TOCTOU) cannot smuggle a
+     url/method/header/body. A readOnly client is built from its own `new GoogleApis()` instance, so
+     `google.options({ adapter, params })` on the shared singleton does not change its requests.
   2. **Non-writable flag** — `client.readOnly` and `client._gmail` are non-writable, non-configurable;
      the OAuth2 client is a private `#oauth2` field. `poll()` never batch-archives a readOnly client and
      `checkAndForward()` declines to forward from one.
   3. **Scope check** — `fromTokenFile({ readOnly: true })` fails closed (`ReadOnlyScopeError`,
-     `code: 'READ_ONLY_SCOPE_MISMATCH'`) unless the token file's `scopes` are exactly
-     `https://www.googleapis.com/auth/gmail.readonly`. Per-account: a caller can skip just that account.
+     `code: 'READ_ONLY_SCOPE_MISMATCH'`) unless the token file's `scopes` are exactly ONE entry,
+     `https://www.googleapis.com/auth/gmail.readonly` (a duplicated entry fails too). The `scope`
+     Google returns in the token response of every refresh (the first one included) is verified the
+     same way, and a response that is wider or does not state its scope is refused before any Gmail
+     request is made. Per-account: a caller can skip just that account.
+     A token file that is not valid JSON throws `TokenFileInvalidError` naming only the masked address
+     — never the parser's message, which can quote a bare token value.
   4. **Read-only token (the real backstop)** — a `gmail.readonly`-only refresh token is refused by Google
      for every write, whatever code runs in the process. Layers 1-3 keep honest code honest and fail
      loudly; they cannot contain code that already holds a broader token, which is why layer 3 refuses
      to load one.
 
   Denials are logged (address masked) to the console and, if `setReadOnlyDenialSink()` is wired to the
-  entity logger's `readOnlyDenial()`, to the durable JSONL log.
+  entity logger's `readOnlyDenial()`, to the durable JSONL log (a sink that throws produces one
+  console warning, not silence).
+
+  **Not writable-by-default-safe:** `GmailClient.fromTokenFile(addr, entity)` called without
+  `{ readOnly: true }` builds a WRITABLE client (other callers depend on it). A protected mailbox
+  must always pass the option.
+
+  **Out of scope:** the guard cannot contain code in the same process that patches
+  `OAuth2Client.prototype.request` (or google-auth-library / gaxios internals) — a shared class the
+  read-only client necessarily uses. Only the read-only token (layer 4) stops that, which is why it is
+  the backstop and why layer 3 refuses to build a client from any wider token.
 
 ## Auth
 

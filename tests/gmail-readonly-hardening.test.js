@@ -278,6 +278,28 @@ describe('L5 — denials reach a durable JSONL sink, address masked', () => {
     setReadOnlyDenialSink(() => { throw new Error('disk full'); });
     await expect(ro().archive('m1')).rejects.toMatchObject({ code: 'READ_ONLY_ACCOUNT' });
   });
+  // A5 (Fable nit): a broken sink used to be swallowed silently — the operator never learned the
+  // durable log was down. Warn ONCE (masked, no sink error text), keep denying.
+  it('a broken sink warns ONCE via console.warn (masked), and every denial still stands', async () => {
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    setReadOnlyDenialSink(() => { throw new Error(`disk full for ${ADDR} SECRET-SINK-TEXT`); });
+    for (let i = 0; i < 3; i++) {
+      await expect(ro().archive('m1')).rejects.toMatchObject({ code: 'READ_ONLY_ACCOUNT' });
+    }
+    expect(warn).toHaveBeenCalledTimes(1);
+    const line = warn.mock.calls[0].join(' ');
+    expect(line).toMatch(/denial sink/i);
+    expect(line).not.toContain(ADDR);
+    expect(line).not.toContain('SECRET-SINK-TEXT');
+  });
+  it('re-registering a sink re-arms the one-time warning', async () => {
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    setReadOnlyDenialSink(() => { throw new Error('x'); });
+    await ro().archive('m1').catch(() => {});
+    setReadOnlyDenialSink(() => { throw new Error('y'); });
+    await ro().archive('m1').catch(() => {});
+    expect(warn).toHaveBeenCalledTimes(2);
+  });
 });
 
 describe('L6 — README states the layered model and does not oversell', () => {
@@ -286,6 +308,18 @@ describe('L6 — README states the layered model and does not oversell', () => {
   it('never uses the word "impossible"', () => {
     expect(readme).not.toMatch(/impossible/i);
     expect(guardSrc).not.toMatch(/impossible/i);
+  });
+  it('says plainly that fromTokenFile WITHOUT readOnly:true builds a WRITABLE client', () => {
+    expect(readme).toMatch(/without\s+`?\{?\s*readOnly:\s*true[^\n]*writable/is);
+  });
+  it('is honest that patching OAuth2Client.prototype is out of scope (only the read-only token stops it)', () => {
+    expect(readme).toMatch(/OAuth2Client\.prototype/);
+    expect(readme).toMatch(/out of scope/i);
+  });
+  it('documents the copy-once argument sanitising, isolated GoogleApis instance and refresh-scope check', () => {
+    expect(readme).toMatch(/copied? once|read once|single pass/i);
+    expect(readme).toMatch(/GoogleApis/);
+    expect(readme).toMatch(/token response|refresh response/i);
   });
   it('names each layer, with the gmail.readonly token as the real backstop', () => {
     expect(readme).toMatch(/gmail\.readonly/);
