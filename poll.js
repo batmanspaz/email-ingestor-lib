@@ -351,7 +351,8 @@ export async function poll(config, handler) {
         if (!dryRun) { ringAdd(id); delete failures[id]; }
         // Per-client archiveAfterProcess overrides the global setting.
         // Set noArchive: true on a client entry to keep that account's inbox intact.
-        const shouldArchive = !dryRun && (clientEntry.noArchive ? false : archiveAfterProcess);
+        // A readOnly client (readonly-guard.js) is never archived, whatever the flags say.
+        const shouldArchive = !dryRun && !client.readOnly && (clientEntry.noArchive ? false : archiveAfterProcess);
         if (shouldArchive) toArchive.push(id);
       } catch (err) {
         // Gmail 404: message deleted before fetch — skip silently, not an error
