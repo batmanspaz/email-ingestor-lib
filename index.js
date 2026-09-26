@@ -20,7 +20,9 @@
 export { GmailClient } from './gmail.js';
 export { poll } from './poll.js';
 export { checkAndForward } from './forward.js';
-export { ReadOnlyAccountError, guardGmailApi, READ_VERBS } from './readonly-guard.js';
+export {
+  ReadOnlyAccountError, ReadOnlyScopeError, guardGmailApi, READ_VERBS, READONLY_SCOPE, setReadOnlyDenialSink,
+} from './readonly-guard.js';
 export { createLogger } from './log.js';
 export { maskEmail, maskFrom, redact } from './mask.js';
 export { shouldRunSluiceProducer, resolveSluiceGate, computeSluiceGateCheck } from './sluice-flag.js';

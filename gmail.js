@@ -13,7 +13,7 @@ import { google } from 'googleapis';
 import fs from 'fs';
 import path from 'path';
 import os from 'os';
-import { guardGmailApi, denyWrite } from './readonly-guard.js';
+import { guardGmailApi, denyWrite, emitDenial, ReadOnlyScopeError, READONLY_SCOPE } from './readonly-guard.js';
 
 const CRED_DIR = path.join(os.homedir(), 'claude/shared/config/credentials');
 const CLIENT_FILE = path.join(CRED_DIR, 'conductor_paul_client.json');
@@ -76,6 +76,30 @@ function resolveClientCredentials(tokenData, tokenFile) {
 }
 
 /**
+ * Layer 3 of the read-only model (see readonly-guard.js): a readOnly client is only
+ * built from a token whose granted scopes are EXACTLY [gmail.readonly], so Google
+ * itself refuses writes even for code that bypasses the proxy. Fails closed: a missing,
+ * malformed or wider `scopes` array throws a typed, per-account ReadOnlyScopeError.
+ * Only the `scopes` field is inspected; nothing from the token is ever logged.
+ *
+ * @param {string} account
+ * @param {object} tokenData — parsed token file
+ * @throws {ReadOnlyScopeError}
+ */
+function assertReadOnlyScopes(account, tokenData) {
+  const scopes = tokenData?.scopes;
+  if (!Array.isArray(scopes) || scopes.length === 0 || !scopes.every(s => typeof s === 'string')) {
+    emitDenial('readonly_scope_rejected', account, 'token scopes missing or malformed');
+    throw new ReadOnlyScopeError(account, [], 'token file has no valid `scopes` array (cannot prove gmail.readonly-only)');
+  }
+  const extra = [...new Set(scopes)].filter(s => s !== READONLY_SCOPE);
+  if (extra.length > 0 || !scopes.includes(READONLY_SCOPE)) {
+    emitDenial('readonly_scope_rejected', account, 'token scopes wider than gmail.readonly');
+    throw new ReadOnlyScopeError(account, extra);
+  }
+}
+
+/**
  * Retry a Gmail API call with exponential backoff on 429 / 5xx / network errors.
  * Non-retryable errors (401, 403, 404) bubble up immediately.
  */
@@ -108,6 +132,10 @@ async function withRetry(fn, label = 'gmail') {
 const MAX_HISTORY_IDS_PER_CALL = 500;
 
 export class GmailClient {
+  /** OAuth2 client — private on purpose: a readOnly client must not hand out the credential
+   *  another googleapis client (or a raw .request(POST)) could use to bypass the proxy. */
+  #oauth2;
+
   /**
    * @param {object} config
    * @param {string} config.account       — email address
@@ -130,11 +158,21 @@ export class GmailClient {
     this.account = config.account;
     this.entity = config.entity || 'Unknown';
 
-    this._oauth2 = new google.auth.OAuth2(config.clientId, config.clientSecret);
-    this._oauth2.setCredentials({ refresh_token: config.refreshToken });
-    this.readOnly = config.readOnly === true;
-    const gmail = google.gmail({ version: 'v1', auth: this._oauth2 });
-    this._gmail = this.readOnly ? guardGmailApi(gmail, this.account) : gmail;
+    this.#oauth2 = new google.auth.OAuth2(config.clientId, config.clientSecret);
+    this.#oauth2.setCredentials({ refresh_token: config.refreshToken });
+    const readOnly = config.readOnly === true;
+    // Non-writable + non-configurable: `client.readOnly = false` must not switch the
+    // poll()/forward guards off (throws in strict mode, is ignored in sloppy mode).
+    Object.defineProperty(this, 'readOnly', { value: readOnly, writable: false, configurable: false, enumerable: true });
+    const gmail = google.gmail({ version: 'v1', auth: this.#oauth2 });
+    if (readOnly) {
+      // The guarded client cannot be swapped for an unguarded one after construction.
+      Object.defineProperty(this, '_gmail', {
+        value: guardGmailApi(gmail, this.account), writable: false, configurable: false, enumerable: true,
+      });
+    } else {
+      this._gmail = gmail;
+    }
   }
 
   /**
@@ -163,6 +201,8 @@ export class GmailClient {
     if (!refreshToken) {
       throw new Error(`No refresh_token in ${tokenFile} — re-run OAuth flow for ${account}`);
     }
+
+    if (opts?.readOnly === true) assertReadOnlyScopes(account, tokenData);
 
     const { clientId, clientSecret } = resolveClientCredentials(tokenData, tokenFile);
 

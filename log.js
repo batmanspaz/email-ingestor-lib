@@ -67,6 +67,11 @@ export function createLogger(entity, logPath) {
       });
     },
 
+    /** A refused write on a readOnly account (readonly-guard.js). Record is already masked. */
+    readOnlyDenial(rec) {
+      append({ ...rec });
+    },
+
     runStart(stats) {
       append({ op: 'run_start', ...stats });
     },
