@@ -47,6 +47,13 @@ export async function checkAndForward(message, client, rules, opts = {}) {
   for (const rule of rules) {
     const matched = rule.patterns.some(p => compilePattern(p).test(haystack));
     if (matched) {
+      // Read-only accounts (see readonly-guard.js) are never forwarded from. Decline
+      // rather than throw: a throw would fail the message, retry it, and quarantine
+      // (drop) it — the mail should just stay put and be processed normally.
+      if (client.readOnly) {
+        console.error(`    [readonly-guard] DENIED forward of ${message.id} — account is read-only (rule: ${rule.label})`);
+        return { forwarded: false, denied: true, rule: rule.label };
+      }
       if (dryRun) {
         console.log(`    [DRY] would forward to ${rule.target} (rule: ${rule.label})`);
         return { forwarded: true, target: rule.target, rule: rule.label, dryRun: true };

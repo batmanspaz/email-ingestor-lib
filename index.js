@@ -2,7 +2,8 @@
  * email-ingestor-lib — Shared library for per-entity email ingestors
  *
  * Exports:
- *   GmailClient  — OAuth2 Gmail API client (refresh-token based)
+ *   GmailClient  — OAuth2 Gmail API client (refresh-token based); readOnly:true
+ *     makes every Gmail write throw ReadOnlyAccountError (readonly-guard.js)
  *   poll         — incremental poll loop using Gmail history API
  *   checkAndForward — apply forward rules and forward misrouted emails
  *   createLogger — entity-specific JSONL logger
@@ -19,6 +20,7 @@
 export { GmailClient } from './gmail.js';
 export { poll } from './poll.js';
 export { checkAndForward } from './forward.js';
+export { ReadOnlyAccountError, guardGmailApi, READ_VERBS } from './readonly-guard.js';
 export { createLogger } from './log.js';
 export { maskEmail, maskFrom, redact } from './mask.js';
 export { shouldRunSluiceProducer, resolveSluiceGate, computeSluiceGateCheck } from './sluice-flag.js';

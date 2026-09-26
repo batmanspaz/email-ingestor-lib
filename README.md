@@ -17,6 +17,13 @@ import { GmailClient, poll, checkAndForward, createLogger } from '../../../share
 - **poll.js** — Incremental poll loop using Gmail history API, dedupes by Message-ID
 - **forward.js** — Apply per-entity forward rules, forward misrouted emails
 - **log.js** — Append-only JSONL logger per entity
+- **readonly-guard.js** — Enforced read-only accounts. `new GmailClient({ ..., readOnly: true })` or
+  `GmailClient.fromTokenFile(addr, entity, { readOnly: true })` wraps the raw googleapis client so ONLY
+  `get` / `list` / `getProfile` calls go through; every other Gmail call (modify, batchModify, trash,
+  send, drafts, labels, settings, watch, and any method added later) throws `ReadOnlyAccountError`
+  (`code: 'READ_ONLY_ACCOUNT'`) and is logged with the address masked. `poll()` never batch-archives a
+  readOnly client and `checkAndForward()` declines to forward from one. Use it for any mailbox that must
+  never be modified by ingestion (e.g. emilee.stone@collagesoup.com).
 
 ## Auth
 

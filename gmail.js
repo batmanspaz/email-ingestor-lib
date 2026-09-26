@@ -13,6 +13,7 @@ import { google } from 'googleapis';
 import fs from 'fs';
 import path from 'path';
 import os from 'os';
+import { guardGmailApi, denyWrite } from './readonly-guard.js';
 
 const CRED_DIR = path.join(os.homedir(), 'claude/shared/config/credentials');
 const CLIENT_FILE = path.join(CRED_DIR, 'conductor_paul_client.json');
@@ -114,6 +115,11 @@ export class GmailClient {
    * @param {string} config.clientId      — OAuth2 client ID
    * @param {string} config.clientSecret  — OAuth2 client secret
    * @param {string} [config.entity]      — entity name for logging
+   * @param {boolean} [config.readOnly]   — when true, every Gmail state change
+   *   (modify/batchModify/trash/send/drafts/labels/settings/…) is refused with a
+   *   ReadOnlyAccountError; only get/list/getProfile calls go through. Enforced on
+   *   the raw googleapis client (this._gmail), so it also stops callers that
+   *   bypass the GmailClient methods. See readonly-guard.js.
    */
   constructor(config) {
     if (!config?.account) throw new Error('GmailClient: account required');
@@ -126,7 +132,9 @@ export class GmailClient {
 
     this._oauth2 = new google.auth.OAuth2(config.clientId, config.clientSecret);
     this._oauth2.setCredentials({ refresh_token: config.refreshToken });
-    this._gmail = google.gmail({ version: 'v1', auth: this._oauth2 });
+    this.readOnly = config.readOnly === true;
+    const gmail = google.gmail({ version: 'v1', auth: this._oauth2 });
+    this._gmail = this.readOnly ? guardGmailApi(gmail, this.account) : gmail;
   }
 
   /**
@@ -138,9 +146,11 @@ export class GmailClient {
    *
    * @param {string} account — email address (e.g. paulallensteinberg@gmail.com)
    * @param {string} [entity] — entity name for logging
+   * @param {object} [opts]
+   * @param {boolean} [opts.readOnly=false] — refuse every Gmail write for this account
    * @returns {GmailClient}
    */
-  static fromTokenFile(account, entity) {
+  static fromTokenFile(account, entity, opts = {}) {
     // Load account token file FIRST — it may be self-describing about which
     // OAuth client minted it, which decides where the client creds come from.
     const tokenFile = path.join(CRED_DIR, `${account}.json`);
@@ -156,7 +166,7 @@ export class GmailClient {
 
     const { clientId, clientSecret } = resolveClientCredentials(tokenData, tokenFile);
 
-    return new GmailClient({ account, refreshToken, clientId, clientSecret, entity });
+    return new GmailClient({ account, refreshToken, clientId, clientSecret, entity, readOnly: opts?.readOnly === true });
   }
 
   /** Extract a header value from a Gmail message */
@@ -356,6 +366,8 @@ export class GmailClient {
 
   /** Forward a message to another address */
   async forwardEmail(messageId, toAddress) {
+    // Fail before the reads below — a read-only account can never send.
+    if (this.readOnly) denyWrite(this.account, 'users.messages.send (forwardEmail)');
     const original = await this.fetchMessage(messageId);
     const subject = GmailClient.getHeader(original, 'Subject');
     const from = GmailClient.getHeader(original, 'From');
