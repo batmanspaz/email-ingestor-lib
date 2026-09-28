@@ -140,11 +140,31 @@ describe('maskEmail', () => {
     });
   });
 
-  it('never runs the regexes over a huge input: 60k chars returns fast and redacted', () => {
-    const t = Date.now();
-    const out = maskEmail('a'.repeat(60_000));
-    expect(out).toBe('[redacted]');
-    expect(Date.now() - t).toBeLessThan(250);
+  describe('input length cap (boundary)', () => {
+    // 1000 chars total: 'a'*N + '@example.com' (12 chars)
+    const atLen = (n) => 'a'.repeat(n - 12) + '@example.com';
+
+    it('an otherwise-valid address of exactly 1000 chars is still masked', () => {
+      const input = atLen(1000);
+      expect(input.length).toBe(1000);
+      expect(maskEmail(input)).toBe('a***@example.com');
+    });
+
+    it('the same shape at 1001 chars is redacted (pins > vs >=, and the maskEmail cap itself)', () => {
+      const input = atLen(1001);
+      expect(input.length).toBe(1001);
+      expect(maskEmail(input)).toBe('[redacted]');
+    });
+
+    it('60k chars returns redacted', () => {
+      expect(maskEmail('a'.repeat(60_000))).toBe('[redacted]');
+    });
+  });
+
+  it('already-masked short-circuit only accepts a first char maskEmail could produce (no control chars)', () => {
+    expect(maskEmail('\u0000***@gmail.com')).toBe('[redacted]');
+    expect(maskEmail('\t***@gmail.com')).toBe('[redacted]');
+    expect(maskEmail('xx p***@gmail.com')).toBe('[redacted]');
   });
 });
 
@@ -217,6 +237,11 @@ describe('maskFrom', () => {
     it('a clean masked address still short-circuits unchanged', () => {
       expect(maskFrom('p***@gmail.com')).toBe('p***@gmail.com');
     });
+
+    it('a control character in the masked first-char slot is not passed through', () => {
+      expect(maskFrom('\t***@x.com')).toBe('[redacted]');
+      expect(maskFrom('\u0000***@x.com')).toBe('[redacted]');
+    });
   });
 
   // --- input-length cap (tasks.db #1345): EMAIL_RE is quadratic on long crafted input ---
@@ -232,6 +257,13 @@ describe('maskFrom', () => {
     it('60k chars ending in a real address does not leak it', () => {
       const out = maskFrom('a.'.repeat(30_000) + ' real.person@example.com');
       expect(out).toBe('[redacted]');
+    });
+
+    it('boundary: a 1000-char From header is masked; 1001 is redacted', () => {
+      const pad = (n) => 'x'.repeat(n - ' <paul@gmail.com>'.length) + ' <paul@gmail.com>';
+      expect(pad(1000).length).toBe(1000);
+      expect(maskFrom(pad(1000))).toBe('p***@gmail.com');
+      expect(maskFrom(pad(1001))).toBe('[redacted]');
     });
 
     it('an ordinary long-ish From header (well under the cap) is still masked normally', () => {

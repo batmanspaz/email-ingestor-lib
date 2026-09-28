@@ -38,7 +38,7 @@ const SINGLE_ADDRESS_RE = new RegExp(`^${LOCAL}@${DOMAIN}$`);
 // MUST stay fully anchored (^...$): a loosened pattern would let a real
 // address ride through behind a masked prefix. Pinned by the "already-masked
 // short-circuit stays anchored" tests in tests/mask.test.js.
-const ALREADY_MASKED_RE = new RegExp(`^.\\*\\*\\*@${DOMAIN}$`);
+const ALREADY_MASKED_RE = new RegExp(`^[A-Za-z0-9._%+-]\\*\\*\\*@${DOMAIN}$`);
 
 /**
  * Mask a bare email address.
@@ -71,6 +71,10 @@ export function maskEmail(email) {
  * Example: "Paul Steinberg" <paul.steinberg@gmail.com> → p***@gmail.com
  *
  * Idempotent: calling this again on its own output is a no-op.
+ *
+ * Fails closed: input longer than 1000 chars is returned as '[redacted]'
+ * without running any regex (tasks.db #1345). The domain is deliberately kept
+ * in the output — note a personal domain is itself identifying.
  *
  * @param {*} from — raw From header value
  * @returns {*} masked sender, or the original value if not a string
