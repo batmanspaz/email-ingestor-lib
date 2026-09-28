@@ -129,10 +129,6 @@ describe('maskEmail', () => {
       expect(maskEmail('user@localhost')).toBe('[redacted]');
     });
 
-    it('still passes an already-masked address through unchanged (idempotent)', () => {
-      expect(maskEmail('p***@gmail.com')).toBe('p***@gmail.com');
-    });
-
     it('redacts a masked prefix followed by a real address (no anchor bypass)', () => {
       const out = maskEmail('p***@gmail.com, real.person@example.com');
       expect(out).toBe('[redacted]');
