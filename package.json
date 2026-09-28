@@ -4,6 +4,9 @@
   "description": "Shared email ingestor library — poll, forward, log for all entity ingestors",
   "type": "module",
   "main": "index.js",
+  "engines": {
+    "node": ">=20.3"
+  },
   "scripts": {
     "test": "vitest run --dir tests"
   },

@@ -36,6 +36,34 @@
 
 import { maskEmail } from './mask.js';
 
+/** An optional caller-supplied account label is cut to this many characters. */
+export const MAX_ACCOUNT_LABEL_LEN = 64;
+
+/**
+ * Normalise an optional, NON-PII account label (callers pass their config label, e.g.
+ * 'emilee-stone'). Two different mailboxes can mask to the same string, so the masked address alone
+ * does not say WHICH mailbox needs attention. Anything that is not a non-empty string is treated as
+ * absent; the rest is cut to MAX_ACCOUNT_LABEL_LEN (+ '…') and every character outside
+ * [A-Za-z0-9 ._:@/…-] becomes '?' (so it is idempotent), so caller text cannot inject control characters into a log line.
+ * @param {unknown} label
+ * @returns {string|undefined}
+ */
+export function safeAccountLabel(label) {
+  if (typeof label !== 'string' || label.length === 0) return undefined;
+  const clean = label.slice(0, MAX_ACCOUNT_LABEL_LEN).replace(/[^A-Za-z0-9 ._:@/…-]/g, '?');
+  return label.length > MAX_ACCOUNT_LABEL_LEN ? `${clean}…` : clean;
+}
+
+/** 'a***@x.com' or, with a label, 'a***@x.com, label pc-billing'. */
+function describeAccount(account, label) {
+  return label ? `${maskEmail(account)}, label ${label}` : maskEmail(account);
+}
+
+/** Set err.accountLabel only when a label was given (property stays absent otherwise). */
+function attachLabel(err, label) {
+  if (label) err.accountLabel = label;
+}
+
 /** The only API verbs a read-only account may call. */
 export const READ_VERBS = new Set(['get', 'list', 'getProfile']);
 
@@ -43,12 +71,15 @@ export class ReadOnlyAccountError extends Error {
   /**
    * @param {string} account — address of the protected mailbox (masked in the message)
    * @param {string} op — API path that was refused, e.g. "users.messages.modify"
+   * @param {string} [accountLabel] — optional non-PII label (see safeAccountLabel)
    */
-  constructor(account, op) {
-    super(`READ-ONLY account (${maskEmail(account)}): refused Gmail write ${op}`);
+  constructor(account, op, accountLabel) {
+    const label = safeAccountLabel(accountLabel);
+    super(`READ-ONLY account (${describeAccount(account, label)}): refused Gmail write ${op}`);
     this.name = 'ReadOnlyAccountError';
     this.code = 'READ_ONLY_ACCOUNT';
     this.op = op;
+    attachLabel(this, label);
   }
 }
 
@@ -92,21 +123,27 @@ export class ReadOnlyScopeError extends Error {
    *   capped + cleaned by safeScopeList before they reach the message or the field)
    * @param {string} [reason] — fixed text; a caller that echoes scopes in it must pass them
    *   through safeScopeList first
+   * @param {string} [accountLabel] — optional non-PII label (see safeAccountLabel)
    */
-  constructor(account, unexpected = [], reason = '') {
+  constructor(account, unexpected = [], reason = '', accountLabel) {
     const masked = maskEmail(account);
+    const label = safeAccountLabel(accountLabel);
     const shown = safeScopeList(unexpected);
     const detail = reason || (shown.length
       ? `token grants scopes beyond gmail.readonly: ${shown.join(', ')}`
       : 'token does not grant exactly gmail.readonly');
     super(
-      `READ-ONLY account (${masked}): refusing to build client — ${detail}. ` +
+      `READ-ONLY account (${describeAccount(account, label)}): refusing to build client — ${detail}. ` +
       'Re-authorize with gmail.readonly ONLY (scripts/reauth-readonly.py).',
     );
     this.name = 'ReadOnlyScopeError';
     this.code = 'READ_ONLY_SCOPE_MISMATCH';
     this.account = masked;
+    // DISPLAY-ONLY: capped, cleaned, and possibly ending in a synthetic '(+N more)' entry — never a
+    // parseable scope list. The true number of offending scopes is unexpectedScopeCount.
     this.unexpectedScopes = shown;
+    this.unexpectedScopeCount = Array.isArray(unexpected) ? unexpected.length : 0;
+    attachLabel(this, label);
   }
 }
 
@@ -120,12 +157,15 @@ export class TokenFileInvalidError extends Error {
   /**
    * @param {string} account — address (masked in message)
    * @param {string} reason — fixed, secret-free text, e.g. 'token file is not valid JSON'
+   * @param {string} [accountLabel] — optional non-PII label (see safeAccountLabel)
    */
-  constructor(account, reason) {
-    super(`${maskEmail(account)}: ${reason} — re-run the OAuth flow for this account`);
+  constructor(account, reason, accountLabel) {
+    const label = safeAccountLabel(accountLabel);
+    super(`${describeAccount(account, label)}: ${reason} — re-run the OAuth flow for this account`);
     this.name = 'TokenFileInvalidError';
     this.code = 'TOKEN_FILE_INVALID';
     this.account = maskEmail(account);
+    attachLabel(this, label);
   }
 }
 
@@ -135,12 +175,17 @@ export class TokenFileInvalidError extends Error {
  * unmasked address).
  */
 export class TokenFileMissingError extends Error {
-  /** @param {string} account — address (masked in message + field) */
-  constructor(account) {
-    super(`${maskEmail(account)}: token file not found — run the OAuth flow for this account`);
+  /**
+   * @param {string} account — address (masked in message + field)
+   * @param {string} [accountLabel] — optional non-PII label (see safeAccountLabel)
+   */
+  constructor(account, accountLabel) {
+    const label = safeAccountLabel(accountLabel);
+    super(`${describeAccount(account, label)}: token file not found — run the OAuth flow for this account`);
     this.name = 'TokenFileMissingError';
     this.code = 'TOKEN_FILE_MISSING';
     this.account = maskEmail(account);
+    attachLabel(this, label);
   }
 }
 
@@ -149,12 +194,17 @@ export class TokenFileMissingError extends Error {
  * refresh_token. Per-account; masked address only, no path.
  */
 export class RefreshTokenMissingError extends Error {
-  /** @param {string} account — address (masked in message + field) */
-  constructor(account) {
-    super(`${maskEmail(account)}: token file has no refresh_token — re-run the OAuth flow for this account`);
+  /**
+   * @param {string} account — address (masked in message + field)
+   * @param {string} [accountLabel] — optional non-PII label (see safeAccountLabel)
+   */
+  constructor(account, accountLabel) {
+    const label = safeAccountLabel(accountLabel);
+    super(`${describeAccount(account, label)}: token file has no refresh_token — re-run the OAuth flow for this account`);
     this.name = 'RefreshTokenMissingError';
     this.code = 'REFRESH_TOKEN_MISSING';
     this.account = maskEmail(account);
+    attachLabel(this, label);
   }
 }
 
@@ -166,11 +216,20 @@ export class RefreshTokenMissingError extends Error {
  * Like TokenFileInvalidError it carries no parser text, no `cause` and no path.
  */
 export class OAuthClientFileError extends Error {
-  /** @param {string} reason — fixed, secret-free text, e.g. 'is not valid JSON' */
-  constructor(reason) {
-    super(`shared OAuth client file ${reason} — every account without its own OAuth client is affected`);
+  /**
+   * @param {string} reason — fixed, secret-free text, e.g. 'is not valid JSON'
+   * @param {string} [accountLabel] — optional non-PII label of the account whose load hit it
+   *   (see safeAccountLabel); the failure itself is shared, but the log should say who tripped it
+   */
+  constructor(reason, accountLabel) {
+    const label = safeAccountLabel(accountLabel);
+    super(
+      `shared OAuth client file ${reason}${label ? ` (hit while loading account label ${label})` : ''} — ` +
+      'every account without its own OAuth client is affected',
+    );
     this.name = 'OAuthClientFileError';
     this.code = 'OAUTH_CLIENT_FILE_INVALID';
+    attachLabel(this, label);
   }
 }
 
@@ -219,10 +278,11 @@ export function emitDenial(op, account, attempted) {
  * methods (forwardEmail) that would otherwise do wasted reads before their write.
  * @param {string} account
  * @param {string} op
+ * @param {string} [accountLabel] — optional non-PII label
  * @returns {never}
  */
-export function denyWrite(account, op) {
-  const err = new ReadOnlyAccountError(account, op);
+export function denyWrite(account, op, accountLabel) {
+  const err = new ReadOnlyAccountError(account, op, accountLabel);
   console.error(`[readonly-guard] DENIED ${err.message}`);
   emitDenial('readonly_denied', account, op);
   throw err;
@@ -388,9 +448,10 @@ const BLOCKED_PROPS = new Set(['context', '_options', 'auth', 'google', 'options
  *
  * @param {object} gmail — google.gmail({version:'v1'}) client
  * @param {string} account — the address it belongs to (for the error/log line)
+ * @param {string} [accountLabel] — optional non-PII label included in denial errors
  * @returns {object} a Proxy with the same shape as `gmail`
  */
-export function guardGmailApi(gmail, account) {
+export function guardGmailApi(gmail, account, accountLabel) {
   // The Proxy target is an empty shell, NOT the real object: googleapis defines e.g.
   // `users` as a read-only non-configurable property, and a get-trap may not return a
   // different value for such a property on its target (TypeError). Reads are routed
@@ -400,15 +461,15 @@ export function guardGmailApi(gmail, account) {
       get(_shell, prop) {
         if (typeof prop === 'symbol') return Reflect.get(obj, prop, obj);
         const here = [...pathParts, prop];
-        if (BLOCKED_PROPS.has(prop)) denyWrite(account, `${here.join('.')} (googleapis internals)`);
+        if (BLOCKED_PROPS.has(prop)) denyWrite(account, `${here.join('.')} (googleapis internals)`, accountLabel);
         const value = Reflect.get(obj, prop, obj);
         if (typeof value === 'function') {
           return (...args) => {
             if (!READ_VERBS.has(prop)) {
-              denyWrite(account, here.join('.'));
+              denyWrite(account, here.join('.'), accountLabel);
             }
             const safe = sanitizeReadArgs(args);
-            if (safe.why) denyWrite(account, `${here.join('.')} with unsafe arguments (${safe.why})`);
+            if (safe.why) denyWrite(account, `${here.join('.')} with unsafe arguments (${safe.why})`, accountLabel);
             // Resource methods rely on `this` (e.g. this.context) — call on the real object,
             // with the sanitised COPIES only (never the caller's objects: TOCTOU).
             return value.apply(obj, safe.args);
