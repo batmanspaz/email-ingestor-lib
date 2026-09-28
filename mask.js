@@ -6,8 +6,24 @@
  * same way and there is a single place to harden.
  */
 
+// Longest input any function here will run a regex over. A real From header
+// is well under 1 KB; EMAIL_RE is quadratic on long crafted input (~3s on 60k
+// chars, measured 2026-09-27), so anything longer is redacted outright —
+// fail closed rather than scan (tasks.db #1345).
+const MAX_INPUT_LEN = 1000;
+
+const REDACTED = '[redacted]';
+
+// Single source of truth for the domain grammar, shared by every pattern below
+// so a future widening (e.g. IDN support) cannot desync them.
+const DOMAIN = '[A-Za-z0-9.-]+\\.[A-Za-z]{2,}';
+const LOCAL = '[A-Za-z0-9._%+-]+';
+
 // Matches a plain email address anywhere inside a larger string.
-const EMAIL_RE = /[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}/;
+const EMAIL_RE = new RegExp(`${LOCAL}@${DOMAIN}`);
+
+// Matches a string that is exactly ONE plain address and nothing else.
+const SINGLE_ADDRESS_RE = new RegExp(`^${LOCAL}@${DOMAIN}$`);
 
 // Matches maskEmail()'s own output format (e.g. "p***@gmail.com"). EMAIL_RE's
 // local-part character class does not include "*", so an already-masked
@@ -18,21 +34,33 @@ const EMAIL_RE = /[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}/;
 // that re-mask a value — e.g. a retried log write — would silently see it
 // mutate from a stable masked address to a different, less informative
 // constant).
-const ALREADY_MASKED_RE = /^.\*\*\*@[A-Za-z0-9.-]+\.[A-Za-z]{2,}$/;
+//
+// MUST stay fully anchored (^...$): a loosened pattern would let a real
+// address ride through behind a masked prefix. Pinned by the "already-masked
+// short-circuit stays anchored" tests in tests/mask.test.js.
+const ALREADY_MASKED_RE = new RegExp(`^[A-Za-z0-9._%+-]\\*\\*\\*@${DOMAIN}$`);
 
 /**
  * Mask a bare email address.
  * Returns first char of the local part + "***@" + domain.
  * Example: paul.steinberg@gmail.com → p***@gmail.com
  *
+ * Fails closed: the ENTIRE input must be exactly one plain address (or
+ * maskEmail's own already-masked output, returned unchanged). Anything else —
+ * a display name, a comma-separated list, "a@b@c.com", surrounding
+ * whitespace, over-long input — returns '[redacted]' rather than leaving PII
+ * in place (tasks.db #1345). Callers holding a full header should use
+ * maskFrom(), which extracts the address first.
+ *
  * @param {*} email
- * @returns {*} masked string, or the original value if not a maskable string
+ * @returns {*} masked string, '[redacted]', or the original value if not a string
  */
 export function maskEmail(email) {
   if (!email || typeof email !== 'string') return email;
-  const atIdx = email.indexOf('@');
-  if (atIdx < 1) return email;
-  return email[0] + '***@' + email.slice(atIdx + 1);
+  if (email.length > MAX_INPUT_LEN) return REDACTED;
+  if (ALREADY_MASKED_RE.test(email)) return email;
+  if (!SINGLE_ADDRESS_RE.test(email)) return REDACTED;
+  return email[0] + '***@' + email.slice(email.indexOf('@') + 1);
 }
 
 /**
@@ -44,14 +72,19 @@ export function maskEmail(email) {
  *
  * Idempotent: calling this again on its own output is a no-op.
  *
+ * Fails closed: input longer than 1000 chars is returned as '[redacted]'
+ * without running any regex (tasks.db #1345). The domain is deliberately kept
+ * in the output — note a personal domain is itself identifying.
+ *
  * @param {*} from — raw From header value
  * @returns {*} masked sender, or the original value if not a string
  */
 export function maskFrom(from) {
   if (!from || typeof from !== 'string') return from;
+  if (from.length > MAX_INPUT_LEN) return REDACTED;
   if (ALREADY_MASKED_RE.test(from)) return from;
   const m = from.match(EMAIL_RE);
-  if (!m) return '[redacted]';
+  if (!m) return REDACTED;
   return maskEmail(m[0]);
 }
 

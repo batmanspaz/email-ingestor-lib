@@ -78,15 +78,12 @@ describe('maskEmail', () => {
 
   // --- edge cases specific to a PII masker ---
 
-  it('returns a string with no "@" unchanged (nothing to mask)', () => {
-    expect(maskEmail('not-an-email')).toBe('not-an-email');
+  it('redacts a string with no "@" (fail closed: not one clean address, tasks.db #1345)', () => {
+    expect(maskEmail('not-an-email')).toBe('[redacted]');
   });
 
-  it('returns a string starting with "@" unchanged (no local part to redact)', () => {
-    // atIdx === 0 fails the `atIdx < 1` guard the same way "no @" does.
-    // Documents current behavior: there is no local-part character to keep,
-    // so the whole (already address-less) string passes through.
-    expect(maskEmail('@nodomain.com')).toBe('@nodomain.com');
+  it('redacts a string starting with "@" (no local part; not one clean address)', () => {
+    expect(maskEmail('@nodomain.com')).toBe('[redacted]');
   });
 
   it('idempotency: masking an already-masked address twice is a no-op', () => {
@@ -96,10 +93,74 @@ describe('maskEmail', () => {
     expect(twice).toBe('p***@gmail.com');
   });
 
-  it('handles a local part containing a second "@" by splitting on the first one', () => {
-    // Documents current (first-@-wins) behavior rather than asserting an
-    // "ideal" parse — this input isn't a valid single address to begin with.
-    expect(maskEmail('a@b@c.com')).toBe('a***@b@c.com');
+  it('redacts a malformed address with a second "@" instead of leaking the tail (tasks.db #1345)', () => {
+    expect(maskEmail('a@b@c.com')).toBe('[redacted]');
+  });
+
+  // --- tasks.db #1345: maskEmail must fail closed on anything but ONE clean address ---
+
+  describe('fail-closed on anything other than a single clean address', () => {
+    it('redacts a comma-separated list (previously leaked every address after the first)', () => {
+      const out = maskEmail('a@b.com, c@d.com');
+      expect(out).toBe('[redacted]');
+      expect(out).not.toContain('c@d.com');
+    });
+
+    it('redacts a display name on its own', () => {
+      expect(maskEmail('Paul Steinberg')).toBe('[redacted]');
+    });
+
+    it('redacts a display-name-wrapped address (name is PII too)', () => {
+      const out = maskEmail('"Paul Steinberg" <paul.steinberg@gmail.com>');
+      expect(out).toBe('[redacted]');
+      expect(out).not.toContain('Steinberg');
+    });
+
+    it('redacts leading/trailing whitespace around an address (input must be exactly one address)', () => {
+      expect(maskEmail(' paul@gmail.com')).toBe('[redacted]');
+      expect(maskEmail('paul@gmail.com ')).toBe('[redacted]');
+    });
+
+    it('redacts an address followed by a newline and a second address', () => {
+      expect(maskEmail('a@b.com\nc@d.com')).toBe('[redacted]');
+    });
+
+    it('redacts a domain with no TLD, consistent with maskFrom', () => {
+      expect(maskEmail('user@localhost')).toBe('[redacted]');
+    });
+
+    it('redacts a masked prefix followed by a real address (no anchor bypass)', () => {
+      const out = maskEmail('p***@gmail.com, real.person@example.com');
+      expect(out).toBe('[redacted]');
+      expect(out).not.toContain('real.person');
+    });
+  });
+
+  describe('input length cap (boundary)', () => {
+    // 1000 chars total: 'a'*N + '@example.com' (12 chars)
+    const atLen = (n) => 'a'.repeat(n - 12) + '@example.com';
+
+    it('an otherwise-valid address of exactly 1000 chars is still masked', () => {
+      const input = atLen(1000);
+      expect(input.length).toBe(1000);
+      expect(maskEmail(input)).toBe('a***@example.com');
+    });
+
+    it('the same shape at 1001 chars is redacted (pins > vs >=, and the maskEmail cap itself)', () => {
+      const input = atLen(1001);
+      expect(input.length).toBe(1001);
+      expect(maskEmail(input)).toBe('[redacted]');
+    });
+
+    it('60k chars returns redacted', () => {
+      expect(maskEmail('a'.repeat(60_000))).toBe('[redacted]');
+    });
+  });
+
+  it('already-masked short-circuit only accepts a first char maskEmail could produce (no control chars)', () => {
+    expect(maskEmail('\u0000***@gmail.com')).toBe('[redacted]');
+    expect(maskEmail('\t***@gmail.com')).toBe('[redacted]');
+    expect(maskEmail('xx p***@gmail.com')).toBe('[redacted]');
   });
 });
 
@@ -131,6 +192,80 @@ describe('maskFrom', () => {
     expect(out).toBe('a***@b.com');
     expect(out).not.toContain('c@d.com');
     expect(out).not.toContain('d.com');
+  });
+
+  // --- ALREADY_MASKED_RE anchor regression (tasks.db #1345) ---
+  //
+  // The idempotency short-circuit must stay anchored (^...$). If a future edit
+  // loosens it, a real trailing address could ride through behind a masked
+  // prefix while the rest of the suite stays green. These pin the anchor.
+  describe('already-masked short-circuit stays anchored', () => {
+    it('masked prefix + trailing REAL address: the real one is masked, never passed through', () => {
+      const out = maskFrom('p***@gmail.com, real.person@example.com');
+      expect(out).not.toContain('real.person');
+      expect(out).toBe('r***@example.com');
+    });
+
+    it('masked address followed by junk and a real address does not short-circuit', () => {
+      const out = maskFrom('p***@gmail.com real.person@example.com');
+      expect(out).not.toContain('real.person');
+    });
+
+    it('display-name-wrapped masked form is NOT treated as already-masked (name is dropped)', () => {
+      const out = maskFrom('"Paul Steinberg" <p***@gmail.com>');
+      expect(out).toBe('[redacted]');
+      expect(out).not.toContain('Steinberg');
+    });
+
+    it('leading whitespace before a masked address is not treated as already-masked', () => {
+      expect(maskFrom(' p***@gmail.com')).toBe('[redacted]');
+    });
+
+    it('trailing whitespace after a masked address is not treated as already-masked', () => {
+      expect(maskFrom('p***@gmail.com ')).toBe('[redacted]');
+    });
+
+    it('a masked address with a real address on the next line does not short-circuit', () => {
+      const out = maskFrom('p***@gmail.com\nreal.person@example.com');
+      expect(out).not.toContain('real.person');
+    });
+
+    it('a clean masked address still short-circuits unchanged', () => {
+      expect(maskFrom('p***@gmail.com')).toBe('p***@gmail.com');
+    });
+
+    it('a control character in the masked first-char slot is not passed through', () => {
+      expect(maskFrom('\t***@x.com')).toBe('[redacted]');
+      expect(maskFrom('\u0000***@x.com')).toBe('[redacted]');
+    });
+  });
+
+  // --- input-length cap (tasks.db #1345): EMAIL_RE is quadratic on long crafted input ---
+
+  describe('input length cap', () => {
+    it('60k chars of crafted input returns fast and fully redacted', () => {
+      const t = Date.now();
+      const out = maskFrom('a'.repeat(60_000));
+      expect(out).toBe('[redacted]');
+      expect(Date.now() - t).toBeLessThan(250);
+    });
+
+    it('60k chars ending in a real address does not leak it', () => {
+      const out = maskFrom('a.'.repeat(30_000) + ' real.person@example.com');
+      expect(out).toBe('[redacted]');
+    });
+
+    it('boundary: a 1000-char From header is masked; 1001 is redacted', () => {
+      const pad = (n) => 'x'.repeat(n - ' <paul@gmail.com>'.length) + ' <paul@gmail.com>';
+      expect(pad(1000).length).toBe(1000);
+      expect(maskFrom(pad(1000))).toBe('p***@gmail.com');
+      expect(maskFrom(pad(1001))).toBe('[redacted]');
+    });
+
+    it('an ordinary long-ish From header (well under the cap) is still masked normally', () => {
+      const name = 'N'.repeat(200);
+      expect(maskFrom(`"${name}" <paul@gmail.com>`)).toBe('p***@gmail.com');
+    });
   });
 
   // --- null / undefined / non-string passthrough ---
