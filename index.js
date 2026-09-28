@@ -22,6 +22,7 @@ export { poll } from './poll.js';
 export { checkAndForward } from './forward.js';
 export {
   ReadOnlyAccountError, ReadOnlyScopeError, TokenFileInvalidError, guardGmailApi, READ_VERBS, READONLY_SCOPE, setReadOnlyDenialSink,
+  TokenFileMissingError, RefreshTokenMissingError, OAuthClientFileError, PER_ACCOUNT_TOKEN_ERROR_CODES,
 } from './readonly-guard.js';
 export { createLogger } from './log.js';
 export { maskEmail, maskFrom, redact } from './mask.js';

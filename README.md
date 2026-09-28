@@ -41,6 +41,26 @@ import { GmailClient, poll, checkAndForward, createLogger } from '../../../share
      request is made. Per-account: a caller can skip just that account.
      A token file that is not valid JSON throws `TokenFileInvalidError` naming only the masked address
      — never the parser's message, which can quote a bare token value.
+     Offending scope strings echoed into a `ReadOnlyScopeError` (message and `unexpectedScopes`) are
+     capped — at most `MAX_ECHOED_SCOPES`, each cut to `MAX_ECHOED_SCOPE_LEN`, odd characters replaced
+     with `?` — since they come from a file or from Google, not from this code.
+
+  **`fromTokenFile()` error codes** — every one names only the masked address and never a path:
+
+  | code | class | scope |
+  |---|---|---|
+  | `TOKEN_FILE_MISSING` | `TokenFileMissingError` | one account |
+  | `TOKEN_FILE_INVALID` | `TokenFileInvalidError` | one account |
+  | `REFRESH_TOKEN_MISSING` | `RefreshTokenMissingError` | one account |
+  | `READ_ONLY_SCOPE_MISMATCH` | `ReadOnlyScopeError` | one account |
+  | `OAUTH_CLIENT_FILE_INVALID` | `OAuthClientFileError` | **shared** — every account without its own OAuth client |
+
+  `PER_ACCOUNT_TOKEN_ERROR_CODES` lists the four per-account codes a multi-account runtime may skip
+  while the others continue; the shared client-file failure is deliberately not in it.
+
+  Per-call `timeout` must be a finite number in `[0, MAX_TIMEOUT_MS]` (the setTimeout ceiling). A
+  `signal` must be an AbortSignal, and googleapis receives a fresh `AbortSignal.any([signal])`, never
+  the caller's object (Node's brand check does not reject a Proxy around a real signal).
   4. **Read-only token (the real backstop)** — a `gmail.readonly`-only refresh token is refused by Google
      for every write, whatever code runs in the process. Layers 1-3 keep honest code honest and fail
      loudly; they cannot contain code that already holds a broader token, which is why layer 3 refuses

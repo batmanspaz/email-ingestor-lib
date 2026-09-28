@@ -55,6 +55,31 @@ export class ReadOnlyAccountError extends Error {
 /** The only scope a readOnly account's token may have been granted. */
 export const READONLY_SCOPE = 'https://www.googleapis.com/auth/gmail.readonly';
 
+/** At most this many offending scopes are echoed into an error (the rest are counted). */
+export const MAX_ECHOED_SCOPES = 5;
+/** Each echoed scope is cut to this many characters (real scope URLs are well under it). */
+export const MAX_ECHOED_SCOPE_LEN = 100;
+
+/**
+ * Make offending scope strings safe to put in an error message / log line. They come from a
+ * token file or from Google's refresh response — not from this code — so: each is cut to
+ * MAX_ECHOED_SCOPE_LEN (+ '…'), every character outside the URL-ish set a scope uses is
+ * replaced with '?' (no control characters, newlines or terminal escapes), and only the first
+ * MAX_ECHOED_SCOPES are kept, followed by a '(+N more)' count.
+ * @param {unknown} scopes
+ * @returns {string[]}
+ */
+export function safeScopeList(scopes) {
+  const list = Array.isArray(scopes) ? scopes : [];
+  const out = list.slice(0, MAX_ECHOED_SCOPES).map((s) => {
+    if (typeof s !== 'string') return '?';
+    const clean = s.slice(0, MAX_ECHOED_SCOPE_LEN).replace(/[^A-Za-z0-9:/._~+=&%?#@-]/g, '?');
+    return s.length > MAX_ECHOED_SCOPE_LEN ? `${clean}…` : clean;
+  });
+  if (list.length > MAX_ECHOED_SCOPES) out.push(`(+${list.length - MAX_ECHOED_SCOPES} more)`);
+  return out;
+}
+
 /**
  * Thrown by GmailClient.fromTokenFile({readOnly:true}) when the token file's scopes
  * are not EXACTLY [gmail.readonly]. Per-account and typed so a runtime can skip just
@@ -63,13 +88,16 @@ export const READONLY_SCOPE = 'https://www.googleapis.com/auth/gmail.readonly';
 export class ReadOnlyScopeError extends Error {
   /**
    * @param {string} account — address (masked in message + field)
-   * @param {string[]} [unexpected] — offending scope URLs (not secret)
-   * @param {string} [reason]
+   * @param {string[]} [unexpected] — offending scope URLs (not secret, but not ours either:
+   *   capped + cleaned by safeScopeList before they reach the message or the field)
+   * @param {string} [reason] — fixed text; a caller that echoes scopes in it must pass them
+   *   through safeScopeList first
    */
   constructor(account, unexpected = [], reason = '') {
     const masked = maskEmail(account);
-    const detail = reason || (unexpected.length
-      ? `token grants scopes beyond gmail.readonly: ${unexpected.join(', ')}`
+    const shown = safeScopeList(unexpected);
+    const detail = reason || (shown.length
+      ? `token grants scopes beyond gmail.readonly: ${shown.join(', ')}`
       : 'token does not grant exactly gmail.readonly');
     super(
       `READ-ONLY account (${masked}): refusing to build client — ${detail}. ` +
@@ -78,7 +106,7 @@ export class ReadOnlyScopeError extends Error {
     this.name = 'ReadOnlyScopeError';
     this.code = 'READ_ONLY_SCOPE_MISMATCH';
     this.account = masked;
-    this.unexpectedScopes = unexpected;
+    this.unexpectedScopes = shown;
   }
 }
 
@@ -100,6 +128,60 @@ export class TokenFileInvalidError extends Error {
     this.account = maskEmail(account);
   }
 }
+
+/**
+ * Thrown by GmailClient.fromTokenFile() when the account's token file does not exist.
+ * Per-account. The message names only the masked address — never the path (it embeds the
+ * unmasked address).
+ */
+export class TokenFileMissingError extends Error {
+  /** @param {string} account — address (masked in message + field) */
+  constructor(account) {
+    super(`${maskEmail(account)}: token file not found — run the OAuth flow for this account`);
+    this.name = 'TokenFileMissingError';
+    this.code = 'TOKEN_FILE_MISSING';
+    this.account = maskEmail(account);
+  }
+}
+
+/**
+ * Thrown by GmailClient.fromTokenFile() when the account's token file parses but carries no
+ * refresh_token. Per-account; masked address only, no path.
+ */
+export class RefreshTokenMissingError extends Error {
+  /** @param {string} account — address (masked in message + field) */
+  constructor(account) {
+    super(`${maskEmail(account)}: token file has no refresh_token — re-run the OAuth flow for this account`);
+    this.name = 'RefreshTokenMissingError';
+    this.code = 'REFRESH_TOKEN_MISSING';
+    this.account = maskEmail(account);
+  }
+}
+
+/**
+ * Thrown by GmailClient.fromTokenFile() when the SHARED OAuth client file (used by every token
+ * that names no client of its own) is missing, unparseable or lacks a client_id/client_secret
+ * pair. NOT per-account: every account relying on it is equally broken, so it carries its own
+ * code rather than TOKEN_FILE_INVALID (which a runtime may treat as "skip this one account").
+ * Like TokenFileInvalidError it carries no parser text, no `cause` and no path.
+ */
+export class OAuthClientFileError extends Error {
+  /** @param {string} reason — fixed, secret-free text, e.g. 'is not valid JSON' */
+  constructor(reason) {
+    super(`shared OAuth client file ${reason} — every account without its own OAuth client is affected`);
+    this.name = 'OAuthClientFileError';
+    this.code = 'OAUTH_CLIENT_FILE_INVALID';
+  }
+}
+
+/**
+ * fromTokenFile() error codes that concern ONE account (its token file / its scopes), which a
+ * multi-account runtime may choose to skip while the others continue. OAUTH_CLIENT_FILE_INVALID
+ * is deliberately absent: it is shared.
+ */
+export const PER_ACCOUNT_TOKEN_ERROR_CODES = Object.freeze([
+  'TOKEN_FILE_MISSING', 'REFRESH_TOKEN_MISSING', 'TOKEN_FILE_INVALID', 'READ_ONLY_SCOPE_MISMATCH',
+]);
 
 let denialSink = null;
 let sinkWarned = false;
@@ -165,7 +247,12 @@ const isPrimitive = (v) => v === null || v === undefined || ['string', 'number',
 /** Upper bound on an array-valued param (labelIds / metadataHeaders / historyTypes are tiny). */
 const MAX_ARRAY_PARAM = 100;
 
-/** A real AbortSignal (brand-checked via its internal slot; a Proxy or look-alike throws). */
+/**
+ * An AbortSignal (brand-checked through the `aborted` getter: a look-alike object throws).
+ * NOT proof the value is un-proxied: Node implements that getter in JS, so a Proxy around a
+ * real signal passes. Harmless (a signal can only abort), but the caller's object is still never
+ * handed on — copyOptions stores a fresh AbortSignal.any([v]) that follows it (OPTION_COPY).
+ */
 function isRealAbortSignal(v) {
   try {
     const desc = Object.getOwnPropertyDescriptor(AbortSignal.prototype, 'aborted');
@@ -176,12 +263,22 @@ function isRealAbortSignal(v) {
   }
 }
 
+/** Largest timeout a read may carry: the setTimeout ceiling (2^31 - 1 ms, ~24.8 days). Beyond
+ *  it Node fires after 1 ms instead; negative / NaN / Infinity make the transport throw. */
+export const MAX_TIMEOUT_MS = 2 ** 31 - 1;
+
 /** Per-option value validators — anything else is refused. */
 const OPTION_VALUE_OK = {
   signal: isRealAbortSignal,
-  timeout: (v) => typeof v === 'number',
+  timeout: (v) => typeof v === 'number' && Number.isFinite(v) && v >= 0 && v <= MAX_TIMEOUT_MS,
   responseType: (v) => typeof v === 'string',
   retry: (v) => typeof v === 'boolean' || typeof v === 'number',
+};
+
+/** Per-option transform applied to the validated value before it goes into the copy. */
+const OPTION_COPY = {
+  // A fresh signal this module creates, following the caller's — never the caller's object.
+  signal: (v) => AbortSignal.any([v]),
 };
 
 /** Every enumerable key, own AND inherited (googleapis deep-extends with for..in), plus symbols. */
@@ -236,7 +333,15 @@ function copyOptions(src) {
     if (!d || 'get' in d || 'set' in d) return { why: `option "${k}" is not a plain data property` };
     const v = src[k]; // the ONE read
     if (v !== undefined && !OPTION_VALUE_OK[k](v)) return { why: `option "${k}" has an unsafe value` };
-    copy[k] = v;
+    if (v !== undefined && OPTION_COPY[k]) {
+      try {
+        copy[k] = OPTION_COPY[k](v);
+      } catch {
+        return { why: `option "${k}" has an unsafe value` };
+      }
+    } else {
+      copy[k] = v;
+    }
   }
   return { copy };
 }

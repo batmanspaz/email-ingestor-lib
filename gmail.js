@@ -14,7 +14,8 @@ import fs from 'fs';
 import path from 'path';
 import os from 'os';
 import {
-  guardGmailApi, denyWrite, emitDenial, ReadOnlyScopeError, TokenFileInvalidError, READONLY_SCOPE,
+  guardGmailApi, denyWrite, emitDenial, ReadOnlyScopeError, TokenFileInvalidError, TokenFileMissingError,
+  RefreshTokenMissingError, OAuthClientFileError, READONLY_SCOPE, safeScopeList,
 } from './readonly-guard.js';
 
 const CRED_DIR = path.join(os.homedir(), 'claude/shared/config/credentials');
@@ -23,24 +24,23 @@ const CLIENT_FILE = path.join(CRED_DIR, 'conductor_paul_client.json');
 /**
  * Parse a credentials file WITHOUT ever surfacing the parser's message: a JSON.parse
  * SyntaxError quotes a slice of the malformed input, which can include a bare token or
- * client-secret value (Opus review, real leak). On any failure throw a typed error naming
- * only the masked address and a fixed reason — no cause, no parser text.
+ * client-secret value (Opus review, real leak). On any failure throw the typed error `fail`
+ * builds from a fixed reason — no cause, no parser text, no path.
  *
  * @param {string} text
- * @param {string} account
- * @param {string} what — 'token file' | 'OAuth client file' (fixed strings only)
+ * @param {(reason:string)=>Error} fail — e.g. r => new TokenFileInvalidError(account, `token file ${r}`)
  * @returns {object}
- * @throws {TokenFileInvalidError}
+ * @throws {TokenFileInvalidError|OAuthClientFileError}
  */
-function parseCredentialsJson(text, account, what) {
+function parseCredentialsJson(text, fail) {
   let data;
   try {
     data = JSON.parse(text);
   } catch {
-    throw new TokenFileInvalidError(account, `${what} is not valid JSON`);
+    throw fail('is not valid JSON');
   }
   if (typeof data !== 'object' || data === null || Array.isArray(data)) {
-    throw new TokenFileInvalidError(account, `${what} is not a JSON object`);
+    throw fail('is not a JSON object');
   }
   return data;
 }
@@ -83,23 +83,21 @@ function extractClientPair(creds) {
  * `unauthorized_client`, unrecoverable by waiting, and it took out live email
  * ingestion for three accounts before anyone noticed.
  *
+ * Every failure of the SHARED file is an OAuthClientFileError (OAUTH_CLIENT_FILE_INVALID) —
+ * not a per-account TOKEN_FILE_INVALID — and names no path.
+ *
  * @param {object} tokenData — parsed contents of the account's token file
- * @param {string} tokenFile — path, for error messages only
- * @param {string} account — address, for the (masked) parse-error message
  * @returns {{clientId: string, clientSecret: string}}
+ * @throws {OAuthClientFileError}
  */
-function resolveClientCredentials(tokenData, tokenFile, account) {
+function resolveClientCredentials(tokenData) {
   const own = extractClientPair(tokenData);
   if (own) return own;
 
-  if (!fs.existsSync(CLIENT_FILE)) {
-    throw new Error(
-      `OAuth client file not found: ${CLIENT_FILE} (and ${tokenFile} carries no ` +
-        'client_id/client_secret of its own)',
-    );
-  }
-  const shared = extractClientPair(parseCredentialsJson(fs.readFileSync(CLIENT_FILE, 'utf8'), account, 'OAuth client file'));
-  if (!shared) throw new Error(`Invalid client credentials in ${CLIENT_FILE}`);
+  if (!fs.existsSync(CLIENT_FILE)) throw new OAuthClientFileError('not found');
+  const parsed = parseCredentialsJson(fs.readFileSync(CLIENT_FILE, 'utf8'), (r) => new OAuthClientFileError(r));
+  const shared = extractClientPair(parsed);
+  if (!shared) throw new OAuthClientFileError('has no client_id/client_secret pair');
   return shared;
 }
 
@@ -135,7 +133,10 @@ function assertExactlyReadonly(account, scopes, source) {
   const extra = [...new Set(scopes)].filter(s => s !== READONLY_SCOPE);
   if (extra.length > 0) {
     emitDenial('readonly_scope_rejected', account, `${source} scopes wider than gmail.readonly`);
-    throw new ReadOnlyScopeError(account, extra, `${source} grants scopes beyond gmail.readonly: ${extra.join(', ')}`);
+    // The scope strings come from the file / Google, so only a capped, cleaned list is echoed.
+    throw new ReadOnlyScopeError(
+      account, extra, `${source} grants scopes beyond gmail.readonly: ${safeScopeList(extra).join(', ')}`,
+    );
   }
   if (scopes.length !== 1) {
     emitDenial('readonly_scope_rejected', account, `${source} scopes not exactly one entry`);
@@ -282,20 +283,20 @@ export class GmailClient {
   static fromTokenFile(account, entity, opts = {}) {
     // Load account token file FIRST — it may be self-describing about which
     // OAuth client minted it, which decides where the client creds come from.
+    // Errors never name this path: it embeds the unmasked address. Each failure has its own code
+    // (TOKEN_FILE_MISSING / TOKEN_FILE_INVALID / REFRESH_TOKEN_MISSING; see readonly-guard.js).
     const tokenFile = path.join(CRED_DIR, `${account}.json`);
-    if (!fs.existsSync(tokenFile)) {
-      throw new Error(`Token file not found: ${tokenFile} — run OAuth flow for ${account}`);
-    }
-    const tokenData = parseCredentialsJson(fs.readFileSync(tokenFile, 'utf8'), account, 'token file');
+    if (!fs.existsSync(tokenFile)) throw new TokenFileMissingError(account);
+    const tokenData = parseCredentialsJson(
+      fs.readFileSync(tokenFile, 'utf8'), (r) => new TokenFileInvalidError(account, `token file ${r}`),
+    );
     const refreshToken = tokenData.refresh_token;
 
-    if (!refreshToken) {
-      throw new Error(`No refresh_token in ${tokenFile} — re-run OAuth flow for ${account}`);
-    }
+    if (!refreshToken) throw new RefreshTokenMissingError(account);
 
     if (opts?.readOnly === true) assertReadOnlyScopes(account, tokenData);
 
-    const { clientId, clientSecret } = resolveClientCredentials(tokenData, tokenFile, account);
+    const { clientId, clientSecret } = resolveClientCredentials(tokenData);
 
     return new GmailClient({ account, refreshToken, clientId, clientSecret, entity, readOnly: opts?.readOnly === true });
   }
