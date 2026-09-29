@@ -139,9 +139,40 @@ describe('ocr date guard — never use a date of birth as the document date (#14
     expect(r.parsed.date).toBeNull();
   });
 
-  it('a newborn visit whose document date is labelled only "Date:" keeps that date', async () => {
+  it('a bare "Date:" is NOT a document-date label (it is ambiguous on a DOB form): newborn edge case fails safe to null', async () => {
+    // Delta review round 2 (Fable): treating bare "Date:" as a document label let "DOB Date:",
+    // "Birth-Date:" etc. keep the DOB, and made the fallback pick print/due dates.
     const r = await run(medicalDoc({ raw_text: 'Date: 03/15/2025\nDOB: 03/15/2025', date: '2025-03-15' }));
-    expect(r.parsed.date).toBe('2025-03-15');
+    expect(r.parsed.date).toBeNull();
+  });
+
+  it('"DOB: X" then a bare "Date: X" (same date) on a DOB-only form still rejects the DOB', async () => {
+    const r = await run(medicalDoc({ raw_text: 'DOB: 12/30/1963\nDate: 12/30/1963', date: '1963-12-30' }));
+    expect(r.parsed.date).toBeNull();
+  });
+
+  it.each([
+    'DOB Date: 12/30/1963',
+    'DOB (Date): 12/30/1963',
+    'Birth-Date: 12/30/1963',
+    'Birth\nDate: 12/30/1963',
+    'Birthday: 12/30/1963',
+    'Birthday Date: 12/30/1963',
+    'DOB:\t\tDate: 12/30/1963',
+  ])('a birth token followed by a "Date" word is still a birth label: %j', async (line) => {
+    const r = await run(medicalDoc({ raw_text: `Clinic\n${line}\nimmunization`, date: '1963-12-30' }));
+    expect(r.parsed.date).toBeNull();
+  });
+
+  it.each([
+    'Print Date: 09/28/2026',
+    'Next Due Date: 12/01/2027',
+    'Date: 09/28/2026',
+    'Exp. Date: 05/01/2027',
+    'Next Dose Due Date: 03/15/2026',
+  ])('the single-date fallback never picks a non-document date (%j)', async (line) => {
+    const r = await run(medicalDoc({ raw_text: `DOB: 12/30/1963\n${line}`, date: '1963-12-30' }));
+    expect(r.parsed.date).toBeNull();
   });
 
   it('"Birth Date:" is still a birth label even though it ends in "Date:"', async () => {

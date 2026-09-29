@@ -157,8 +157,9 @@ All fields not applicable to this document type should be null (or [] for arrays
 // Labels are ported from ~/claude/shared/lib/receipt_processor.py parse_date
 // (#1407/#1606) so the regex and LLM producers agree on what a DOB looks like.
 const BIRTH_DATE_LABEL = new RegExp(
-  "(date[ \\t]*of[ \\t]*birth|\\bbirth\\b|birth[ \\t]*date|birthdate|\\bd\\.?[ \\t]*o\\.?[ \\t]*b\\b\\.?|\\bborn(?:[ \\t]+on)?\\b)"
-  + "[\\s:.#'()|\\-]*(mm[ \\t]*[/\\-]?[ \\t]*dd[ \\t]*[/\\-]?[ \\t]*(?:yyyy|yy))?[\\s:.()|\\-]*$",
+  "(date[ \\t]*of[ \\t]*birth|\\bbirth\\b|birth[ \\t]*date|birthdate|\\bbirthday\\b|\\bd\\.?[ \\t]*o\\.?[ \\t]*b\\b\\.?|\\bborn(?:[ \\t]+on)?\\b)"
+  // A trailing "Date" word stays part of the birth label: "DOB Date:", "Birth-Date:", "Birth\nDate:".
+  + "[\\s:.#'()|\\-]*(?:date[\\s:.#'()|\\-]*)?(mm[ \\t]*[/\\-]?[ \\t]*dd[ \\t]*[/\\-]?[ \\t]*(?:yyyy|yy))?[\\s:.()|\\-]*$",
   'i',
 );
 // "04/08/2016 (age 10)" — only the parenthesised form; a lab's "Collected
@@ -166,7 +167,7 @@ const BIRTH_DATE_LABEL = new RegExp(
 const BIRTH_DATE_TRAILER = /^[ \t]*\([ \t]*age[ \t:]*\d{1,3}\b/i;
 const DOCUMENT_DATE_LABEL = new RegExp(
   "(date[ \\t]*of[ \\t]*service|service[ \\t]*date|\\bdos\\b|statement[ \\t]*date|invoice[ \\t]*date|"
-  + "transaction[ \\t]*date|order[ \\t]*date|purchase[ \\t]*date|visit[ \\t]*date|receipt[ \\t]*date|\\bdate|"
+  + "transaction[ \\t]*date|order[ \\t]*date|purchase[ \\t]*date|visit[ \\t]*date|receipt[ \\t]*date|"
   + "billing[ \\t]*period[ \\t]*ending|period[ \\t]*ending|start[ \\t]*date[ \\t]*of[ \\t]*service)"
   + "[\\s:.#\\-]*$",
   'i',
