@@ -86,7 +86,7 @@ describe('ocr date guard — never use a date of birth as the document date (#14
     expect(r.ok).toBe(true);
     expect(r.parsed.date).toBe('2024-08-30');
     expect(r.structured.date).toBe('2024-08-30');
-    expect(r.parsed.date_guard).toMatchObject({ rejected: '1963-12-30', reason: 'date_of_birth' });
+    expect(r.parsed.date_guard).toEqual({ reason: 'date_of_birth', rejected_fields: ['date'], replaced_with: 'service_date' });
   });
 
   it('DOB only (vaccination history): the DOB is dropped to null, never kept', async () => {
@@ -96,16 +96,56 @@ describe('ocr date guard — never use a date of birth as the document date (#14
       is_receipt: false,
     }));
     expect(r.parsed.date).toBeNull();
-    expect(r.parsed.date_guard).toMatchObject({ rejected: '1963-12-30', reason: 'date_of_birth' });
+    expect(r.parsed.date_guard).toEqual({ reason: 'date_of_birth', rejected_fields: ['date'], replaced_with: null });
   });
 
-  it('a service_date that is itself the DOB is also dropped', async () => {
+  it('date_guard never carries the rejected DOB value (PII — parsed is persisted by consumers)', async () => {
+    const r = await run(medicalDoc({ raw_text: 'DOB: 12/30/1963\nvaccine record', date: '1963-12-30' }));
+    expect(JSON.stringify(r.parsed.date_guard)).not.toContain('1963');
+  });
+
+  it('a service_date that is itself the DOB is also dropped; the one labelled document date is used', async () => {
     const r = await run(medicalDoc({
       raw_text: 'Patient DOB 04/08/2016\nStatement Date: 03/15/2025',
       date: '2016-04-08',
       service_date: '2016-04-08',
     }));
     expect(r.parsed.service_date).toBeNull();
+    expect(r.parsed.date).toBe('2025-03-15');
+    expect(r.parsed.date_guard).toEqual({ reason: 'date_of_birth', rejected_fields: ['service_date', 'date'], replaced_with: 'labelled_document_date' });
+  });
+
+  it('with two different labelled document dates there is no single fallback: null, not a guess', async () => {
+    const r = await run(medicalDoc({
+      raw_text: 'DOB 04/08/2016\nStatement Date: 03/15/2025\nDate of Service: 02/01/2025',
+      date: '2016-04-08',
+    }));
+    expect(r.parsed.date).toBeNull();
+  });
+
+  it('a rejected service_date is recorded even when date itself survives', async () => {
+    const r = await run(medicalDoc({
+      raw_text: 'DOB: 12/30/1963\nStatement Date: 02/11/2025',
+      date: '2025-02-11',
+      service_date: '1963-12-30',
+    }));
+    expect(r.parsed.date).toBe('2025-02-11');
+    expect(r.parsed.service_date).toBeNull();
+    expect(r.parsed.date_guard).toEqual({ reason: 'date_of_birth', rejected_fields: ['service_date'], replaced_with: null });
+  });
+
+  it('a right-aligned form field (label far left of the date, >40 chars of spaces) is still caught', async () => {
+    const r = await run(medicalDoc({ raw_text: `Date of Birth:${' '.repeat(50)}12/30/1963\nflu shot`, date: '1963-12-30' }));
+    expect(r.parsed.date).toBeNull();
+  });
+
+  it('a newborn visit whose document date is labelled only "Date:" keeps that date', async () => {
+    const r = await run(medicalDoc({ raw_text: 'Date: 03/15/2025\nDOB: 03/15/2025', date: '2025-03-15' }));
+    expect(r.parsed.date).toBe('2025-03-15');
+  });
+
+  it('"Birth Date:" is still a birth label even though it ends in "Date:"', async () => {
+    const r = await run(medicalDoc({ raw_text: 'Birth Date: 12/30/1963\nimmunization record', date: '1963-12-30' }));
     expect(r.parsed.date).toBeNull();
   });
 

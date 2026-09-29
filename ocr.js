@@ -166,12 +166,16 @@ const BIRTH_DATE_LABEL = new RegExp(
 const BIRTH_DATE_TRAILER = /^[ \t]*\([ \t]*age[ \t:]*\d{1,3}\b/i;
 const DOCUMENT_DATE_LABEL = new RegExp(
   "(date[ \\t]*of[ \\t]*service|service[ \\t]*date|\\bdos\\b|statement[ \\t]*date|invoice[ \\t]*date|"
-  + "transaction[ \\t]*date|order[ \\t]*date|purchase[ \\t]*date|visit[ \\t]*date|receipt[ \\t]*date|"
+  + "transaction[ \\t]*date|order[ \\t]*date|purchase[ \\t]*date|visit[ \\t]*date|receipt[ \\t]*date|\\bdate|"
   + "billing[ \\t]*period[ \\t]*ending|period[ \\t]*ending|start[ \\t]*date[ \\t]*of[ \\t]*service)"
   + "[\\s:.#\\-]*$",
   'i',
 );
 const LABEL_WINDOW_CHARS = 40;
+// Right-aligned form fields pad the label far from its value; whitespace runs are
+// collapsed within this wider raw slice before the 40-char label window is taken.
+const RAW_WINDOW_CHARS = 200;
+const TRAILER_WINDOW_CHARS = 24;
 const MONTHS = { jan: 1, feb: 2, mar: 3, apr: 4, may: 5, jun: 6, jul: 7, aug: 8, sep: 9, oct: 10, nov: 11, dec: 12 };
 const MON = '(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]*\\.?';
 
@@ -200,10 +204,14 @@ function scanLabelledDates(text) {
     for (const m of text.matchAll(re)) {
       const isos = toIso(m).filter(Boolean);
       if (!isos.length) continue;
-      const before = text.slice(Math.max(0, m.index - LABEL_WINDOW_CHARS), m.index);
-      const after = text.slice(m.index + m[0].length);
-      const docLabelled = DOCUMENT_DATE_LABEL.test(before);
-      const birthLabelled = BIRTH_DATE_LABEL.test(before) || (!docLabelled && BIRTH_DATE_TRAILER.test(after));
+      const before = text.slice(Math.max(0, m.index - RAW_WINDOW_CHARS), m.index)
+        .replace(/[ \t]{2,}/g, ' ')
+        .slice(-LABEL_WINDOW_CHARS);
+      const after = text.slice(m.index + m[0].length, m.index + m[0].length + TRAILER_WINDOW_CHARS);
+      // A birth label wins: "Birth Date:" also ends in the generic document label "Date:".
+      const birthByLabel = BIRTH_DATE_LABEL.test(before);
+      const docLabelled = !birthByLabel && DOCUMENT_DATE_LABEL.test(before);
+      const birthLabelled = birthByLabel || (!docLabelled && BIRTH_DATE_TRAILER.test(after));
       for (const iso of isos) {
         if (docLabelled) doc.add(iso);
         if (birthLabelled) birth.add(iso);
@@ -214,26 +222,40 @@ function scanLabelledDates(text) {
 }
 
 /**
- * Null out (or replace with a non-birth service_date) a `date`/`service_date`
- * that the OCR text shows only as a date of birth. Mutates and returns
- * `parsed`; sets `parsed.date_guard` when `date` was rejected. No-op on
- * anything that isn't a parsed object with raw text.
+ * Null out a `date`/`service_date` that the OCR text shows only as a date of
+ * birth. A rejected `date` is replaced by the (surviving) service_date, else by
+ * the single labelled document date in the text, else null — never a guess.
+ * Mutates and returns `parsed`; sets `parsed.date_guard` = {reason,
+ * rejected_fields, replaced_with} whenever anything was rejected. The guard
+ * never records the rejected VALUE: consumers persist `parsed`, and a DOB is PII.
+ * No-op on anything that isn't a parsed object with raw text.
  */
 export function guardDocumentDates(parsed, rawText) {
   if (!parsed || typeof parsed !== 'object' || typeof rawText !== 'string' || !rawText) return parsed;
   const { birth, doc } = scanLabelledDates(rawText);
   if (!birth.size) return parsed;
   const birthOnly = (v) => typeof v === 'string' && birth.has(v) && !doc.has(v);
-  let rejectedService = null;
+  const rejected = [];
+  let replacedWith = null;
   if (birthOnly(parsed.service_date)) {
-    rejectedService = parsed.service_date;
+    rejected.push('service_date');
     parsed.service_date = null;
   }
   if (birthOnly(parsed.date)) {
-    const rejected = parsed.date;
-    parsed.date = parsed.service_date || null;
-    parsed.date_guard = { rejected, reason: 'date_of_birth', replaced_with: parsed.date };
-    if (rejectedService) parsed.date_guard.rejected_service_date = rejectedService;
+    rejected.push('date');
+    const docDates = [...doc].filter((d) => !birth.has(d));
+    if (parsed.service_date) {
+      parsed.date = parsed.service_date;
+      replacedWith = 'service_date';
+    } else if (docDates.length === 1) {
+      parsed.date = docDates[0];
+      replacedWith = 'labelled_document_date';
+    } else {
+      parsed.date = null;
+    }
+  }
+  if (rejected.length) {
+    parsed.date_guard = { reason: 'date_of_birth', rejected_fields: rejected, replaced_with: replacedWith };
   }
   return parsed;
 }
