@@ -115,12 +115,12 @@ Return ONLY valid JSON (no markdown, no explanation):
   "sender_email": "sender email address, or null",
   "recipient_name": "name of the person this is addressed to, or null",
   "recipient_address": "recipient mailing address, or null",
-  "date": "document date as YYYY-MM-DD, or null",
+  "date": "the document's own date as YYYY-MM-DD (transaction, purchase, invoice, statement or issue date; for medical documents the date of service or statement date), or null. NEVER a date of birth (DOB, birth date, born on) — if the only date shown is a birth date, use null",
   "reference_number": "account number, claim number, case number, invoice number, or any other reference ID, or null",
   "amount_owed": total dollar amount currently owed as a number or null,
   "amount_paid": dollar amount already paid as a number or null,
   "due_date": "payment deadline as YYYY-MM-DD, or null",
-  "service_date": "date of service (medical or legal) as YYYY-MM-DD, or null",
+  "service_date": "date of service (medical or legal) as YYYY-MM-DD, or null. NEVER a date of birth",
   "creditor_name": "original creditor name for collection notices, or null",
   "collection_agency": "name of the collection agency if this is a collection notice, or null",
   "patient_name": "patient name for medical documents, or null",
@@ -146,6 +146,120 @@ Return ONLY valid JSON (no markdown, no explanation):
 }
 
 All fields not applicable to this document type should be null (or [] for arrays).`;
+
+// ── Document-date guard (tasks.db #1407) ────────────────────────────────────
+// The model sometimes returns a date of birth as the document's `date` on
+// medical paperwork (the account holder's DOB printed on a CVS vaccination
+// history became receipt_date 1963-12-30). The prompt says not to; this is the
+// deterministic backstop. A returned date is rejected only when the OCR text
+// shows that exact date next to a birth-date label and never next to a
+// document-date label (a newborn's DOB can equal the date of service).
+// Labels are ported from ~/claude/shared/lib/receipt_processor.py parse_date
+// (#1407/#1606) so the regex and LLM producers agree on what a DOB looks like.
+const BIRTH_DATE_LABEL = new RegExp(
+  "(date[ \\t]*of[ \\t]*birth|\\bbirth\\b|birth[ \\t]*date|birthdate|\\bbirthday\\b|\\bd\\.?[ \\t]*o\\.?[ \\t]*b\\b\\.?|\\bborn(?:[ \\t]+on)?\\b)"
+  // A trailing "Date" word stays part of the birth label: "DOB Date:", "Birth-Date:", "Birth\nDate:".
+  + "[\\s:.#'()|\\-]*(?:date[\\s:.#'()|\\-]*)?(mm[ \\t]*[/\\-]?[ \\t]*dd[ \\t]*[/\\-]?[ \\t]*(?:yyyy|yy))?[\\s:.()|\\-]*$",
+  'i',
+);
+// "04/08/2016 (age 10)" — only the parenthesised form; a lab's "Collected
+// 03/15/2025 Age: 45" is a real service date.
+const BIRTH_DATE_TRAILER = /^[ \t]*\([ \t]*age[ \t:]*\d{1,3}\b/i;
+const DOCUMENT_DATE_LABEL = new RegExp(
+  "(date[ \\t]*of[ \\t]*service|service[ \\t]*date|\\bdos\\b|statement[ \\t]*date|invoice[ \\t]*date|"
+  + "transaction[ \\t]*date|order[ \\t]*date|purchase[ \\t]*date|visit[ \\t]*date|receipt[ \\t]*date|"
+  + "billing[ \\t]*period[ \\t]*ending|period[ \\t]*ending|start[ \\t]*date[ \\t]*of[ \\t]*service)"
+  + "[\\s:.#\\-]*$",
+  'i',
+);
+const LABEL_WINDOW_CHARS = 40;
+// Right-aligned form fields pad the label far from its value; whitespace runs are
+// collapsed within this wider raw slice before the 40-char label window is taken.
+const RAW_WINDOW_CHARS = 200;
+const TRAILER_WINDOW_CHARS = 24;
+const MONTHS = { jan: 1, feb: 2, mar: 3, apr: 4, may: 5, jun: 6, jul: 7, aug: 8, sep: 9, oct: 10, nov: 11, dec: 12 };
+const MON = '(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]*\\.?';
+
+function isoOf(y, m, d) {
+  if (!(m >= 1 && m <= 12 && d >= 1 && d <= 31)) return null;
+  const t = new Date(Date.UTC(y, m - 1, d));
+  if (t.getUTCFullYear() !== y || t.getUTCMonth() !== m - 1 || t.getUTCDate() !== d) return null;
+  return `${String(y).padStart(4, '0')}-${String(m).padStart(2, '0')}-${String(d).padStart(2, '0')}`;
+}
+
+// Each pattern maps a match to every ISO date it could mean (a 2-digit year
+// could be 19yy or 20yy — "DOB: 12/30/63" must still catch 1963-12-30).
+const DATE_SCANNERS = [
+  [/\b(\d{4})[-/](\d{1,2})[-/](\d{1,2})\b/g, (m) => [isoOf(+m[1], +m[2], +m[3])]],
+  [/\b(\d{1,2})[-/](\d{1,2})[-/](\d{4}|\d{2})\b/g, (m) => (m[3].length === 4
+    ? [isoOf(+m[3], +m[1], +m[2])]
+    : [isoOf(1900 + +m[3], +m[1], +m[2]), isoOf(2000 + +m[3], +m[1], +m[2])])],
+  [new RegExp(`\\b${MON}\\s+(\\d{1,2}),?\\s+(\\d{4})\\b`, 'gi'), (m) => [isoOf(+m[3], MONTHS[m[1].toLowerCase()], +m[2])]],
+  [new RegExp(`\\b(\\d{1,2})\\s+${MON}\\s+(\\d{4})\\b`, 'gi'), (m) => [isoOf(+m[3], MONTHS[m[2].toLowerCase()], +m[1])]],
+];
+
+function scanLabelledDates(text) {
+  const birth = new Set();
+  const doc = new Set();
+  for (const [re, toIso] of DATE_SCANNERS) {
+    for (const m of text.matchAll(re)) {
+      const isos = toIso(m).filter(Boolean);
+      if (!isos.length) continue;
+      const before = text.slice(Math.max(0, m.index - RAW_WINDOW_CHARS), m.index)
+        .replace(/[ \t]{2,}/g, ' ')
+        .slice(-LABEL_WINDOW_CHARS);
+      const after = text.slice(m.index + m[0].length, m.index + m[0].length + TRAILER_WINDOW_CHARS);
+      // A birth label wins: "Birth Date:" also ends in the generic document label "Date:".
+      const birthByLabel = BIRTH_DATE_LABEL.test(before);
+      const docLabelled = !birthByLabel && DOCUMENT_DATE_LABEL.test(before);
+      const birthLabelled = birthByLabel || (!docLabelled && BIRTH_DATE_TRAILER.test(after));
+      for (const iso of isos) {
+        if (docLabelled) doc.add(iso);
+        if (birthLabelled) birth.add(iso);
+      }
+    }
+  }
+  return { birth, doc };
+}
+
+/**
+ * Null out a `date`/`service_date` that the OCR text shows only as a date of
+ * birth. A rejected `date` is replaced by the (surviving) service_date, else by
+ * the single labelled document date in the text, else null — never a guess.
+ * Mutates and returns `parsed`; sets `parsed.date_guard` = {reason,
+ * rejected_fields, replaced_with} whenever anything was rejected. The guard
+ * never records the rejected VALUE: consumers persist `parsed`, and a DOB is PII.
+ * No-op on anything that isn't a parsed object with raw text.
+ */
+export function guardDocumentDates(parsed, rawText) {
+  if (!parsed || typeof parsed !== 'object' || typeof rawText !== 'string' || !rawText) return parsed;
+  const { birth, doc } = scanLabelledDates(rawText);
+  if (!birth.size) return parsed;
+  const birthOnly = (v) => typeof v === 'string' && birth.has(v) && !doc.has(v);
+  const rejected = [];
+  let replacedWith = null;
+  if (birthOnly(parsed.service_date)) {
+    rejected.push('service_date');
+    parsed.service_date = null;
+  }
+  if (birthOnly(parsed.date)) {
+    rejected.push('date');
+    const docDates = [...doc].filter((d) => !birth.has(d));
+    if (parsed.service_date) {
+      parsed.date = parsed.service_date;
+      replacedWith = 'service_date';
+    } else if (docDates.length === 1) {
+      parsed.date = docDates[0];
+      replacedWith = 'labelled_document_date';
+    } else {
+      parsed.date = null;
+    }
+  }
+  if (rejected.length) {
+    parsed.date_guard = { reason: 'date_of_birth', rejected_fields: rejected, replaced_with: replacedWith };
+  }
+  return parsed;
+}
 
 // Minimal JSON string unescaping for a partially-recovered (unterminated)
 // string value — recoverPartialRawText below extracts a raw_text value that
@@ -192,6 +306,11 @@ function parseOcrResponse(text, filename, log, { truncated = false } = {}) {
     try {
       const parsed = JSON.parse(jsonMatch[0]);
       const rawText = parsed.raw_text || text;
+      guardDocumentDates(parsed, typeof parsed.raw_text === 'string' ? parsed.raw_text : '');
+      if (parsed && parsed.date_guard) {
+        // No date value in the log line — a DOB is PII.
+        log.warn(`OCR date guard: rejected a date-of-birth document date for ${filename} (#1407)`);
+      }
       const structured = parsed.is_receipt ? {
         vendor: parsed.vendor || parsed.sender_name,
         amount: parsed.amount || parsed.amount_owed,
