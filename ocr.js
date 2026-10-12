@@ -153,7 +153,9 @@ All fields not applicable to this document type should be null (or [] for arrays
 // history became receipt_date 1963-12-30). The prompt says not to; this is the
 // deterministic backstop. A returned date is rejected only when the OCR text
 // shows that exact date next to a birth-date label and never next to a
-// document-date label (a newborn's DOB can equal the date of service).
+// document-date label (a newborn's DOB can equal the date of service), or —
+// format-independent backstop — when it is before MIN_PLAUSIBLE_YEAR, never
+// document-labelled, and the text contains a birth word.
 // Labels are ported from ~/claude/shared/lib/receipt_processor.py parse_date
 // (#1407/#1606) so the regex and LLM producers agree on what a DOB looks like.
 const BIRTH_DATE_LABEL = new RegExp(
@@ -187,16 +189,29 @@ function isoOf(y, m, d) {
   return `${String(y).padStart(4, '0')}-${String(m).padStart(2, '0')}-${String(d).padStart(2, '0')}`;
 }
 
+const ORD = '(?:st|nd|rd|th)?';
 // Each pattern maps a match to every ISO date it could mean (a 2-digit year
 // could be 19yy or 20yy — "DOB: 12/30/63" must still catch 1963-12-30).
+// Separators include '.' ("12.30.1963"); month-name forms accept ordinals
+// ("December 30th, 1963") and dashes ("30-Dec-1963") — parity with the Python
+// enricher guard (~/claude/shared/lib/receipt_enricher.py _DATE_SCANNERS).
 const DATE_SCANNERS = [
-  [/\b(\d{4})[-/](\d{1,2})[-/](\d{1,2})\b/g, (m) => [isoOf(+m[1], +m[2], +m[3])]],
-  [/\b(\d{1,2})[-/](\d{1,2})[-/](\d{4}|\d{2})\b/g, (m) => (m[3].length === 4
+  [/\b(\d{4})[-/.](\d{1,2})[-/.](\d{1,2})\b/g, (m) => [isoOf(+m[1], +m[2], +m[3])]],
+  [/\b(\d{1,2})[-/.](\d{1,2})[-/.](\d{4}|\d{2})\b/g, (m) => (m[3].length === 4
     ? [isoOf(+m[3], +m[1], +m[2])]
     : [isoOf(1900 + +m[3], +m[1], +m[2]), isoOf(2000 + +m[3], +m[1], +m[2])])],
-  [new RegExp(`\\b${MON}\\s+(\\d{1,2}),?\\s+(\\d{4})\\b`, 'gi'), (m) => [isoOf(+m[3], MONTHS[m[1].toLowerCase()], +m[2])]],
-  [new RegExp(`\\b(\\d{1,2})\\s+${MON}\\s+(\\d{4})\\b`, 'gi'), (m) => [isoOf(+m[3], MONTHS[m[2].toLowerCase()], +m[1])]],
+  [new RegExp(`\\b${MON}\\s+(\\d{1,2})${ORD},?\\s+(\\d{4})\\b`, 'gi'), (m) => [isoOf(+m[3], MONTHS[m[1].toLowerCase()], +m[2])]],
+  [new RegExp(`\\b(\\d{1,2})${ORD}[\\s-]+${MON}[\\s,-]+(\\d{4})\\b`, 'gi'), (m) => [isoOf(+m[3], MONTHS[m[2].toLowerCase()], +m[1])]],
 ];
+
+// Format-independent backstop (Python parity): a returned date before this year
+// that is never document-labelled, in a text containing a birth word, is most
+// likely a DOB printed in a layout or format the scanners above do not read
+// (day-first "30/12/1963", "19631230"). Refuse it rather than fail open. Same
+// floor as parse_date / guard_document_date (date_labels.MIN_PLAUSIBLE_YEAR).
+const MIN_PLAUSIBLE_YEAR = 2010;
+const BIRTH_WORD = /\b(?:dob|d\.o\.b\.?|date[ \t]*of[ \t]*birth|birth[ \t]*date|birthdate|birthday|born)\b/i;
+const ISO_DATE = /^(\d{4})-\d{2}-\d{2}$/;
 
 function scanLabelledDates(text) {
   const birth = new Set();
@@ -234,8 +249,14 @@ function scanLabelledDates(text) {
 export function guardDocumentDates(parsed, rawText) {
   if (!parsed || typeof parsed !== 'object' || typeof rawText !== 'string' || !rawText) return parsed;
   const { birth, doc } = scanLabelledDates(rawText);
-  if (!birth.size) return parsed;
-  const birthOnly = (v) => typeof v === 'string' && birth.has(v) && !doc.has(v);
+  const hasBirthWord = BIRTH_WORD.test(rawText);
+  if (!birth.size && !hasBirthWord) return parsed;
+  const preFloor = (v) => {
+    const m = ISO_DATE.exec(v);
+    return !!m && +m[1] < MIN_PLAUSIBLE_YEAR;
+  };
+  const birthOnly = (v) => typeof v === 'string' && !doc.has(v)
+    && (birth.has(v) || (hasBirthWord && preFloor(v)));
   const rejected = [];
   let replacedWith = null;
   if (birthOnly(parsed.service_date)) {
