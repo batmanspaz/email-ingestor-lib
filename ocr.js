@@ -199,7 +199,11 @@ const DATE_SCANNERS = [
   [/\b(\d{4})[-/.](\d{1,2})[-/.](\d{1,2})\b/g, (m) => [isoOf(+m[1], +m[2], +m[3])]],
   [/\b(\d{1,2})[-/.](\d{1,2})[-/.](\d{4}|\d{2})\b/g, (m) => (m[3].length === 4
     ? [isoOf(+m[3], +m[1], +m[2])]
-    : [isoOf(1900 + +m[3], +m[1], +m[2]), isoOf(2000 + +m[3], +m[1], +m[2])])],
+    : [isoOf(1900 + +m[3], +m[1], +m[2]), isoOf(2000 + +m[3], +m[1], +m[2])]),
+    // Day-first reading, used only for birth / loose-document label sets.
+    (m) => (m[3].length === 4
+      ? [isoOf(+m[3], +m[2], +m[1])]
+      : [isoOf(1900 + +m[3], +m[2], +m[1]), isoOf(2000 + +m[3], +m[2], +m[1])])],
   [new RegExp(`\\b${MON}\\s+(\\d{1,2})${ORD},?\\s+(\\d{4})\\b`, 'gi'), (m) => [isoOf(+m[3], MONTHS[m[1].toLowerCase()], +m[2])]],
   [new RegExp(`\\b(\\d{1,2})${ORD}[\\s-]+${MON}[\\s,-]+(\\d{4})\\b`, 'gi'), (m) => [isoOf(+m[3], MONTHS[m[2].toLowerCase()], +m[1])]],
 ];
@@ -209,17 +213,23 @@ const DATE_SCANNERS = [
 // likely a DOB printed in a layout or format the scanners above do not read
 // (day-first "30/12/1963", "19631230"). Refuse it rather than fail open. Same
 // floor as parse_date / guard_document_date (date_labels.MIN_PLAUSIBLE_YEAR).
-const MIN_PLAUSIBLE_YEAR = 2010;
-const BIRTH_WORD = /\b(?:dob|d\.o\.b\.?|date[ \t]*of[ \t]*birth|birth[ \t]*date|birthdate|birthday|born)\b/i;
+export const MIN_PLAUSIBLE_YEAR = 2010;
+// Deliberately narrow: "birthday"/"born"/"birthdate" appear on ordinary retail
+// receipts and would null legitimate old dates.
+const BIRTH_WORD = /\b(?:dob|d\.o\.b\.?|date[ \t]*of[ \t]*birth|birth[ \t]*date)(?![a-z])/i;
+// Bare "Date:" (not birth-labelled) marks a document date for the backstop only.
+const GENERIC_DATE_LABEL = /\bdate[\s:.#\-]*$/i;
 const ISO_DATE = /^(\d{4})-\d{2}-\d{2}$/;
 
 function scanLabelledDates(text) {
   const birth = new Set();
   const doc = new Set();
-  for (const [re, toIso] of DATE_SCANNERS) {
+  const docLoose = new Set();
+  for (const [re, toIso, toAlt] of DATE_SCANNERS) {
     for (const m of text.matchAll(re)) {
       const isos = toIso(m).filter(Boolean);
-      if (!isos.length) continue;
+      const alts = toAlt ? toAlt(m).filter(Boolean) : [];
+      if (!isos.length && !alts.length) continue;
       const before = text.slice(Math.max(0, m.index - RAW_WINDOW_CHARS), m.index)
         .replace(/[ \t]{2,}/g, ' ')
         .slice(-LABEL_WINDOW_CHARS);
@@ -228,13 +238,19 @@ function scanLabelledDates(text) {
       const birthByLabel = BIRTH_DATE_LABEL.test(before);
       const docLabelled = !birthByLabel && DOCUMENT_DATE_LABEL.test(before);
       const birthLabelled = birthByLabel || (!docLabelled && BIRTH_DATE_TRAILER.test(after));
+      const looseDoc = docLabelled || (!birthLabelled && GENERIC_DATE_LABEL.test(before));
       for (const iso of isos) {
         if (docLabelled) doc.add(iso);
         if (birthLabelled) birth.add(iso);
+        if (looseDoc) docLoose.add(iso);
+      }
+      for (const iso of alts) {
+        if (birthLabelled) birth.add(iso);
+        if (looseDoc) docLoose.add(iso);
       }
     }
   }
-  return { birth, doc };
+  return { birth, doc, docLoose };
 }
 
 /**
@@ -248,22 +264,35 @@ function scanLabelledDates(text) {
  */
 export function guardDocumentDates(parsed, rawText) {
   if (!parsed || typeof parsed !== 'object' || typeof rawText !== 'string' || !rawText) return parsed;
-  const { birth, doc } = scanLabelledDates(rawText);
+  const { birth, doc, docLoose } = scanLabelledDates(rawText);
   const hasBirthWord = BIRTH_WORD.test(rawText);
   if (!birth.size && !hasBirthWord) return parsed;
   const preFloor = (v) => {
     const m = ISO_DATE.exec(v);
     return !!m && +m[1] < MIN_PLAUSIBLE_YEAR;
   };
-  const birthOnly = (v) => typeof v === 'string' && !doc.has(v)
-    && (birth.has(v) || (hasBirthWord && preFloor(v)));
+  let viaBackstop = false;
+  const birthOnly = (v) => {
+    if (typeof v !== 'string' || doc.has(v)) return false;
+    if (birth.has(v)) return true;
+    if (hasBirthWord && preFloor(v) && !docLoose.has(v)) {
+      viaBackstop = true;
+      return true;
+    }
+    return false;
+  };
   const rejected = [];
   let replacedWith = null;
-  if (birthOnly(parsed.service_date)) {
+  const sdBirth = birthOnly(parsed.service_date);
+  const sdBackstop = viaBackstop;
+  viaBackstop = false;
+  if (sdBirth) {
     rejected.push('service_date');
     parsed.service_date = null;
   }
-  if (birthOnly(parsed.date)) {
+  const dBirth = birthOnly(parsed.date);
+  const dBackstop = viaBackstop;
+  if (dBirth) {
     rejected.push('date');
     const docDates = [...doc].filter((d) => !birth.has(d));
     if (parsed.service_date) {
@@ -277,7 +306,9 @@ export function guardDocumentDates(parsed, rawText) {
     }
   }
   if (rejected.length) {
-    parsed.date_guard = { reason: 'date_of_birth', rejected_fields: rejected, replaced_with: replacedWith };
+    // Distinct reason when every rejection came only from the pre-floor birth-word backstop.
+    const onlyBackstop = (!rejected.includes('service_date') || sdBackstop) && (!rejected.includes('date') || dBackstop);
+    parsed.date_guard = { reason: onlyBackstop ? 'pre_floor_birth_word' : 'date_of_birth', rejected_fields: rejected, replaced_with: replacedWith };
   }
   return parsed;
 }
