@@ -4,7 +4,7 @@
 // (redacted, held, verify_failed, engine crash, shadow). Expected at end of Phase 0: E_NOT_IMPLEMENTED.
 import { describe, it, expect, beforeAll } from 'vitest';
 import { redactBuffer } from '../../pii-redact.js';
-import { buildFixtures, watchTmpdir } from './support/harness.mjs';
+import { buildFixtures, watchTmpdir, tesseractPng } from './support/harness.mjs';
 
 let fx;
 beforeAll(() => { fx = buildFixtures(); }, 120_000);
@@ -20,12 +20,20 @@ async function runWatched(name, opts) {
 }
 
 describe('temp files: private while they exist, gone afterwards', () => {
-  it('image-only PDF, success: mid-run temp entries are 0700 dirs / 0600 files; nothing left after', async () => {
-    const { r, mid, left } = await runWatched('image_only.pdf', { verifyResult: { ok: true, residual: [] } });
+  it('image-only PDF, success: mid-run temp entries (snapshot taken INSIDE deps.ocr, while rendered pages exist) are 0700 dirs / 0600 files; nothing left after [Fable L1]', async () => {
+    const w = watchTmpdir();
+    let mid = [];
+    let r;
+    try {
+      r = await redactBuffer(fx.read('image_only.pdf'), {
+        filename: 'image_only.pdf', mode: 'enforce',
+        deps: { ocr: async (png) => { if (!mid.length) mid = w.snapshot(); return tesseractPng(png); } },
+      });
+    } finally { w.restore(); }
     expect(r.outcome).toBe('redacted');
-    expect(Array.isArray(mid)).toBe(true); // the verifier ran mid-pipeline; whatever temp space existed then is private
+    expect(mid.length).toBeGreaterThan(0); // the engine DID hold rendered pages in temp space at that moment
     for (const e of mid) expect(e.mode, e.path).toBe(e.dir ? 0o700 : 0o600);
-    expect(left).toEqual([]);
+    expect(w.leftovers()).toEqual([]);
   });
 
   it('verify_failed: nothing left after', async () => {

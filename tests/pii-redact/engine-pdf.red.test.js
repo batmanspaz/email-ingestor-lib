@@ -3,8 +3,8 @@
 // never with the engine's own verifier. Expected at the end of Phase 0: all fail with E_NOT_IMPLEMENTED.
 // Round 2 (2026-10-14): red-team fold-in. IDs in test names map to review-verdicts/{sonnet,opus}-redact-p0.md.
 import { describe, it, expect, beforeAll } from 'vitest';
-import { redactBuffer, verifyRedacted } from '../../pii-redact.js';
-import { buildFixtures, inspectPdf, allLeaks, negativesPresent, lastFourKept, regionStats, privateDigitsIn, SECRETS } from './support/harness.mjs';
+import { redactBuffer, verifyRedacted, engineCommand } from '../../pii-redact.js';
+import { buildFixtures, inspectPdf, allLeaks, negativesPresent, lastFourKept, regionStats, privateDigitsIn, tesseractPng, SECRETS } from './support/harness.mjs';
 
 let fx;
 beforeAll(() => { fx = buildFixtures(); }, 120_000);
@@ -24,6 +24,8 @@ const REDACTABLE = [
   // round 2
   'form_xobject.pdf', 'acroform_full.pdf', 'image_on_text_page.pdf', 'objstm.pdf', 'js_action.pdf', 'custom_info_key.pdf',
   'link_labels_fileannot.pdf', 'incremental_history.pdf', 'orphan_after_redact.pdf',
+  // round 3 (Fable M1 success floor): the straightforward scan pages MUST be redacted, not held
+  'scan_skew_rotate.pdf',
 ];
 // Hard inputs where HOLDING is an acceptable (fail-closed) answer; 'redacted' must still be leak-free.
 const REDACTED_OR_HELD = ['scan_variants.pdf', 'xfa.pdf', 'encrypted_owner_only.pdf'];
@@ -69,7 +71,18 @@ describe('every surface is scrubbed (enforce mode)', () => {
   it('real redaction, not an overlay: the redacted text layer cannot be recovered (image-only page is rasterized-and-blacked-out)', async () => {
     const r = await redactBuffer(fx.read('image_only.pdf'), { filename: 'image_only.pdf', mode: 'enforce' });
     const out = inspectAll(r.buffer);
-    expect(allLeaks({ ocr: out.surfaces.ocr, ocr_alt: out.surfaces.ocr_alt, text: out.surfaces.text, raw: out.surfaces.raw, filebytes: out.surfaces.filebytes })).toEqual([]);
+    expect(allLeaks({ ocr: out.surfaces.ocr, ocr_alt: out.surfaces.ocr_alt, text: out.surfaces.text, raw: out.surfaces.raw, filebytes: out.surfaces.filebytes, images: out.surfaces.images })).toEqual([]);
+  });
+
+  it('[Fable C1] the IMAGE PIXELS are changed, not covered: image-space ground truth (first-5 SSN digits) is uniform in the image XObject itself, resolution kept', async () => {
+    const r = await redactBuffer(fx.read('image_only.pdf'), { filename: 'image_only.pdf', mode: 'enforce' });
+    expect(r.outcome).toBe('redacted');
+    const before = inspectPdf(fx.read('image_only.pdf'), { ocr: true }).meta.images;
+    const after = inspectPdf(r.buffer, { ocr: true }).meta.images;
+    expect(after.map((i) => [i.w, i.h])).toEqual(before.map((i) => [i.w, i.h])); // redact in place, keep resolution
+    for (const t of fx.manifest['image_only.pdf'].xobject_truth) {
+      expect(regionStats(r.buffer, { kind: 'xobject', ...t }).std, JSON.stringify(t.rect)).toBeLessThan(8);
+    }
   });
 
   it('SSN repeated in the footer of all 5 pages is masked on every page', async () => {
@@ -85,6 +98,37 @@ describe('every surface is scrubbed (enforce mode)', () => {
     const out = inspectPdf(r.buffer, { ocr: false });
     expect(out.surfaces.widgets.filter((w) => /taxpayer_ssn/.test(w))).toEqual([]);
     expect(allLeaks({ objects: out.surfaces.objects, filebytes: out.surfaces.filebytes }, ['ssn1', 'ssn2'])).toEqual([]);
+  });
+});
+
+describe('[Fable C1/M5] pixels a PAGE RENDER never shows: overlays, /Thumb, hidden-OCG images, tiny images, soft masks, embedded binaries', () => {
+  // must be redacted (dropping a thumbnail / fixing a tiny image is not hard: holding these is not acceptable)
+  const MUST = ['thumb.pdf', 'tiny_image.pdf', 'overlay_rect_image.pdf'];
+  const MAY_HOLD = ['hidden_ocg_image.pdf', 'smask_image.pdf', 'embedded_image.pdf', 'embedded_pdf.pdf'];
+  for (const name of [...MUST, ...MAY_HOLD]) {
+    it(`${name}: ${MUST.includes(name) ? 'redacted' : 'redacted or held'}; no image XObject (native resolution, both OCR passes) and no embedded file (inspected AS A FILE) yields a secret`, async () => {
+      const r = await redactBuffer(fx.read(name), { filename: name, mode: 'enforce' });
+      if (MUST.includes(name)) expect(r.outcome).toBe('redacted');
+      else expect(['redacted', 'held']).toContain(r.outcome);
+      if (r.outcome !== 'redacted') return;
+      const out = inspectAll(r.buffer);
+      expect(allLeaks(out.surfaces, fx.manifest[name].secrets)).toEqual([]);
+      expectNoDeadData(out, name);
+    });
+  }
+
+  it('overlay_rect_image.pdf: the overlaid image\'s pixels are actually removed (image-space truth uniform), not just covered', async () => {
+    const r = await redactBuffer(fx.read('overlay_rect_image.pdf'), { filename: 'o.pdf', mode: 'enforce' });
+    expect(r.outcome).toBe('redacted');
+    for (const t of fx.manifest['overlay_rect_image.pdf'].xobject_truth) expect(regionStats(r.buffer, { kind: 'xobject', ...t }).std).toBeLessThan(8);
+  });
+
+  it('the engine\'s own verifier does NOT share the blind spot: every one of these inputs is not ok (residual image_xobject / embedded_file)', async () => {
+    for (const name of [...MUST, ...MAY_HOLD]) {
+      const v = await verifyRedacted(fx.read(name), { filename: name });
+      expect(v.ok, name).toBe(false);
+      expect(v.residual.map((x) => x.surface).some((sf) => ['image_xobject', 'embedded_file'].includes(sf)), name).toBe(true);
+    }
   });
 });
 
@@ -104,6 +148,31 @@ describe('[Opus D3/C3] OCR is not trusted alone: pixel ground truth', () => {
     const v = await verifyRedacted(fx.read('comb_ssn_image.pdf'), { filename: 'comb_ssn_image.pdf' });
     expect(v.ok).toBe(false);
     expect(v.residual.map((x) => x.surface)).toContain('ocr_label_without_value');
+  });
+
+  it('[Fable M4] DECIDED: a uniform fill in the value window counts as a located MASKED value — a correctly redacted comb field verifies ok and re-runs clean', async () => {
+    const ok = fx.read('comb_redacted_ok.pdf');
+    expect(await verifyRedacted(ok, { filename: 'c.pdf' })).toEqual({ ok: true, residual: [] });
+    const r = await redactBuffer(ok, { filename: 'c.pdf', mode: 'enforce' });
+    expect(r.outcome).toBe('clean');
+    expect(Buffer.compare(r.buffer, ok)).toBe(0);
+  });
+
+  it('[Fable M4] re-running on the engine\'s own comb redaction is clean (no label-without-value hold on its own output)', async () => {
+    const first = await redactBuffer(fx.read('comb_ssn_image.pdf'), { filename: 'c.pdf', mode: 'enforce' });
+    if (first.outcome !== 'redacted') return;
+    expect((await redactBuffer(first.buffer, { filename: 'c.pdf', mode: 'enforce' })).outcome).toBe('clean');
+  });
+
+  it('[Fable L2] local OCR really goes through the deps.ocr seam (no phantom collaborator): called with real PNGs for image_only.pdf, and its answers are used', async () => {
+    const seen = [];
+    const r = await redactBuffer(fx.read('image_only.pdf'), {
+      filename: 'image_only.pdf', mode: 'enforce',
+      deps: { ocr: async (png) => { seen.push(png.length); return tesseractPng(png); } },
+    });
+    expect(r.outcome).toBe('redacted');
+    expect(seen.length).toBeGreaterThan(0);
+    expect(seen.every((n) => n > 1000)).toBe(true);
   });
 
   it('[Opus D6/C5] an image pasted on a TEXT page is OCR\'d and redacted (the page has a text layer, so "OCR image-only pages" is not enough)', async () => {
@@ -243,6 +312,20 @@ describe('fail closed: anything not redactable AND verifiable is HELD', () => {
     expect(utf16).toMatchObject({ outcome: 'held', reason: 'unsupported' });
     const without = await redactBuffer(Buffer.from([0, 1, 2, 3, 4, 5]), { filename: 'blob.bin', mode: 'enforce' });
     expect(without.outcome).toBe('clean');
+  });
+});
+
+describe('[Fable M3] the engine subprocess cannot reach the network regardless of python flags', () => {
+  it('engineCommand(args) is either wrapped in a deny-network sandbox, or a plain python argv WITHOUT -I/-E/-S (which would silently disable the sitecustomize guard)', () => {
+    const argv = engineCommand(['--in', 'x.pdf', '--out', 'y.pdf', '--report', 'r.json', '--mode', 'enforce']);
+    expect(Array.isArray(argv)).toBe(true);
+    if (argv[0] === 'sandbox-exec' || argv[0] === '/usr/bin/sandbox-exec') {
+      expect(argv.join(' ')).toMatch(/deny network/);
+    } else {
+      const pyFlags = argv.slice(1, argv.findIndex((a) => a.endsWith('.py')));
+      expect(pyFlags.filter((f) => /^-[^-]*[IES]/.test(f))).toEqual([]);
+    }
+    expect(argv.some((a) => a.endsWith('redact_pdf.py'))).toBe(true);
   });
 });
 

@@ -5,7 +5,7 @@
 // metadata stripped) or HELD. Never 'clean' when it shows a secret. Expected at the end of Phase 0: E_NOT_IMPLEMENTED.
 import { describe, it, expect, beforeAll } from 'vitest';
 import { redactBuffer } from '../../pii-redact.js';
-import { buildFixtures, allLeaks, regionStats, ocrImageFile, SECRETS } from './support/harness.mjs';
+import { buildFixtures, allLeaks, regionStats, ocrImageFile, probeImage, SECRETS } from './support/harness.mjs';
 
 let fx;
 beforeAll(() => { fx = buildFixtures(); }, 120_000);
@@ -14,10 +14,11 @@ const IMAGES = () => ['w2_scan.png', 'w2.tiff', 'w2_photo.jpg', ...(fx.manifest[
 const extOf = (n) => n.slice(n.lastIndexOf('.'));
 
 describe('image files are never "clean" when they show a secret', () => {
-  it('every image fixture -> redacted or held', async () => {
+  it('every image fixture -> redacted or held; [Fable M1 success floor] the plain scans (png, tiff) MUST be redacted', async () => {
     for (const name of IMAGES()) {
       const r = await redactBuffer(fx.read(name), { filename: name, mode: 'enforce' });
-      expect(['redacted', 'held'], name).toContain(r.outcome);
+      if (['w2_scan.png', 'w2.tiff'].includes(name)) expect(r.outcome, name).toBe('redacted');
+      else expect(['redacted', 'held'], name).toContain(r.outcome);
     }
   });
 
@@ -68,5 +69,47 @@ describe('image files are never "clean" when they show a secret', () => {
     expect(r.outcome).toBe('clean');
     expect(Buffer.compare(r.buffer, input)).toBe(0);
     fs.rmSync(d, { recursive: true, force: true });
+  });
+});
+
+describe('[Fable M2] secondary payloads inside image containers', () => {
+  const secretsIn = (text, keys) => allLeaks({ t: [text] }, keys).map((h) => h.key);
+
+  it('clean pixels + SSN only in EXIF ImageDescription: never "clean"/identical; redacted output has no APP1/EXIF and no secret', async () => {
+    const input = fx.read('clean_pixels_exif_ssn.jpg');
+    const r = await redactBuffer(input, { filename: 'c.jpg', mode: 'enforce' });
+    expect(r.outcome).not.toBe('clean');
+    if (r.outcome !== 'redacted') return;
+    const p = probeImage(r.buffer, '.jpg');
+    expect(p.jpeg_app.filter((a) => a !== 'e0')).toEqual([]);
+    expect(secretsIn(p.metadata_text + r.buffer.toString('latin1'), ['ssn1'])).toEqual([]);
+  });
+
+  it('PNG tEXt / iTXt metadata with the SSN: no textual chunk survives', async () => {
+    const r = await redactBuffer(fx.read('w2_meta.png'), { filename: 'm.png', mode: 'enforce' });
+    expect(r.outcome).not.toBe('clean');
+    if (r.outcome !== 'redacted') return;
+    const p = probeImage(r.buffer, '.png');
+    expect(p.png_chunks.filter((c) => ['tEXt', 'iTXt', 'zTXt', 'eXIf'].includes(c))).toEqual([]);
+    expect(secretsIn(p.metadata_text, ['ssn1', 'ssn2'])).toEqual([]);
+  });
+
+  it('EXIF THUMBNAIL (a downscaled copy of the unredacted scan): the output carries exactly one image (one SOI), no APP1', async () => {
+    const r = await redactBuffer(fx.read('w2_thumb.jpg'), { filename: 't.jpg', mode: 'enforce' });
+    expect(['redacted', 'held']).toContain(r.outcome);
+    if (r.outcome !== 'redacted') return;
+    const p = probeImage(r.buffer, '.jpg');
+    expect(p.soi_count).toBe(1);
+    expect(p.jpeg_app).not.toContain('e1');
+    expect(secretsIn(p.frames.join('\n'), ['ssn1', 'ssn2', 'itin'])).toEqual([]);
+  });
+
+  it('multi-frame TIFF whose SECOND frame has the SSN: every frame is redacted (frame count kept) or the file is held', async () => {
+    const r = await redactBuffer(fx.read('w2_2page.tiff'), { filename: 'p.tiff', mode: 'enforce' });
+    expect(['redacted', 'held']).toContain(r.outcome);
+    if (r.outcome !== 'redacted') return;
+    const p = probeImage(r.buffer, '.tiff');
+    expect(p.frames).toHaveLength(2);
+    for (const f of p.frames) expect(secretsIn(f, ['ssn1', 'ssn2', 'itin'])).toEqual([]);
   });
 });

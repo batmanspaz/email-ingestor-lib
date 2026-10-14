@@ -265,6 +265,29 @@ export function regionStats(buffer, { kind, page = 0, rect, dpi = 200 }) {
   }
 }
 
+/** Local tesseract over a PNG buffer — the reference implementation a test hands to deps.ocr (R3, Fable L1/L2). */
+export async function tesseractPng(png) {
+  const tmp = fs.mkdtempSync(path.join(HARNESS_TMP, 'pii-tess-'));
+  try {
+    fs.writeFileSync(path.join(tmp, 'p.png'), png);
+    return execFileSync('tesseract', [path.join(tmp, 'p.png'), '-', '--psm', '6'], { stdio: ['ignore', 'pipe', 'ignore'] }).toString('utf8');
+  } finally {
+    fs.rmSync(tmp, { recursive: true, force: true });
+  }
+}
+
+/** R3 (Fable M2): frames OCR + JPEG APPn segments + SOI count + PNG chunks + textual metadata of an image file. */
+export function probeImage(buffer, ext = '.img') {
+  const tmp = fs.mkdtempSync(path.join(HARNESS_TMP, 'pii-imgprobe-'));
+  const p = path.join(tmp, `x${ext}`);
+  fs.writeFileSync(p, buffer);
+  try {
+    return JSON.parse(execFileSync('python3', [path.join(HERE, 'image_probe.py'), p], { stdio: ['ignore', 'pipe', 'ignore'], maxBuffer: 16 * 1024 * 1024 }).toString('utf8'));
+  } finally {
+    fs.rmSync(tmp, { recursive: true, force: true });
+  }
+}
+
 /** OCR an image FILE buffer with local tesseract (positive controls + output checks for jpg/png/tiff/heic). */
 export function ocrImageFile(buffer, ext) {
   const tmp = fs.mkdtempSync(path.join(HARNESS_TMP, 'pii-ocrimg-'));

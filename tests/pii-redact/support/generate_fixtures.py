@@ -699,6 +699,218 @@ def round2_manifest(photo_truth, has_heic):
     return m
 
 
+# ---------------------------------------------------------------------------------------------------------------
+# ROUND 3 fixtures (Fable red-team, review-verdicts/fable-redact-p0-r2.md). Pixels that a PAGE RENDER never shows.
+# ---------------------------------------------------------------------------------------------------------------
+SSN_KEYS_ON_PAGE0 = ("ssn1", "ssn2", "itin")
+
+
+def first5_rects_pt(page):
+    """First-5-digit rects (PDF points) of every SSN-class secret on a text_layer page."""
+    out = []
+    for key in SSN_KEYS_ON_PAGE0:
+        for r in page.search_for(S[key]):
+            w5 = fitz.get_text_length(S[key][:6], fontname="helv", fontsize=10)
+            out.append(fitz.Rect(r.x0, r.y0, r.x0 + w5, r.y1))
+    return out
+
+
+def _stamp_png(text=None, dpi=200, w=300, h=40, size=16):
+    st = fitz.open()
+    sp = st.new_page(width=w, height=h)
+    sp.insert_text((8, 26), text or f"SSN {S['ssn1']}", fontsize=size, fontname="helv")
+    return sp.get_pixmap(dpi=dpi).tobytes("png")
+
+
+def make_overlay_rect_image(text_pdf, image_pdf, path):
+    """[Fable C1 / naive #7] image-only page with FILLED RECTANGLES drawn over the SSNs; the image XObject pixels are
+    untouched. Page render looks redacted; the XObject at native resolution is not."""
+    src = fitz.open(text_pdf)
+    rects = first5_rects_pt(src[0])
+    doc = fitz.open(image_pdf)
+    for i in range(len(doc)):
+        for key in SSN_KEYS_ON_PAGE0:
+            for r in src[i].search_for(S[key]):
+                doc[i].draw_rect(r, color=(0, 0, 0), fill=(0, 0, 0), overlay=True)
+    doc.save(path, garbage=4, deflate=True, clean=True)
+    return rects
+
+
+def make_thumb(text_pdf, path):
+    """[Fable C1 / naive #8] page text properly redacted, but a /Thumb page thumbnail rendered BEFORE redaction stays."""
+    pix = fitz.open(text_pdf)[0].get_pixmap(dpi=150)
+    d = fitz.open(text_pdf)
+    for pg in d:
+        for key in SSN_KEYS_ON_PAGE0:
+            for r in pg.search_for(S[key]):
+                pg.add_redact_annot(r, fill=(0, 0, 0))
+        pg.apply_redactions()
+    x = d.get_new_xref()
+    d.update_object(x, f"<</Type/XObject/Subtype/Image/Width {pix.width}/Height {pix.height}/ColorSpace/DeviceRGB/BitsPerComponent 8>>")
+    d.update_stream(x, pix.samples)
+    d.xref_set_key(d[0].xref, "Thumb", f"{x} 0 R")
+    d.save(path, garbage=4, deflate=True, clean=True)
+
+
+def make_hidden_ocg_image(path):
+    """[Fable C1 / naive #9] an image in a HIDDEN optional-content layer: the page render honours visibility."""
+    d = fitz.open()
+    p = d.new_page()
+    write_lines(p, ["Synthetic cover page, nothing typed here"])
+    ocg = d.add_ocg("hidden", on=False)
+    p.insert_image(fitz.Rect(54, 140, 354, 180), stream=_stamp_png(), oc=ocg)
+    d.save(path, garbage=4, deflate=True, clean=True)
+
+
+def make_tiny_image(path):
+    """[Fable C1 / naive #10] a 30x4 pt pasted image that is 1250x167 px natively: unreadable in a 220/300 dpi page
+    render, readable at native resolution (and by a vision model)."""
+    d = fitz.open()
+    p = d.new_page()
+    write_lines(p, ["Synthetic page with a very small pasted image"])
+    p.insert_image(fitz.Rect(54, 100, 84, 104), stream=_stamp_png(dpi=300))
+    d.save(path, garbage=4, deflate=True, clean=True)
+
+
+def make_smask_image(path):
+    """[Fable C1] the SSN lives only in an image's SOFT MASK (alpha): white RGB on a white page renders as nothing."""
+    from PIL import Image
+    import io
+    mask = Image.open(io.BytesIO(_stamp_png())).convert("L").point(lambda v: 255 - v)  # text = opaque
+    rgba = Image.new("RGBA", mask.size, (255, 255, 255, 0))
+    rgba.putalpha(mask)
+    b = io.BytesIO()
+    rgba.save(b, "PNG")
+    d = fitz.open()
+    p = d.new_page()
+    write_lines(p, ["Synthetic page with a white-on-white masked image"])
+    p.insert_image(fitz.Rect(54, 140, 354, 180), stream=b.getvalue())
+    d.save(path, garbage=4, deflate=True, clean=True)
+
+
+def make_embedded_binaries(P):
+    """[Fable C1/M5] embedded files that are NOT text: an image (embfile) and a whole PDF (FileAttachment annot)."""
+    d = fitz.open()
+    p = d.new_page()
+    write_lines(p, ["Synthetic PDF carrying an embedded scan"])
+    d.embfile_add("scan.png", _stamp_png())
+    d.save(P("embedded_image.pdf"))
+    d = fitz.open()
+    p = d.new_page()
+    write_lines(p, ["Synthetic PDF carrying an attached return"])
+    p.add_file_annot(fitz.Point(300, 300), open(P("text_layer.pdf"), "rb").read(), "return.pdf")
+    d.save(P("embedded_pdf.pdf"))
+
+
+def make_scan_skew_rotate(path):
+    """[Fable M1] the 'straightforward' scan pages (3-degree skew, /Rotate 90 at 200 dpi): these MUST be redacted."""
+    src = fitz.open(path.replace("scan_skew_rotate.pdf", "scan_variants.pdf"))
+    d = fitz.open()
+    d.insert_pdf(src, from_page=0, to_page=0)
+    d.insert_pdf(src, from_page=3, to_page=3)
+    d.save(path, garbage=3, deflate=True)
+
+
+def make_comb_redacted_ok(path):
+    """[Fable M4] what a CORRECT comb redaction looks like: label, first five boxes solid-filled, last 4 visible.
+    The verifier must accept it (a uniform fill in the value window is a located MASKED value)."""
+    src = fitz.open()
+    p = src.new_page()
+    p.insert_text((60, 100), "Your social security number", fontsize=9, fontname="helv")
+    digits = S["ssn1"].replace("-", "")
+    x = COMB_X0
+    for i, ch in enumerate(digits):
+        if i in (3, 5):
+            x += 12
+        r = fitz.Rect(x, COMB_Y0, x + COMB_W, COMB_Y0 + COMB_H)
+        if i < 5:
+            p.draw_rect(r, color=(0, 0, 0), fill=(0, 0, 0), width=1.2)
+        else:
+            p.draw_rect(r, color=(0, 0, 0), width=1.2)
+            p.insert_text((x + 6, COMB_Y0 + 19), ch, fontsize=14, fontname="cour")
+        x += COMB_W + COMB_GAP
+    image_pages_from(src, path, dpi=200)
+
+
+def _jpeg_with_app1(jpeg_bytes, app1_payload):
+    seg = b"\xff\xe1" + (len(app1_payload) + 2).to_bytes(2, "big") + app1_payload
+    return jpeg_bytes[:2] + seg + jpeg_bytes[2:]
+
+
+def _exif_with_thumbnail(thumb_jpeg):
+    """Minimal big-endian EXIF: empty IFD0 -> IFD1 {Compression=6, JPEGInterchangeFormat, ...Length} -> thumbnail."""
+    import struct
+    tiff = b"MM\x00\x2a" + struct.pack(">I", 8)
+    ifd0 = struct.pack(">H", 0) + struct.pack(">I", 14)
+    thumb_off = 14 + 2 + 3 * 12 + 4
+    ifd1 = struct.pack(">H", 3)
+    ifd1 += struct.pack(">HHII", 0x0103, 3, 1, 6 << 16)
+    ifd1 += struct.pack(">HHII", 0x0201, 4, 1, thumb_off)
+    ifd1 += struct.pack(">HHII", 0x0202, 4, 1, len(thumb_jpeg))
+    ifd1 += struct.pack(">I", 0)
+    return b"Exif\x00\x00" + tiff + ifd0 + ifd1 + thumb_jpeg
+
+
+def make_image_containers(P, text_pdf):
+    """[Fable M2] image files whose secret is in a SECONDARY payload: EXIF text with clean pixels, PNG tEXt/iTXt with
+    clean pixels, an EXIF thumbnail of the unredacted scan, and a 2-frame TIFF whose 2nd frame has the SSN."""
+    from PIL import Image, PngImagePlugin
+    import io
+    clean = fitz.open()
+    cp = clean.new_page(width=400, height=120)
+    cp.insert_text((10, 60), "Grocery receipt total $12.34", fontsize=16, fontname="helv")
+    clean_im = Image.open(io.BytesIO(cp.get_pixmap(dpi=150).tobytes("png"))).convert("RGB")
+    exif = Image.Exif()
+    exif[0x010E] = f"Scan of SSN {S['ssn1']}"
+    clean_im.save(P("clean_pixels_exif_ssn.jpg"), "JPEG", quality=85, exif=exif)
+    info = PngImagePlugin.PngInfo()
+    info.add_text("Comment", f"Taxpayer SSN {S['ssn1']}")
+    info.add_itxt("Description", f"Spouse SSN {S['ssn2']}")
+    clean_im.save(P("w2_meta.png"), "PNG", pnginfo=info)
+    w2 = Image.open(io.BytesIO(fitz.open(text_pdf)[0].get_pixmap(dpi=150).tobytes("png"))).convert("RGB")
+    top = w2.crop((0, 0, w2.width, w2.height // 4))
+    tb = io.BytesIO()
+    top.resize((900, int(900 * top.height / top.width))).save(tb, "JPEG", quality=60)
+    main = io.BytesIO()
+    w2.save(main, "JPEG", quality=70)
+    open(P("w2_thumb.jpg"), "wb").write(_jpeg_with_app1(main.getvalue(), _exif_with_thumbnail(tb.getvalue())))
+    Image.frombytes("RGB", clean_im.size, clean_im.tobytes()).save(P("w2_2page.tiff"), save_all=True, append_images=[Image.frombytes("RGB", w2.size, w2.tobytes())], compression="tiff_deflate")
+
+
+def write_round3(out, P):
+    text_pdf, image_pdf = P("text_layer.pdf"), P("image_only.pdf")
+    overlay_rects = make_overlay_rect_image(text_pdf, image_pdf, P("overlay_rect_image.pdf"))
+    make_thumb(text_pdf, P("thumb.pdf"))
+    make_hidden_ocg_image(P("hidden_ocg_image.pdf"))
+    make_tiny_image(P("tiny_image.pdf"))
+    make_smask_image(P("smask_image.pdf"))
+    make_embedded_binaries(P)
+    make_scan_skew_rotate(P("scan_skew_rotate.pdf"))
+    make_comb_redacted_ok(P("comb_redacted_ok.pdf"))
+    make_image_containers(P, text_pdf)
+    s = 200 / 72  # image_only.pdf / overlay fixture: page 0 image was rendered at 200 dpi from text_layer page 0
+    xtruth = [{"page": 0, "rect": [int(r.x0 * s), int(r.y0 * s), int(r.x1 * s), int(r.y1 * s)]} for r in overlay_rects]
+    return xtruth
+
+
+def round3_manifest(xtruth):
+    return {
+        "overlay_rect_image.pdf": {"secrets": FULL_SECRETS, "surfaces": ["images"], "visible_clean_ssn": True, "pages": 2, "xobject_truth": xtruth},
+        "thumb.pdf": {"secrets": ["ssn1", "ssn2", "itin"], "surfaces": ["images"], "visible_clean_ssn": True, "pages": 2},
+        "hidden_ocg_image.pdf": {"secrets": ["ssn1"], "surfaces": ["images"], "visible_clean": True, "pages": 1},
+        "tiny_image.pdf": {"secrets": ["ssn1"], "surfaces": ["images"], "visible_clean": True, "pages": 1},
+        "smask_image.pdf": {"secrets": ["ssn1"], "surfaces": ["images"], "visible_clean": True, "pages": 1},
+        "embedded_image.pdf": {"secrets": ["ssn1"], "surfaces": ["embedded_bin"], "visible_clean": True, "pages": 1},
+        "embedded_pdf.pdf": {"secrets": FULL_SECRETS, "surfaces": ["embedded_bin"], "visible_clean": True, "pages": 1},
+        "scan_skew_rotate.pdf": {"secrets": ["ssn1"], "surfaces": ["ocr"], "pages": 2},
+        "comb_redacted_ok.pdf": {"secrets": [], "surfaces": [], "pages": 1},
+        "clean_pixels_exif_ssn.jpg": {"secrets": ["ssn1"], "kind": "image", "where": "exif"},
+        "w2_meta.png": {"secrets": ["ssn1", "ssn2"], "kind": "image", "where": "png_text"},
+        "w2_thumb.jpg": {"secrets": FULL_SECRETS, "kind": "image", "where": "exif_thumbnail"},
+        "w2_2page.tiff": {"secrets": FULL_SECRETS, "kind": "image", "where": "frame_2"},
+    }
+
+
 def main():
     out = sys.argv[1]
     os.makedirs(out, exist_ok=True)
@@ -759,6 +971,9 @@ def main():
     }
     photo_truth, has_heic = write_round2(out, P)
     manifest.update(round2_manifest(photo_truth, has_heic))
+    xtruth = write_round3(out, P)
+    manifest.update(round3_manifest(xtruth))
+    manifest["image_only.pdf"]["xobject_truth"] = xtruth
     json.dump(manifest, open(P("manifest.json"), "w"), indent=2)
     print(json.dumps({"ok": True, "dir": out, "files": sorted(manifest)}))
 

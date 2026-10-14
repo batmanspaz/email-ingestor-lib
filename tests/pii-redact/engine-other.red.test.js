@@ -89,6 +89,8 @@ describe('[Sonnet H2, Opus H8] encodings: masked in the SAME encoding, or held �
     it(`${name}`, async () => {
       const input = fx.read(name);
       const r = await redactBuffer(input, { filename: name, mode: 'enforce' });
+      // [Fable M1] success floor: the common encodings MUST be redacted, not held
+      if (['notes_utf16le.txt', 'notes_utf16be.txt', 'notes_utf8bom.txt', 'notes_crlf.txt'].includes(name)) expect(r.outcome).toBe('redacted');
       expect(['redacted', 'held']).toContain(r.outcome);
       if (r.outcome === 'held') return;
       const enc = fx.manifest[name].encoding;
@@ -152,8 +154,7 @@ describe('docx', () => {
   it('[Sonnet H1, Opus H6] return_full.docx: EVERY part is scanned — split runs, tracked deletion (w:delText), comments, header, footer, footnotes, docProps core+custom, customXml, embedded xlsx — and the part list is preserved (replaces round-1 "other parts untouched")', async () => {
     const input = fx.read('return_full.docx');
     const r = await redactBuffer(input, { filename: 'return_full.docx', mode: 'enforce' });
-    expect(['redacted', 'held']).toContain(r.outcome);
-    if (r.outcome === 'held') return;
+    expect(r.outcome).toBe('redacted'); // [Fable M1] success floor: a well-formed docx is redacted, not held
     expect(Object.keys(unzipToMap(r.buffer)).sort()).toEqual(Object.keys(unzipToMap(input)).sort());
     const parts = allParts(r.buffer);
     for (const [n, b] of Object.entries(parts)) {
@@ -179,11 +180,10 @@ describe('docx', () => {
 });
 
 describe('[Sonnet H1, Opus H7] xlsx', () => {
-  it('sheet.xlsx: numeric SSN cell (numFmt 000-00-0000), shared strings, hidden sheet, comment, defined name, docProps — every part clean, or held', async () => {
+  it('sheet.xlsx: numeric SSN cell (numFmt 000-00-0000), shared strings, hidden sheet, comment, defined name, docProps — every part clean (R3: must be redacted, not held)', async () => {
     const input = fx.read('sheet.xlsx');
     const r = await redactBuffer(input, { filename: 'sheet.xlsx', mode: 'enforce' });
-    expect(['redacted', 'held']).toContain(r.outcome);
-    if (r.outcome === 'held') return;
+    expect(r.outcome).toBe('redacted'); // [Fable M1] success floor
     for (const [n, b] of Object.entries(allParts(r.buffer))) {
       expect(hasSecret(b.toString('utf8'), fx.manifest['sheet.xlsx'].secrets), n).toEqual([]);
     }

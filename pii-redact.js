@@ -112,6 +112,11 @@ export function maskText(text, opts) { // eslint-disable-line no-unused-vars
  *  - 'clean' (identical bytes) only if the independent verifier's broad net finds nothing on ANY surface of the
  *    INPUT, raw file bytes included — otherwise the file is rewritten ('redacted') or held.
  *  - AcroForm fields carrying PII are DELETED (value, /DV, appearance stream), not blanked.
+ *  - R3 (Fable C1): image pixels are changed IN PLACE in the image XObject (same pixel dimensions), never covered
+ *    by a drawn rectangle; /Thumb thumbnails are dropped; hidden-OCG / soft-mask / tiny images and embedded
+ *    binaries (images, PDFs) are redacted recursively or the file is held. Image files lose EXIF/XMP/PNG-text and
+ *    embedded thumbnails; every frame of a multi-frame image is redacted.
+ *  - R3 (Fable L2): ALL local OCR goes through deps.ocr (default: tesseract CLI wrapper) — the seam is real.
  *  - Output is byte-deterministic (fixed /ID, no ModDate) so content-addressed envelope ids do not duplicate.
  *  - Temp files live in a 0700 dir under os.tmpdir() and are removed on every exit path.
  *  - Engine stderr / exceptions never surface matched values (only reason codes).
@@ -132,6 +137,9 @@ export async function redactBuffer(buffer, opts) { // eslint-disable-line no-unu
 /**
  * Verify a redacted output: re-extract every surface (text layer, raw streams, metadata, XMP, form fields,
  * annotations, bookmarks, embedded files) AND locally OCR rendered pages; report any unmasked pattern.
+ * R3 (Fable C1/M4/M5): also EVERY image XObject at native resolution (incl. /Thumb, SMask, hidden-OCG, Form-XObject
+ * images; residual surface 'image_xobject') and every embedded / FileAttachment payload inspected as a FILE by type
+ * (residual 'embedded_file'). A uniform fill in a label's value window counts as a located MASKED value.
  * R2 (Sonnet C4, Opus D1/D3): a DELIBERATELY BROADER, fail-closed net than detectPii — NFKC + Unicode-digit
  * folding, zero-width/soft-hyphen stripped, any 9-digit or 3-2-4 run in any script, partial masks (5-8 digits of an
  * SSN) — over raw file bytes + every decoded object/stream (filebytes, objects) as well as the visible surfaces;
@@ -141,6 +149,17 @@ export async function redactBuffer(buffer, opts) { // eslint-disable-line no-unu
  */
 export async function verifyRedacted(buffer, opts) { // eslint-disable-line no-unused-vars
   throw notImplemented('verifyRedacted');
+}
+
+/**
+ * The argv used to spawn the python engine (R3, Fable M3). The no-network guarantee must not depend on python flags:
+ * either the command is wrapped in a deny-network sandbox (`sandbox-exec -p '(version 1)(allow default)(deny network*)'`)
+ * or it is a plain `python3 <redact_pdf.py> ...` WITHOUT -I/-E/-S (those disable sitecustomize and so the test guard).
+ * @param {string[]} args  engine CLI args
+ * @returns {string[]} argv
+ */
+export function engineCommand(args) { // eslint-disable-line no-unused-vars
+  throw notImplemented('engineCommand');
 }
 
 /**

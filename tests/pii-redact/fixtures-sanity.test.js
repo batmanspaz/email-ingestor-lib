@@ -1,7 +1,8 @@
 // GREEN by design (positive controls). These prove the P0 harness is real: the synthetic fixtures leak where they
 // should and the independent inspector can see it. If these ever go red, the RED suites below are meaningless.
 import { describe, it, expect, beforeAll } from 'vitest';
-import { buildFixtures, inspectPdf, leaks, allLeaks, partialLeaks, negativesPresent, privateDigitsIn, regionStats, ocrImageFile, normalizeForCheck, SECRETS } from './support/harness.mjs';
+import { buildFixtures, inspectPdf, leaks, allLeaks, partialLeaks, negativesPresent, privateDigitsIn, regionStats, ocrImageFile, probeImage, installNetworkGuard, normalizeForCheck, SECRETS } from './support/harness.mjs';
+import { execFileSync } from 'node:child_process';
 
 let fx;
 beforeAll(() => { fx = buildFixtures(); }, 120_000);
@@ -191,5 +192,75 @@ describe('round-2 fixtures are what they claim (positive controls)', () => {
   it('[Opus D8] privateDigitsIn accepts a spec-correct heartbeat (ttl 24h) and rejects any 64-hex hash by default', () => {
     expect(privateDigitsIn({ module: 'pii-redaction', status: 'ok', ttl_seconds: 86400, at: '2026-10-14T08:00:00Z' })).toEqual([]);
     expect(privateDigitsIn({ props: { original_sha256: 'a'.repeat(64) } })).toContain('sha256_hex');
+  });
+});
+
+// ---------------------------------------------------------------------------------------------------------------
+// ROUND 3 positive controls (Fable red-team, fable-redact-p0-r2.md). Each proves the blind spot is real for a
+// page-render-only inspector AND that the new `images` / `embedded_bin` / xobject-pixel checks see it.
+// ---------------------------------------------------------------------------------------------------------------
+describe('round-3 fixtures: pixels a page render never shows (positive controls)', () => {
+  const SSNK = ['ssn1', 'ssn2', 'itin'];
+
+  it('[Fable C1 / naive #7] overlay_rect_image.pdf: page-render OCR and page-render pixels look redacted; the image XObject at native resolution still has the SSNs', () => {
+    const r = inspectPdf(fx.read('overlay_rect_image.pdf'), { ocr: true });
+    expect(allLeaks({ ocr: r.surfaces.ocr }, SSNK)).toEqual([]);
+    expect(new Set(leaks({ images: r.surfaces.images }, SSNK).map((h) => h.key))).toEqual(new Set(SSNK));
+    for (const t of fx.manifest['overlay_rect_image.pdf'].xobject_truth) {
+      expect(regionStats(fx.read('overlay_rect_image.pdf'), { kind: 'pdf', page: 0, rect: t.rect.map((v) => (v * 72) / 200), dpi: 200 }).std).toBeLessThan(8);
+      expect(regionStats(fx.read('overlay_rect_image.pdf'), { kind: 'xobject', ...t }).std).toBeGreaterThan(20);
+    }
+  });
+
+  for (const n of ['thumb.pdf', 'hidden_ocg_image.pdf', 'tiny_image.pdf', 'smask_image.pdf']) {
+    it(`[Fable C1] ${n}: no secret on the text / content / page-render surfaces, but the images surface reads it`, () => {
+      const r = inspectPdf(fx.read(n), { ocr: true });
+      const ks = fx.manifest[n].secrets;
+      expect(allLeaks({ text: r.surfaces.text, raw: r.surfaces.raw, ocr: r.surfaces.ocr }, SSNK.filter((k) => ks.includes(k)))).toEqual([]);
+      expect(leaks({ images: r.surfaces.images }, ks).map((h) => h.key)).toContain('ssn1');
+    });
+  }
+
+  it('[Fable C1/M5] embedded_image.pdf / embedded_pdf.pdf: embedded payloads inspected AS FILES reveal the secret', () => {
+    expect(leaks({ e: inspectPdf(fx.read('embedded_image.pdf'), { ocr: false }).surfaces.embedded_bin }).map((h) => h.key)).toContain('ssn1');
+    const pdf = inspectPdf(fx.read('embedded_pdf.pdf'), { ocr: false });
+    expect(new Set(leaks({ e: pdf.surfaces.embedded_bin }).map((h) => h.key))).toEqual(new Set(fx.manifest['embedded_pdf.pdf'].secrets));
+  });
+
+  it('[Fable M4] comb_redacted_ok.pdf (first five boxes filled, last 4 visible) carries no full or partial secret, and its first-5 boxes are uniform', () => {
+    const r = inspectPdf(fx.read('comb_redacted_ok.pdf'), { ocr: true, ocrAlt: true });
+    expect(allLeaks(r.surfaces)).toEqual([]);
+    for (const t of fx.manifest['comb_ssn_image.pdf'].pixel_truth) expect(regionStats(fx.read('comb_redacted_ok.pdf'), { kind: 'pdf', ...t }).std).toBeLessThan(8);
+  });
+
+  it('[Fable M2] image containers carry their secret where claimed (EXIF text, PNG text chunks, EXIF thumbnail, 2nd TIFF frame)', () => {
+    const exif = probeImage(fx.read('clean_pixels_exif_ssn.jpg'), '.jpg');
+    expect(leaks({ f: exif.frames }, ['ssn1'])).toEqual([]);
+    expect(exif.jpeg_app).toContain('e1');
+    expect(leaks({ m: [exif.metadata_text] }, ['ssn1']).length).toBe(1);
+    const png = probeImage(fx.read('w2_meta.png'), '.png');
+    expect(png.png_chunks).toEqual(expect.arrayContaining(['tEXt', 'iTXt']));
+    expect(leaks({ f: png.frames }, ['ssn1', 'ssn2'])).toEqual([]);
+    expect(probeImage(fx.read('w2_thumb.jpg'), '.jpg').soi_count).toBe(2);
+    const tif = probeImage(fx.read('w2_2page.tiff'), '.tiff');
+    expect(tif.frames).toHaveLength(2);
+    expect(leaks({ f: [tif.frames[0]] }, ['ssn1'])).toEqual([]);
+    expect(leaks({ f: [tif.frames[1]] }, ['ssn1']).length).toBe(1);
+  });
+
+  it('[Fable M3] the python network guard really fires for a plain `python3` child (positive control)', () => {
+    const g = installNetworkGuard();
+    try {
+      try { execFileSync('python3', ['-c', 'import socket\nsocket.create_connection(("127.0.0.1", 9), timeout=0.2)'], { stdio: 'ignore' }); } catch { /* the guard raises */ }
+      expect(g.pythonNetworkUsed()).toBe(true);
+    } finally { g.restore(); }
+  });
+
+  it('[Fable M3] ...and documents the bypass: `python3 -I` never loads sitecustomize (hence the engineCommand contract)', () => {
+    const g = installNetworkGuard();
+    try {
+      try { execFileSync('python3', ['-I', '-c', 'import socket\ntry:\n socket.create_connection(("127.0.0.1", 9), timeout=0.2)\nexcept Exception: pass'], { stdio: 'ignore' }); } catch { /* ignore */ }
+      expect(g.pythonNetworkUsed()).toBe(false);
+    } finally { g.restore(); }
   });
 });

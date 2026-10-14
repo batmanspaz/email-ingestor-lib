@@ -19,6 +19,11 @@ Prints one JSON object: every extractable surface of the PDF as {name: [strings]
             JavaScript, XFA, custom Info keys, page labels, link URIs, file-attachment annotations, private keys)
   ocr_alt   SECOND OCR setup (only with --ocr-alt): 300 dpi grayscale, table lines removed, --psm 11, digits+dash
             whitelist pass. [Opus D3: one OCR engine/config is a single point of failure]
+  -- round 3 (Fable C1/M5: a PAGE RENDER never shows overlaid, /Thumb, hidden-OCG, tiny, soft-mask images) --
+  images    (with --ocr) EVERY image XObject in the file (incl. /Thumb, SMask, images in Form XObjects and hidden
+            OCG layers) extracted at NATIVE resolution and OCR'd (psm 6 + psm 11; grey images also inverted)
+  embedded_bin every embedded file AND FileAttachment-annotation payload, inspected AS A FILE by type: PDF ->
+            text + objects + images (recursive, depth 2), image -> OCR, else UTF-8 + UTF-16LE text
   meta      {revisions: count of %%EOF markers, xref_length, xref_length_gc: xref length after garbage=4,
              is_encrypted, spans: [[span text...] per page]}
 Failure to open (corrupt/encrypted) is reported, not raised.
@@ -132,6 +137,91 @@ def ocr_alt(doc):
     return texts
 
 
+IMG_MAGIC = (b"\x89PNG", b"\xff\xd8\xff", b"II*\x00", b"MM\x00*", b"GIF8")
+
+
+def ocr_png_bytes(png: bytes, invert=False):
+    """OCR one PNG with two page-segmentation modes (and optionally the inverted image)."""
+    out = []
+    with tempfile.TemporaryDirectory() as td:
+        p = os.path.join(td, "i.png")
+        if invert:
+            from PIL import Image, ImageOps
+            import io
+            ImageOps.invert(Image.open(io.BytesIO(png)).convert("L")).save(p)
+        else:
+            open(p, "wb").write(png)
+        for psm in ("6", "11"):
+            r = subprocess.run(["tesseract", p, "-", "--psm", psm], capture_output=True, text=True)
+            out.append(r.stdout)
+    return "\n".join(out)
+
+
+def images_surface(doc):
+    texts, stats = [], []
+    for x in range(1, doc.xref_length()):
+        try:
+            if doc.xref_get_key(x, "Subtype")[1] != "/Image":
+                continue
+            pix = fitz.Pixmap(doc, x)
+            if pix.alpha:
+                pix = fitz.Pixmap(pix, 0)
+            if pix.n - pix.alpha not in (1, 3):
+                pix = fitz.Pixmap(fitz.csRGB, pix)
+            png = pix.tobytes("png")
+        except Exception:
+            continue
+        gray = pix.n == 1
+        t = ocr_png_bytes(png) + ("\n" + ocr_png_bytes(png, invert=True) if gray else "")
+        texts.append(t)
+        stats.append({"xref": x, "w": pix.width, "h": pix.height})
+    return texts, stats
+
+
+def embedded_payloads(doc):
+    out = []
+    try:
+        for name in doc.embfile_names():
+            out.append(doc.embfile_get(name))
+    except Exception:
+        pass
+    for pg in doc:
+        for a in pg.annots() or []:
+            try:
+                if a.type[0] == fitz.PDF_ANNOT_FILE_ATTACHMENT:
+                    out.append(a.get_file())
+            except Exception:
+                continue
+    return out
+
+
+def inspect_payload(b: bytes, depth=0):
+    if b.startswith(b"%PDF") and depth < 2:
+        try:
+            d = fitz.open("pdf", b)
+            parts = [pg.get_text("text") for pg in d] + objects_surface(d)
+            parts += images_surface(d)[0]
+            parts += [inspect_payload(e, depth + 1) for e in embedded_payloads(d)]
+            return "\n".join(parts)
+        except Exception:
+            return b.decode("latin-1")
+    if b.startswith(IMG_MAGIC):
+        try:
+            from PIL import Image
+            import io
+            frames = []
+            im = Image.open(io.BytesIO(b))
+            for i in range(getattr(im, "n_frames", 1)):
+                im.seek(i)
+                buf = io.BytesIO()
+                im.convert("RGB").save(buf, "PNG")
+                frames.append(ocr_png_bytes(buf.getvalue()))
+            return "\n".join(frames)
+        except Exception:
+            return ""
+    return b.decode("utf-8", errors="replace") + "\n" + b.decode("utf-16-le", errors="replace")
+
+
 def main():
     path = sys.argv[1]
     want_ocr = "--ocr" in sys.argv
@@ -222,6 +312,9 @@ def main():
         s["ocr"] = texts
     if want_ocr_alt:
         s["ocr_alt"] = ocr_alt(doc)
+    if want_ocr:
+        s["images"], out["meta"]["images"] = images_surface(doc)
+    s["embedded_bin"] = [inspect_payload(b) for b in embedded_payloads(doc)]
     print(json.dumps(out))
 
 
