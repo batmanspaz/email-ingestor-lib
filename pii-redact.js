@@ -19,7 +19,7 @@ export const COUNT_KEYS = ['ssn', 'bank', 'dob', 'pin', 'id'];
 export const MODES = ['off', 'shadow', 'enforce'];
 export const REPORT_SCHEMA = 'pii-redaction-report/v1';
 export const HELD_REASONS = [
-  'encrypted', 'corrupt', 'corrupt_member', 'verify_failed', 'ocr_unavailable', 'unsupported', 'too_large', 'engine_error',
+  'encrypted', 'corrupt', 'corrupt_member', 'verify_failed', 'ocr_unavailable', 'unsupported', 'too_large', 'engine_error', 'vault_failed',
 ];
 
 function notImplemented(name) {
