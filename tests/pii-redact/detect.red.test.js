@@ -1,7 +1,8 @@
 // P0 RED — pure detector/masker contract (detectPii / maskText). Synthetic values only.
 // Expected at the end of Phase 0: every test fails with E_NOT_IMPLEMENTED (Phase 1 makes them pass).
 import { describe, it, expect } from 'vitest';
-import { detectPii, maskText } from '../../pii-redact.js';
+import { detectPii, maskText, sanitizeFilename } from '../../pii-redact.js';
+import { textLeaks, normalizeForCheck } from './support/harness.mjs';
 
 const kinds = (text) => detectPii(text).map((f) => f.kind);
 
@@ -172,5 +173,146 @@ describe('counts shape', () => {
   });
   it('detectPii kinds are drawn from the declared set', () => {
     expect(kinds('SSN 123-45-6789 DOB 01/02/1980')).toEqual(['ssn', 'dob']);
+  });
+});
+
+// ---------------------------------------------------------------------------------------------------------------
+// ROUND 2 (red-team fold-in, 2026-10-14). IDs map to review-verdicts/{sonnet,opus}-redact-p0.md.
+// ---------------------------------------------------------------------------------------------------------------
+
+describe('[Sonnet C5, Opus H4] Unicode / obfuscated SSNs are found and masked (checked after NFKC + digit folding)', () => {
+  const variants = [
+    ['fullwidth digits', 'SSN \uff11\uff12\uff13-\uff14\uff15-\uff16\uff17\uff18\uff19'],
+    ['fullwidth hyphen U+FF0D', 'SSN 123\uff0d45\uff0d6789'],
+    ['small hyphen U+FE63', 'SSN 123\ufe6345\ufe636789'],
+    ['Arabic-Indic digits', 'SSN \u0661\u0662\u0663-\u0664\u0665-\u0666\u0667\u0668\u0669'],
+    ['Devanagari digits', 'SSN \u0967\u0968\u0969-\u096a\u096b-\u096c\u096d\u096e\u096f'],
+    ['zero-width space', 'SSN 123\u200b-45-6789'],
+    ['zero-width joiner', 'SSN 123-\u200d45-6789'],
+    ['soft hyphens as separators', 'SSN 123\u00ad45\u00ad6789'],
+    ['minus sign U+2212', 'SSN 123\u221245\u22126789'],
+    ['hyphen U+2010', 'SSN 123\u201045\u20106789'],
+    ['figure dash U+2012', 'SSN 123\u201245\u20126789'],
+    ['middle dot (what base-14 fonts emit for an en dash)', 'SSN 123\u00b745\u00b76789'],
+    ['letter-spaced', 'SSN 1 2 3 - 4 5 - 6 7 8 9'],
+  ];
+  for (const [name, input] of variants) {
+    it(`masks ${name}; no full or partial SSN left; last 4 kept as ASCII`, () => {
+      const r = maskText(input);
+      expect(r.counts.ssn).toBe(1);
+      expect(textLeaks(r.text, ['ssn1'])).toEqual([]);
+      expect(normalizeForCheck(r.text)).toContain('XXX-XX-6789');
+    });
+  }
+
+  it('never reveals MORE than the last 4: a labelled SSN embedded in a longer digit token is masked whole', () => {
+    const r = maskText('SSN 1123-45-67890');
+    expect(textLeaks(r.text, ['ssn1'])).toEqual([]);
+    expect(r.counts.ssn).toBe(1);
+  });
+
+  it('an already-masked SSN next to an unmasked one: only the unmasked one counts and changes', () => {
+    const r = maskText('SSN XXX-XX-6789 and 987-65-4320');
+    expect(r.text).toBe('SSN XXX-XX-6789 and XXX-XX-4320');
+    expect(r.counts.ssn).toBe(1);
+  });
+});
+
+describe('[Opus M9, Sonnet M3/M4] EIN stays visible, prior-year AGI / e-file PINs are redacted (decided phrasings)', () => {
+  for (const s of [
+    'Adjusted gross income 64,210',
+    'AGI 64,210',
+    'Line 1 Adjusted gross income 64,210', // Form 8879 line 1 = THIS year's AGI: visible per decision (PENDING PAUL item 1)
+    "PAYER'S TIN 98-7654321",
+    'Employer identification number 98-7654321',
+    'FEIN 98-7654321',
+    "b Employer's ID number 98-7654321",
+    'Prior year tax paid 78,901', // a different prior-year quantity: bounds false positives
+  ]) {
+    it(`leaves "${s}" untouched`, () => {
+      expect(detectPii(s)).toEqual([]);
+      expect(maskText(s).text).toBe(s);
+    });
+  }
+
+  it('an EIN right after an SSN keeps its digits (label-window bleed must not mask it)', () => {
+    const r = maskText('SSN 123-45-6789 EIN 98-7654321');
+    expect(r.text).toBe('SSN XXX-XX-6789 EIN 98-7654321');
+  });
+
+  it("documented fail-toward-privacy: an UNSEPARATED 9-digit value after any TIN label is masked even when it is a payer's EIN", () => {
+    const r = maskText("PAYER'S TIN 987654321");
+    expect(r.text).not.toContain('987654321');
+    expect(r.counts.ssn).toBe(1);
+  });
+
+  for (const s of [
+    'Enter your prior-year AGI\n78,901',
+    "Last year's AGI: 78,901",
+    'Prior year AGI   $ 78 901',
+    'Prior year AGI\t|\t78,901',
+  ]) {
+    it(`redacts prior-year AGI phrased as ${JSON.stringify(s)}`, () => {
+      const r = maskText(s);
+      expect(r.text).toMatch(/\[REDACTED-AGI\]/);
+      expect(r.text.replace(/\D/g, '')).not.toContain('78901');
+      expect(r.counts.pin).toBe(1);
+    });
+  }
+
+  for (const s of ['Self-Select PIN 31415', 'Practitioner PIN 31415', 'Taxpayer PIN: 31415', 'IP PIN 314159', 'Identity Protection PIN 314159']) {
+    it(`redacts the e-file signature PIN in ${JSON.stringify(s)}`, () => {
+      const r = maskText(s);
+      expect(r.text).toMatch(/\[REDACTED-PIN\]/);
+      expect(r.text).not.toMatch(/31415/);
+      expect(r.counts.pin).toBe(1);
+    });
+  }
+});
+
+describe('[Sonnet M5] labels in other layouts, and the label window', () => {
+  for (const [s, kind] of [
+    ['Routing number\n021000021', 'routing'],
+    ['ROUTING NUMBER: 021000021', 'routing'],
+    ['Acct. No. 55501928', 'bank_account'],
+    ['Account #: 55501928', 'bank_account'],
+    ['A/C 55501928', 'bank_account'],
+    ['Date of Birth\n01/02/1980', 'dob'],
+  ]) {
+    it(`finds ${kind} in ${JSON.stringify(s)}`, () => {
+      expect(detectPii(s).map((f) => f.kind)).toEqual([kind]);
+    });
+  }
+  it('a value far outside the default label window (200 chars away) is NOT redacted', () => {
+    expect(detectPii(`Routing number: see the attached letter.${' '.repeat(10)}${'filler '.repeat(28)} 021000021`)).toEqual([]);
+  });
+  it('labelWindow option bounds the search (just outside: no; just inside: yes)', () => {
+    const text = `Account number: ${'.'.repeat(30)} 55501928`;
+    expect(detectPii(text, { labelWindow: 20 })).toEqual([]);
+    expect(detectPii(text, { labelWindow: 60 }).map((f) => f.kind)).toEqual(['bank_account']);
+  });
+});
+
+describe('[Sonnet C2, Opus D14/H11] sanitizeFilename (names are content: subject, manifest, archive, vault, logs)', () => {
+  it('masks an SSN in a file name and keeps the extension', () => {
+    expect(sanitizeFilename('W2 123-45-6789.pdf')).toBe('W2 XXX-XX-6789.pdf');
+  });
+  it('masks an unseparated labelled SSN', () => {
+    const out = sanitizeFilename('SSN123456789.txt');
+    expect(textLeaks(out, ['ssn1'])).toEqual([]);
+    expect(out.endsWith('.txt')).toBe(true);
+  });
+  it('masks Unicode-digit SSNs in names', () => {
+    expect(textLeaks(sanitizeFilename('SSN \uff11\uff12\uff13-\uff14\uff15-\uff16\uff17\uff18\uff19.pdf'), ['ssn1'])).toEqual([]);
+  });
+  it('neutralises path traversal and control characters', () => {
+    for (const n of ['../../etc/passwd', '..\\..\\x.pdf', 'a/b/c.pdf', 'a\u0000b\nc.pdf']) {
+      const out = sanitizeFilename(n);
+      expect(out, n).not.toMatch(/[\/\\\u0000-\u001f]|(^|[^.])\.\.([^.]|$)/);
+      expect(out.length, n).toBeGreaterThan(0);
+    }
+  });
+  it('leaves ordinary names alone (names/years are not redacted per decision)', () => {
+    for (const n of ['Jane Q Tester 2025 Return.pdf', 'Form 1040 2025.pdf', 'invoice-246813579.pdf']) expect(sanitizeFilename(n)).toBe(n);
   });
 });

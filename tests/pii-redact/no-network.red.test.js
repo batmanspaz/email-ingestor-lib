@@ -1,4 +1,8 @@
 // P0 RED — nothing leaves the machine before redaction completes. Expected at end of Phase 0: E_NOT_IMPLEMENTED.
+// R2 (Opus M4/D20, Sonnet M2): the guard now covers fetch, node:http/https, net.Socket#connect and dns.lookup in this
+// process AND every socket/getaddrinfo in the python engine subprocess (sitecustomize marker). The round-1 phantom
+// `deps.remoteOcr` collaborator (an implementation could simply ignore it, making the assertion vacuous) is gone; the
+// "no remote model in the import graph" half lives in the GREEN no-remote-model.test.js.
 import { describe, it, expect, beforeAll, afterEach } from 'vitest';
 import fs from 'node:fs';
 import path from 'node:path';
@@ -9,21 +13,16 @@ import { buildFixtures, installNetworkGuard } from './support/harness.mjs';
 let fx;
 let guard;
 beforeAll(() => { fx = buildFixtures(); }, 120_000);
-afterEach(() => { guard?.restore(); });
+afterEach(() => { guard?.restore(); guard = null; });
 
 describe('no remote calls while redacting', () => {
-  for (const name of ['text_layer.pdf', 'image_only.pdf', 'mixed.pdf', 'notes.txt', 'bundle.zip']) {
-    it(`${name}: zero fetch calls and zero remote-OCR calls (image pages use LOCAL tesseract)`, async () => {
+  for (const name of ['text_layer.pdf', 'image_only.pdf', 'mixed.pdf', 'image_on_text_page.pdf', 'notes.txt', 'bundle.zip', 'return_full.docx', 'sheet.xlsx', 'w2_scan.png']) {
+    it(`${name}: zero network activity in node AND in the python engine (image pages/files use LOCAL tesseract)`, async () => {
       guard = installNetworkGuard();
-      const remote = [];
-      const r = await redactBuffer(fx.read(name), {
-        filename: name,
-        mode: 'enforce',
-        deps: { remoteOcr: async (...a) => { remote.push(a); throw new Error('remote OCR forbidden'); } },
-      });
-      expect(['redacted', 'clean']).toContain(r.outcome);
+      const r = await redactBuffer(fx.read(name), { filename: name, mode: 'enforce' });
+      expect(['redacted', 'clean', 'held']).toContain(r.outcome);
       expect(guard.calls).toEqual([]);
-      expect(remote).toEqual([]);
+      expect(guard.pythonNetworkUsed()).toBe(false);
     });
   }
 

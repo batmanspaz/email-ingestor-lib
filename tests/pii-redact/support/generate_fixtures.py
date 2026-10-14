@@ -159,20 +159,42 @@ def make_footer_every_page(path, pages=5):
 
 
 def make_split_spans(path):
+    """R2 (Opus D21/H5): the round-1 fixture extracted as ONE span. Now the SSN really is split:
+    ssn1 = two spans in DIFFERENT fonts on one baseline; ssn2 = wrapped across two lines;
+    itin = two separate text blocks (two-column layout)."""
     doc = fitz.open()
     p = doc.new_page()
     p.insert_text((54, 100), "SSN: 123-45-", fontsize=10, fontname="helv")
     w = fitz.get_text_length("SSN: 123-45-", fontname="helv", fontsize=10)
-    p.insert_text((54 + w, 100), "6789", fontsize=10, fontname="helv")
+    p.insert_text((54 + w, 100), "6789", fontsize=10, fontname="cour")
+    p.insert_text((54, 140), "Spouse SSN 987-65-", fontsize=10, fontname="helv")
+    p.insert_text((54, 154), "4320 (continued)", fontsize=10, fontname="helv")
+    tw = fitz.TextWriter(p.rect)
+    tw.append((54, 200), "Dependent ITIN 912-78-", fontsize=10)
+    tw.write_text(p)
+    tw2 = fitz.TextWriter(p.rect)
+    tw2.append((320, 200), "1234", fontsize=10)
+    tw2.write_text(p)
     doc.save(path)
+
+
+UNICODE_FONT = "/System/Library/Fonts/Supplemental/Arial Unicode.ttf"
 
 
 def make_unicode_dashes(path):
+    """R2 (Opus D21/H5): base-14 Helvetica cannot encode U+2013/U+00A0/U+2011 (the round-1 en dash extracted as
+    U+00B7 and the 'NBSP' line was plain spaces). Embed a Unicode TTF (subset) so the code points really exist."""
     doc = fitz.open()
     p = doc.new_page()
-    p.insert_text((54, 100), "SSN 123 45 6789", fontsize=10, fontname="helv")
-    p.insert_text((54, 120), "SSN 987–65–4320", fontsize=10, fontname="helv")
-    doc.save(path)
+    if os.path.exists(UNICODE_FONT):
+        p.insert_font(fontname="UF", fontfile=UNICODE_FONT)
+    else:  # non-mac fallback: built-in Droid fallback covers U+2013 at least
+        p.insert_font(fontname="UF", fontbuffer=fitz.Font("cjk").buffer)
+    p.insert_text((54, 100), "SSN 123 45 6789", fontsize=10, fontname="UF")
+    p.insert_text((54, 120), "SSN 987–65–4320", fontsize=10, fontname="UF")
+    p.insert_text((54, 140), "ITIN 912‑78‑1234", fontsize=10, fontname="UF")
+    doc.subset_fonts()
+    doc.save(path, garbage=3, deflate=True)
 
 
 def make_clean(path):
@@ -215,6 +237,466 @@ def docx_bytes(paragraphs):
         z.writestr("_rels/.rels", rels)
         z.writestr("word/document.xml", doc)
     return buf.getvalue()
+
+
+# ---------------------------------------------------------------------------------------------------------------
+# ROUND 2 fixtures (red-team fold-in, 2026-10-14). Every one of these defeats a naive engine/inspector in a way the
+# Sonnet/Opus red-team verdicts demonstrated. IDs in brackets map to review-verdicts/{sonnet,opus}-redact-p0.md.
+# ---------------------------------------------------------------------------------------------------------------
+
+def _ssn_page(doc, lines=None):
+    p = doc.new_page()
+    write_lines(p, lines or ["Synthetic return", f"Taxpayer SSN {S['ssn1']}"])
+    return p
+
+
+def make_incremental_history(path):
+    """[Opus D1/D2/C2, Sonnet C3] SSN exists ONLY in a superseded revision: rev 1 has it; rev 2 (incremental save)
+    redacts the page. Visible text is clean; raw file bytes are not."""
+    doc = fitz.open()
+    _ssn_page(doc)
+    doc.save(path)
+    doc.close()
+    doc = fitz.open(path)
+    pg = doc[0]
+    for r in pg.search_for(S["ssn1"]):
+        pg.add_redact_annot(r)
+    pg.apply_redactions()
+    doc.saveIncr()
+    doc.close()
+
+
+def make_orphan_after_redact(path):
+    """[Opus D1] apply_redactions + default save (garbage=0) leaves the old content stream as an unreferenced
+    object in the file. Visible text clean; raw bytes still hold the SSN."""
+    doc = fitz.open()
+    _ssn_page(doc)
+    doc = fitz.open("pdf", doc.tobytes())
+    pg = doc[0]
+    for r in pg.search_for(S["ssn1"]):
+        pg.add_redact_annot(r)
+    pg.apply_redactions()
+    doc.save(path)
+
+
+def make_objstm(path):
+    """[Sonnet C3, Opus C1] SSN in a private catalog key, inside a compressed object stream (ObjStm)."""
+    doc = fitz.open()
+    p = doc.new_page()
+    write_lines(p, ["Synthetic PDF with private application data"])
+    doc.xref_set_key(doc.pdf_catalog(), "SynthPrivateData", f"(Taxpayer SSN {S['ssn1']})")
+    doc.save(path, garbage=1, deflate=True, use_objstms=1)
+
+
+def make_form_xobject(path):
+    """[Sonnet C3] SSN drawn by a Form XObject: not in the page content stream itself."""
+    src = fitz.open()
+    _ssn_page(src)
+    doc = fitz.open()
+    p = doc.new_page()
+    write_lines(p, ["Synthetic page that places another page as a form XObject"], y0=40)
+    p.show_pdf_page(fitz.Rect(36, 80, 576, 780), src, 0)
+    doc.save(path, garbage=3, deflate=True)
+
+
+def make_acroform_full(path):
+    """[Opus D6/H1] widget value = ssn1 on a HIDDEN widget (appearance stream carries it), /DV default value = ssn2.
+    Blanking the value + update() still leaks; the field must be DELETED."""
+    doc = fitz.open()
+    p = doc.new_page()
+    write_lines(p, ["Synthetic e-file authorization form (hidden field)"])
+    w = fitz.Widget()
+    w.field_type = fitz.PDF_WIDGET_TYPE_TEXT
+    w.field_name = "taxpayer_ssn_hidden"
+    w.field_value = S["ssn1"]
+    w.rect = fitz.Rect(54, 100, 260, 120)
+    p.add_widget(w)
+    w2 = list(p.widgets())[0]
+    doc.xref_set_key(w2.xref, "DV", f"({S['ssn2']})")
+    doc.xref_set_key(w2.xref, "F", "2")  # annotation flag: Hidden
+    doc.save(path)
+
+
+def make_image_on_text_page(path):
+    """[Opus D6/C5] a TEXT page (has a text layer, so a naive engine never OCRs it) carrying a scanned stamp image
+    with the SSN in its pixels."""
+    stamp = fitz.open()
+    sp = stamp.new_page(width=300, height=40)
+    sp.insert_text((8, 26), f"SSN {S['ssn1']}", fontsize=16, fontname="helv")
+    pix = sp.get_pixmap(dpi=200)
+    doc = fitz.open()
+    p = doc.new_page()
+    write_lines(p, ["Synthetic cover letter with a pasted W-2 stamp", "Nothing private is typed on this page."])
+    p.insert_image(fitz.Rect(54, 140, 354, 180), stream=pix.tobytes("png"))
+    doc.save(path, garbage=3, deflate=True)
+
+
+# Comb field geometry (PDF points) — the generator records ground truth for the pixel check. [Opus D3/C3]
+COMB_X0, COMB_Y0, COMB_W, COMB_H, COMB_GAP = 60, 120, 22, 26, 4
+
+
+def comb_digit_rects():
+    rects = []
+    x = COMB_X0
+    for i in range(9):
+        if i in (3, 5):
+            x += 12  # visual dash gap
+        rects.append([x + 3, COMB_Y0 + 3, x + COMB_W - 3, COMB_Y0 + COMB_H - 3])
+        x += COMB_W + COMB_GAP
+    return rects
+
+
+def make_comb_ssn_image(path):
+    """[Opus D3/C3] 1040/W-2 style comb field: each SSN digit sits in its own box under the label. Rasterised to an
+    image-only page. Tesseract misreads these (probe: 's|7|8]o'), Claude vision does not."""
+    src = fitz.open()
+    p = src.new_page()
+    p.insert_text((60, 100), "Your social security number", fontsize=9, fontname="helv")
+    digits = S["ssn1"].replace("-", "")
+    x = COMB_X0
+    for i, ch in enumerate(digits):
+        if i in (3, 5):
+            x += 12
+        p.draw_rect(fitz.Rect(x, COMB_Y0, x + COMB_W, COMB_Y0 + COMB_H), color=(0, 0, 0), width=1.2)
+        p.insert_text((x + 6, COMB_Y0 + 19), ch, fontsize=14, fontname="cour")
+        x += COMB_W + COMB_GAP
+    p.insert_text((60, 200), "Synthetic form - comb field test", fontsize=9, fontname="helv")
+    image_pages_from(src, path, dpi=200)
+
+
+def image_pages_from(src, out_path, dpi=200, rotate=0.0, gray=False):
+    doc = fitz.open()
+    for pg in src:
+        pix = pg.get_pixmap(dpi=dpi, colorspace=fitz.csGRAY if gray else fitz.csRGB)
+        png = pix.tobytes("png")
+        if rotate:
+            from PIL import Image
+            import io
+            im = Image.open(io.BytesIO(png)).convert("RGB").rotate(rotate, expand=False, fillcolor=(255, 255, 255))
+            b = io.BytesIO()
+            im.save(b, "PNG")
+            png = b.getvalue()
+        np_ = doc.new_page(width=pg.rect.width, height=pg.rect.height)
+        np_.insert_image(np_.rect, stream=png)
+    doc.save(out_path, deflate=True, garbage=3)
+
+
+def make_scan_variants(path):
+    """[Sonnet C3] image-only pages that stress local OCR: 3-degree skew, 100 dpi, light-grey ink, /Rotate 90."""
+    def page_with(color):
+        s = fitz.open()
+        pg = s.new_page()
+        write_lines(pg, ["Synthetic scan", f"Taxpayer SSN {S['ssn1']}"], color=color)
+        return s
+    tmp = []
+    for i, (dpi, rot, col) in enumerate([(200, 3.0, (0, 0, 0)), (100, 0.0, (0, 0, 0)), (200, 0.0, (0.72, 0.72, 0.72))]):
+        t = path + f".part{i}.pdf"
+        image_pages_from(page_with(col), t, dpi=dpi, rotate=rot)
+        tmp.append(t)
+    doc = fitz.open()
+    for t in tmp:
+        doc.insert_pdf(fitz.open(t))
+        os.remove(t)
+    rp = page_with((0, 0, 0))
+    image_pages_from(rp, path + ".rot.pdf", dpi=200)
+    doc.insert_pdf(fitz.open(path + ".rot.pdf"))
+    os.remove(path + ".rot.pdf")
+    doc[-1].set_rotation(90)
+    doc.save(path, garbage=3, deflate=True)
+
+
+def make_js_action(path):
+    """[Opus H2] SSN inside a document-level JavaScript OpenAction."""
+    doc = fitz.open()
+    p = doc.new_page()
+    write_lines(p, ["Synthetic PDF with a JavaScript action"])
+    doc.xref_set_key(doc.pdf_catalog(), "OpenAction", f"<</S/JavaScript/JS(var t='{S['ssn1']}';)>>")
+    doc.save(path)
+
+
+def make_xfa(path):
+    """[Sonnet C3, Opus H2] XFA datasets stream carrying the SSN (AcroForm /XFA)."""
+    doc = fitz.open()
+    p = doc.new_page()
+    write_lines(p, ["Synthetic XFA form"])
+    w = fitz.Widget()
+    w.field_type = fitz.PDF_WIDGET_TYPE_TEXT
+    w.field_name = "note"
+    w.field_value = "n/a"
+    w.rect = fitz.Rect(54, 100, 200, 120)
+    p.add_widget(w)
+    x = doc.get_new_xref()
+    doc.update_object(x, "<<>>")
+    doc.update_stream(x, f"<xfa:datasets xmlns:xfa=\"http://www.xfa.org/schema/xfa-data/1.0/\"><xfa:data><ssn>{S['ssn1']}</ssn></xfa:data></xfa:datasets>".encode())
+    af = doc.xref_get_key(doc.pdf_catalog(), "AcroForm")
+    if af[0] == "xref":
+        doc.xref_set_key(int(af[1].split()[0]), "XFA", f"[(datasets) {x} 0 R]")
+    else:
+        doc.xref_set_key(doc.pdf_catalog(), "AcroForm/XFA", f"[(datasets) {x} 0 R]")
+    doc.save(path)
+
+
+def make_custom_info_key(path):
+    """[Opus H2] a CUSTOM Info key — doc.metadata hides it."""
+    doc = fitz.open()
+    p = doc.new_page()
+    write_lines(p, ["Synthetic PDF with a custom document-info key"])
+    doc.set_metadata({"title": "Synthetic", "author": "Synthetic Preparer"})
+    info = doc.xref_get_key(-1, "Info")
+    xref = int(info[1].split()[0])
+    doc.xref_set_key(xref, "TaxpayerSSN", f"({S['ssn1']})")
+    doc.save(path)
+
+
+def make_link_and_labels(path):
+    """[Opus H2, Sonnet C3] SSN in a link URI query string, in /PageLabels, and in a FileAttachment annotation."""
+    doc = fitz.open()
+    p = doc.new_page()
+    write_lines(p, ["Synthetic PDF with a link, page labels and a file-attachment annotation"])
+    p.insert_link({"kind": fitz.LINK_URI, "from": fitz.Rect(54, 100, 200, 120), "uri": f"https://example.test/r?ssn={S['ssn1'].replace('-', '')}"})
+    doc.set_page_labels([{"startpage": 0, "prefix": f"SSN {S['ssn2']} ", "style": "D", "firstpagenum": 1}])
+    p.add_file_annot(fitz.Point(300, 300), f"Worksheet ITIN {S['itin']}\n".encode(), "worksheet.txt")
+    doc.save(path)
+
+
+def make_encrypted_owner_only(src, path):
+    """[Sonnet C3] encrypted with an EMPTY user password: opens without a password but is encrypted."""
+    doc = fitz.open(src)
+    doc.save(path, encryption=fitz.PDF_ENCRYPT_AES_256, owner_pw="owner-only", user_pw="")
+
+
+def docx_full_bytes():
+    """[Sonnet H1, Opus H6] every OOXML part that can carry text, incl. split runs and a tracked deletion."""
+    import io
+    W = 'xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"'
+    ct = ('<?xml version="1.0" encoding="UTF-8"?><Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">'
+          '<Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>'
+          '<Default Extension="xml" ContentType="application/xml"/>'
+          '<Default Extension="xlsx" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"/>'
+          '<Override PartName="/word/document.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml"/></Types>')
+    rels = ('<?xml version="1.0" encoding="UTF-8"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">'
+            '<Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="word/document.xml"/></Relationships>')
+    doc = (f'<?xml version="1.0" encoding="UTF-8"?><w:document {W}><w:body>'
+           '<w:p><w:r><w:t xml:space="preserve">Taxpayer SSN 123-45-</w:t></w:r><w:r><w:rPr><w:b/></w:rPr><w:t>6789</w:t></w:r></w:p>'
+           f'<w:p><w:del w:id="1" w:author="x"><w:r><w:delText>Spouse SSN {S["ssn2"]}</w:delText></w:r></w:del></w:p>'
+           f'<w:p><w:r><w:t xml:space="preserve">{N["ein"]["label"]} {N["ein"]["text"]} {N["current_agi"]["label"]} {N["current_agi"]["text"]}</w:t></w:r></w:p>'
+           '</w:body></w:document>')
+    part = lambda tag, body: f'<?xml version="1.0" encoding="UTF-8"?><w:{tag} {W}><w:p><w:r><w:t xml:space="preserve">{body}</w:t></w:r></w:p></w:{tag}>'
+    core = ('<?xml version="1.0" encoding="UTF-8"?><cp:coreProperties xmlns:cp="http://schemas.openxmlformats.org/package/2006/metadata/core-properties" '
+            f'xmlns:dc="http://purl.org/dc/elements/1.1/"><dc:title>Return for SSN {S["ssn1"]}</dc:title></cp:coreProperties>')
+    custom = ('<?xml version="1.0" encoding="UTF-8"?><Properties xmlns="http://schemas.openxmlformats.org/officeDocument/2006/custom-properties" '
+              f'xmlns:vt="http://schemas.openxmlformats.org/officeDocument/2006/docPropsVTypes"><property name="DL"><vt:lpwstr>Driver license no: {S["dl"]}</vt:lpwstr></property></Properties>')
+    cxml = f'<?xml version="1.0" encoding="UTF-8"?><data><agi>Prior year AGI: ${S["agi"]}</agi></data>'
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as z:
+        z.writestr("[Content_Types].xml", ct)
+        z.writestr("_rels/.rels", rels)
+        z.writestr("word/document.xml", doc)
+        z.writestr("word/comments.xml", part("comments", f"Dependent ITIN {S['itin']}"))
+        z.writestr("word/header1.xml", part("hdr", f"Date of birth: {S['dob']}"))
+        z.writestr("word/footer1.xml", part("ftr", f"Routing number: {S['routing']} Account number: {S['account']}"))
+        z.writestr("word/footnotes.xml", part("footnotes", f"Self-select PIN: {S['pin']}"))
+        z.writestr("docProps/core.xml", core)
+        z.writestr("docProps/custom.xml", custom)
+        z.writestr("customXml/item1.xml", cxml)
+        z.writestr("word/embeddings/Microsoft_Excel_Worksheet.xlsx", xlsx_bytes(minimal=True))
+    return buf.getvalue()
+
+
+def xlsx_bytes(minimal=False):
+    """[Sonnet H1, Opus H7] SSN as a NUMERIC cell with numFmt 000-00-0000, shared strings, a hidden sheet, a cell
+    comment, a defined name and a document title."""
+    import io
+    from openpyxl import Workbook
+    from openpyxl.comments import Comment
+    from openpyxl.workbook.defined_name import DefinedName
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "Return"
+    ws["A1"] = "SSN"
+    ws["A2"] = int(S["ssn1"].replace("-", ""))
+    ws["A2"].number_format = "000-00-0000"
+    if not minimal:
+        ws["B1"] = "Routing number"
+        ws["B2"] = S["routing"]
+        ws["C1"] = "Account number"
+        ws["C2"] = S["account"]
+        ws["A2"].comment = Comment(f"Dependent ITIN {S['itin']}", "synthetic")
+        hs = wb.create_sheet("Hidden")
+        hs["A1"] = f"Spouse SSN {S['ssn2']}"
+        hs.sheet_state = "hidden"
+        dn = DefinedName("TaxpayerDOB", attr_text=f'"Date of birth: {S["dob"]}"')
+        try:
+            wb.defined_names["TaxpayerDOB"] = dn
+        except TypeError:
+            wb.defined_names.append(dn)
+        wb.properties.title = f"Account number: {S['account']}"
+    b = io.BytesIO()
+    wb.save(b)
+    return b.getvalue()
+
+
+def rtf_bytes():
+    return ("{\\rtf1\\ansi\\deff0{\\fonttbl{\\f0 Helvetica;}}\\f0\\fs20 Synthetic RTF\\par "
+            f"Taxpayer SSN {S['ssn1']}\\par Date of birth: {S['dob']}\\par }}").encode("latin-1")
+
+
+def eml_bytes():
+    """[Sonnet H2] a saved email: SSN in a header AND in a base64 body part (no ASCII SSN in the raw bytes)."""
+    import base64
+    body = base64.b64encode(f"Taxpayer SSN {S['ssn2']}\r\n".encode()).decode()
+    return ("From: Synthetic Preparer <preparer@example.test>\r\nTo: tester@example.test\r\n"
+            f"Subject: Your return {S['ssn1']}\r\nMIME-Version: 1.0\r\nContent-Type: text/plain; charset=utf-8\r\n"
+            f"Content-Transfer-Encoding: base64\r\n\r\n{body}\r\n").encode()
+
+
+def legacy_binary_with_utf16(label):
+    """[Sonnet H2] a legacy binary office file (.doc/.xls) whose text is UTF-16LE: a latin1 raw-byte scan sees no SSN."""
+    return b"\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1" + b"\x00" * 504 + f"{label} SSN {S['ssn1']}".encode("utf-16-le") + b"\x00" * 64
+
+
+def make_photos(out, text_pdf):
+    """[Opus D4/C4] photographed / scanned image FILES (the producer sends these straight to Claude vision today)."""
+    from PIL import Image
+    import io
+    src = fitz.open(text_pdf)
+    pg = src[0]
+    pix = pg.get_pixmap(dpi=150)
+    im = Image.open(io.BytesIO(pix.tobytes("png"))).convert("RGB")
+    truth = []
+    for key in ("ssn1", "ssn2", "itin"):
+        for r in pg.search_for(S[key]):
+            s = 150 / 72
+            # first 5 digits (area + group) of the SSN only; last 4 may legitimately stay visible
+            w5 = fitz.get_text_length(S[key][:6], fontname="helv", fontsize=10)
+            truth.append([int(r.x0 * s), int(r.y0 * s), int((r.x0 + w5) * s), int(r.y1 * s)])
+    im.save(os.path.join(out, "w2_scan.png"))
+    im.save(os.path.join(out, "w2.tiff"))
+    exif = Image.Exif()
+    exif[0x010E] = f"Scan of SSN {S['ssn1']}"  # ImageDescription
+    im.rotate(2, expand=False, fillcolor=(255, 255, 255)).save(os.path.join(out, "w2_photo.jpg"), "JPEG", quality=60, exif=exif)
+    heic = os.path.join(out, "w2.heic")
+    try:
+        import subprocess
+        subprocess.run(["sips", "-s", "format", "heic", os.path.join(out, "w2_scan.png"), "--out", heic], check=True, capture_output=True)
+    except Exception:
+        pass
+    return truth, os.path.exists(heic)
+
+
+def make_zip_variants(P):
+    """[Sonnet C2, Opus H10] SSN in member NAMES, nested zip, encrypted member, zip-slip member, zip bomb."""
+    with zipfile.ZipFile(P("zip_member_names.zip"), "w", zipfile.ZIP_DEFLATED) as z:
+        z.writestr(f"{S['ssn1']}/notes.txt", "nothing private inside\n")
+        z.writestr(f"W2 {S['ssn2']}.txt", "nothing private inside either\n")
+    with zipfile.ZipFile(P("nested.zip"), "w", zipfile.ZIP_DEFLATED) as z:
+        z.write(P("bundle.zip"), "inner/bundle.zip")
+    with zipfile.ZipFile(P("zip_slip.zip"), "w", zipfile.ZIP_DEFLATED) as z:
+        z.writestr("../../escaped.txt", f"Taxpayer SSN {S['ssn1']}\n")
+    import subprocess
+    tmpd = P("_enc_src")
+    os.makedirs(tmpd, exist_ok=True)
+    open(os.path.join(tmpd, "secret.txt"), "w").write(f"Taxpayer SSN {S['ssn1']}\n")
+    subprocess.run(["zip", "-q", "-j", "-P", "zip-pw", P("zip_encrypted_member.zip"), os.path.join(tmpd, "secret.txt")], check=True)
+    import shutil
+    shutil.rmtree(tmpd)
+    with zipfile.ZipFile(P("zip_bomb.zip"), "w", zipfile.ZIP_DEFLATED) as z:
+        z.writestr("zeros.txt", b"0" * (5 * 1024 * 1024))
+
+
+def write_round2(out, P):
+    text_pdf = P("text_layer.pdf")
+    make_incremental_history(P("incremental_history.pdf"))
+    make_orphan_after_redact(P("orphan_after_redact.pdf"))
+    make_objstm(P("objstm.pdf"))
+    make_form_xobject(P("form_xobject.pdf"))
+    make_acroform_full(P("acroform_full.pdf"))
+    make_image_on_text_page(P("image_on_text_page.pdf"))
+    make_comb_ssn_image(P("comb_ssn_image.pdf"))
+    make_scan_variants(P("scan_variants.pdf"))
+    make_js_action(P("js_action.pdf"))
+    make_xfa(P("xfa.pdf"))
+    make_custom_info_key(P("custom_info_key.pdf"))
+    make_link_and_labels(P("link_labels_fileannot.pdf"))
+    make_encrypted_owner_only(text_pdf, P("encrypted_owner_only.pdf"))
+    open(P("return_full.docx"), "wb").write(docx_full_bytes())
+    open(P("sheet.xlsx"), "wb").write(xlsx_bytes())
+    txt = "\n".join(body_lines()) + "\n"
+    open(P("notes_utf16le.txt"), "wb").write(b"\xff\xfe" + txt.encode("utf-16-le"))
+    open(P("notes_utf16be.txt"), "wb").write(b"\xfe\xff" + txt.encode("utf-16-be"))
+    open(P("notes_utf8bom.txt"), "wb").write(b"\xef\xbb\xbf" + txt.encode("utf-8"))
+    open(P("notes_crlf.txt"), "wb").write(txt.replace("\n", "\r\n").encode("utf-8"))
+    open(P("sheet_utf16.csv"), "wb").write(b"\xff\xfe" + f"name,ssn,routing\r\nJane Tester,{S['ssn1']},{S['routing']}\r\n".encode("utf-16-le"))
+    open(P("page_latin1.html"), "wb").write(f"<html><body><p>Café receipt. Taxpayer SSN: {S['ssn1']}</p></body></html>\n".encode("latin-1"))
+    open(P("blob_utf16.bin"), "wb").write(b"\x00\x01\x02\x03" + f"SSN {S['ssn1']}".encode("utf-16-le") + b"\x04\x05")
+    rows = "\n".join(f"Tester {i},2345678{i:02d},{S['routing']}" for i in range(50))
+    open(P("ssn_column.csv"), "w").write(f"name,SSN,Routing number\n{rows}\n")
+    open(P("split_columns.csv"), "w").write('name,ssn_area,ssn_group,ssn_serial\n"Jane Tester","123","45","6789"\n')
+    open(P("html_entities.html"), "w").write(
+        "<html><body><p>Taxpayer SSN &#49;23-45-6789</p><p>Spouse SSN 987&ndash;65&ndash;4320</p>"
+        "<p>ITIN 912-78-<b>1234</b></p></body></html>\n")
+    open(P("json_escapes.json"), "w").write('{"ssn": "123\\u002d45\\u002d6789", "spouse": "987-65-4320"}\n')
+    open(P("notes.md"), "w").write(f"# Synthetic\n\n- Taxpayer SSN: {S['ssn1']}\n- Date of birth: {S['dob']}\n")
+    open(P("notes.xml"), "w").write(f"<r><ssn>{S['ssn1']}</ssn></r>\n")
+    open(P("notes.log"), "w").write(f"2026-10-14 processed taxpayer SSN {S['ssn1']}\n")
+    open(P("notes.rtf"), "wb").write(rtf_bytes())
+    open(P("return.eml"), "wb").write(eml_bytes())
+    open(P("legacy.doc"), "wb").write(legacy_binary_with_utf16("doc"))
+    open(P("legacy.xls"), "wb").write(legacy_binary_with_utf16("xls"))
+    photo_truth, has_heic = make_photos(out, text_pdf)
+    make_zip_variants(P)
+    return photo_truth, has_heic
+
+
+def round2_manifest(photo_truth, has_heic):
+    T = "text"
+    m = {
+        "incremental_history.pdf": {"secrets": ["ssn1"], "surfaces": ["filebytes"], "visible_clean": True, "pages": 1},
+        "orphan_after_redact.pdf": {"secrets": ["ssn1"], "surfaces": ["filebytes"], "visible_clean": True, "pages": 1},
+        "objstm.pdf": {"secrets": ["ssn1"], "surfaces": ["objects"], "visible_clean": True, "pages": 1},
+        "form_xobject.pdf": {"secrets": ["ssn1"], "surfaces": ["text", "objects"], "pages": 1},
+        "acroform_full.pdf": {"secrets": ["ssn1", "ssn2"], "surfaces": ["widgets", "objects"], "pages": 1},
+        "image_on_text_page.pdf": {"secrets": ["ssn1"], "surfaces": ["ocr"], "visible_clean": True, "pages": 1},
+        "comb_ssn_image.pdf": {"secrets": ["ssn1"], "surfaces": ["pixels"], "pages": 1,
+                               "pixel_truth": [{"page": 0, "rect": r, "dpi": 200} for r in comb_digit_rects()[:5]]},
+        "scan_variants.pdf": {"secrets": ["ssn1"], "surfaces": ["ocr"], "pages": 4},
+        "js_action.pdf": {"secrets": ["ssn1"], "surfaces": ["objects"], "visible_clean": True, "pages": 1},
+        "xfa.pdf": {"secrets": ["ssn1"], "surfaces": ["objects"], "visible_clean": True, "pages": 1},
+        "custom_info_key.pdf": {"secrets": ["ssn1"], "surfaces": ["objects"], "visible_clean": True, "pages": 1},
+        "link_labels_fileannot.pdf": {"secrets": ["ssn1", "ssn2", "itin"], "surfaces": ["objects"], "visible_clean": True, "pages": 1},
+        "encrypted_owner_only.pdf": {"secrets": FULL_SECRETS, "surfaces": ["text"], "pages": 2},
+        "return_full.docx": {"secrets": FULL_SECRETS, "negatives": ["ein", "current_agi"], "kind": "docx"},
+        "sheet.xlsx": {"secrets": ["ssn1", "ssn2", "itin", "routing", "account", "dob"], "kind": "xlsx"},
+        "notes_utf16le.txt": {"secrets": FULL_SECRETS, "kind": T, "encoding": "utf-16"},
+        "notes_utf16be.txt": {"secrets": FULL_SECRETS, "kind": T, "encoding": "utf-16"},
+        "notes_utf8bom.txt": {"secrets": FULL_SECRETS, "kind": T, "encoding": "utf-8"},
+        "notes_crlf.txt": {"secrets": FULL_SECRETS, "kind": T, "encoding": "utf-8"},
+        "sheet_utf16.csv": {"secrets": ["ssn1", "routing"], "kind": T, "encoding": "utf-16"},
+        "page_latin1.html": {"secrets": ["ssn1"], "kind": T, "encoding": "latin1"},
+        "blob_utf16.bin": {"secrets": ["ssn1"], "kind": "binary", "expect": "held:unsupported"},
+        "ssn_column.csv": {"secrets": [], "kind": T, "column_ssn": {"column": 1, "rows": 50}},
+        "split_columns.csv": {"secrets": ["ssn1"], "kind": T},
+        "html_entities.html": {"secrets": ["ssn1", "ssn2", "itin"], "kind": "html"},
+        "json_escapes.json": {"secrets": ["ssn1", "ssn2"], "kind": "json"},
+        "notes.md": {"secrets": ["ssn1", "dob"], "kind": T},
+        "notes.xml": {"secrets": ["ssn1"], "kind": T},
+        "notes.log": {"secrets": ["ssn1"], "kind": T},
+        "notes.rtf": {"secrets": ["ssn1", "dob"], "kind": "rtf"},
+        "return.eml": {"secrets": ["ssn1", "ssn2"], "kind": "eml"},
+        "legacy.doc": {"secrets": ["ssn1"], "kind": "binary"},
+        "legacy.xls": {"secrets": ["ssn1"], "kind": "binary"},
+        "w2_scan.png": {"secrets": FULL_SECRETS, "kind": "image", "pixel_truth": [{"rect": r} for r in photo_truth]},
+        "w2.tiff": {"secrets": FULL_SECRETS, "kind": "image", "pixel_truth": [{"rect": r} for r in photo_truth]},
+        "w2_photo.jpg": {"secrets": FULL_SECRETS, "kind": "image", "exif": True},
+        "zip_member_names.zip": {"secrets": ["ssn1", "ssn2"], "kind": "zip", "names_only": True},
+        "nested.zip": {"secrets": FULL_SECRETS, "kind": "zip"},
+        "zip_slip.zip": {"secrets": ["ssn1"], "kind": "zip"},
+        "zip_encrypted_member.zip": {"secrets": ["ssn1"], "kind": "zip", "expect": "held:encrypted"},
+        "zip_bomb.zip": {"secrets": [], "kind": "zip", "expect": "held:too_large"},
+    }
+    if has_heic:
+        m["w2.heic"] = {"secrets": FULL_SECRETS, "kind": "image"}
+    return m
 
 
 def main():
@@ -263,8 +745,8 @@ def main():
         "hidden_ocg.pdf": {"secrets": ["ssn1"], "negatives": [], "surfaces": ["raw"], "pages": 1},
         "white_on_white.pdf": {"secrets": ["ssn1"], "negatives": [], "surfaces": ["text"], "pages": 1},
         "footer_every_page.pdf": {"secrets": ["ssn1"], "negatives": [], "surfaces": ["text"], "pages": 5},
-        "split_spans.pdf": {"secrets": ["ssn1"], "negatives": [], "surfaces": ["text"], "pages": 1},
-        "unicode_dashes.pdf": {"secrets": ["ssn1", "ssn2"], "negatives": [], "surfaces": ["text"], "pages": 1},
+        "split_spans.pdf": {"secrets": ["ssn1", "ssn2", "itin"], "negatives": [], "surfaces": ["text"], "pages": 1},
+        "unicode_dashes.pdf": {"secrets": ["ssn1", "ssn2", "itin"], "negatives": [], "surfaces": ["text"], "pages": 1},
         "clean.pdf": {"secrets": [], "negatives": ["invoice", "phone", "ein", "amount", "filing_date"], "surfaces": [], "pages": 1},
         "encrypted.pdf": {"secrets": FULL_SECRETS, "negatives": [], "surfaces": [], "pages": 2, "expect": "held:encrypted"},
         "corrupt.pdf": {"secrets": [], "negatives": [], "surfaces": [], "pages": 0, "expect": "held:corrupt"},
@@ -275,6 +757,8 @@ def main():
         "bundle.zip": {"secrets": FULL_SECRETS, "negatives": neg_keys(), "kind": "zip"},
         "bundle_with_bad_member.zip": {"secrets": FULL_SECRETS, "negatives": [], "kind": "zip", "expect": "held:corrupt_member"},
     }
+    photo_truth, has_heic = write_round2(out, P)
+    manifest.update(round2_manifest(photo_truth, has_heic))
     json.dump(manifest, open(P("manifest.json"), "w"), indent=2)
     print(json.dumps({"ok": True, "dir": out, "files": sorted(manifest)}))
 
