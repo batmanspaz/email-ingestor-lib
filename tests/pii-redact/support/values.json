@@ -1,0 +1,23 @@
+{
+  "_note": "SYNTHETIC test values only. None of these belong to a real person or account. 021000021 is a public, valid-checksum ABA routing number used only because the detector must validate ABA checksums.",
+  "secrets": {
+    "ssn1": { "kind": "ssn", "text": "123-45-6789", "digits": "123456789", "last4": "6789" },
+    "ssn2": { "kind": "ssn", "text": "987-65-4320", "digits": "987654320", "last4": "4320" },
+    "ssn3_unseparated": { "kind": "ssn", "text": "234567890", "digits": "234567890", "last4": "7890" },
+    "itin": { "kind": "itin", "text": "912-78-1234", "digits": "912781234", "last4": "1234" },
+    "routing": { "kind": "routing", "text": "021000021", "digits": "021000021" },
+    "account": { "kind": "bank_account", "text": "555019283746", "digits": "555019283746" },
+    "dob": { "kind": "dob", "text": "01/02/1980", "digits": "01021980" },
+    "pin": { "kind": "efile_pin", "text": "31415", "digits": "31415" },
+    "agi": { "kind": "agi", "text": "78,901", "digits": "78901" },
+    "dl": { "kind": "dl_id", "text": "D1234567", "digits": "D1234567" }
+  },
+  "negatives": {
+    "invoice": { "text": "246813579", "label": "Invoice number" },
+    "phone": { "text": "(415) 555-0134", "label": "Phone" },
+    "ein": { "text": "98-7654321", "label": "EIN" },
+    "amount": { "text": "$2,468,013.57", "label": "Total tax" },
+    "filing_date": { "text": "04/15/2026", "label": "Filing date" },
+    "current_agi": { "text": "64,210", "label": "Adjusted gross income (line 11)" }
+  }
+}

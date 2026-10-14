@@ -8,7 +8,9 @@
     "node": ">=20.3"
   },
   "scripts": {
-    "test": "vitest run --dir tests"
+    "test": "vitest run --dir tests",
+    "test:green": "vitest run --dir tests --exclude \"**/*.red.test.js\"",
+    "test:red": "vitest run --dir tests red.test"
   },
   "dependencies": {
     "@anthropic-ai/sdk": "^0.131.0",
