@@ -483,3 +483,44 @@ describe('#2421 GmailClient.fetchMetadata extra headers', () => {
     expect(get.mock.calls[0][0].metadataHeaders).toEqual(['Subject', 'From', 'Date', 'To', 'Message-ID', 'Cc', 'List-Id']);
   });
 });
+
+// ── review follow-ups on PR #85 (Sonnet/Opus/Fable) ────────────────────────────────────────────────────
+describe('#2421 review follow-ups', () => {
+  const runWith = async (messages, entry = {}, cfg = {}) => {
+    const client = makeClient({ messages });
+    if (!fs.existsSync(statePath)) seedState({ [ME]: { lastHistoryId: '2000' } });
+    const handler = vi.fn().mockResolvedValue('processed');
+    const stats = await poll({ clients: [{ client, label: 'A', ingestSent: true, ...entry }], statePath, ...cfg }, handler);
+    return { stats, handler, client };
+  };
+
+  it('Bcc: To:self with real recipients in Bcc is NOT self-only (Bcc header is requested and counted)', async () => {
+    const m = makeMeta({ id: 'bcc1', from: ME, to: ME, labelIds: ['SENT'], extra: [{ name: 'Bcc', value: 'Client <client@other.example>' }] });
+    const { stats, handler, client } = await runWith([m]);
+    expect(handler).toHaveBeenCalledTimes(1);
+    expect(stats.sentSkippedSelf).toBe(0);
+    expect(client.fetchMetadata.mock.calls[0][1].extraHeaders).toContain('Bcc');
+  });
+
+  it('a processed SENT message is never batch-archived even with archiveAfterProcess on', async () => {
+    const { client, handler } = await runWith([sentTo('arch1')], {}, { archiveAfterProcess: true });
+    expect(handler).toHaveBeenCalledTimes(1);
+    expect(JSON.stringify(client._gmail.users.messages.batchModify.mock.calls)).not.toContain('arch1');
+  });
+
+  it('turning ingestSent off clears sentEnabledAt so a later re-enable starts a fresh 30-day baseline', async () => {
+    await runWith([sentTo('t1')]);
+    expect(readStateFile().accounts[ME].sentEnabledAt).toBeTruthy();
+    await runWith([], { ingestSent: false });
+    const acct = readStateFile().accounts[ME];
+    expect(acct.sentEnabledAt).toBeUndefined();
+    expect(acct.lastSentIngestedAt).toBeUndefined();
+  });
+
+  it('fetchMetadata tolerates opts === null', async () => {
+    const gm = Object.create(GmailClient.prototype);
+    gm.account = 'x';
+    gm._gmail = { users: { messages: { get: async () => ({ data: {} }) } } };
+    await expect(GmailClient.prototype.fetchMetadata.call(gm, 'x', null)).resolves.toBeDefined();
+  });
+});

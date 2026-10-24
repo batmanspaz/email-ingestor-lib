@@ -460,7 +460,7 @@ export class GmailClient {
    */
   async fetchMetadata(id, opts = {}) {
     const metadataHeaders = ['Subject', 'From', 'Date', 'To', 'Message-ID'];
-    for (const h of opts.extraHeaders || []) if (!metadataHeaders.includes(h)) metadataHeaders.push(h);
+    for (const h of opts?.extraHeaders || []) if (!metadataHeaders.includes(h)) metadataHeaders.push(h);
     const res = await withRetry(() => this._gmail.users.messages.get({
       userId: 'me',
       id,

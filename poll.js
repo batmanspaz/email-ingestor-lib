@@ -12,7 +12,7 @@ import { GmailClient } from './gmail.js';
 // ── Sent mail (#2421) ────────────────────────────────────────────────────────────────────────────
 // Headers poll() needs to recognise automated / self-only sent mail. Requested ONLY for accounts
 // with `ingestSent: true`; every other account's metadata call is byte-identical to before.
-const SENT_SCREEN_HEADERS = ['Cc', 'Auto-Submitted', 'List-Id', 'List-Unsubscribe', 'Precedence'];
+const SENT_SCREEN_HEADERS = ['Cc', 'Bcc', 'Auto-Submitted', 'List-Id', 'List-Unsubscribe', 'Precedence'];
 // An account with ingestSent on that has ingested no sent mail for this long is reported (warn):
 // "enabled yet silent" is exactly how 2026-08-05 -> 2026-10 went unnoticed.
 const SENT_SILENT_MS = 30 * 24 * 3600 * 1000;
@@ -33,10 +33,11 @@ function isAutomatedMessage(meta) {
   return /^(bulk|list|junk|auto_reply)$/i.test(GmailClient.getHeader(meta, 'Precedence').trim());
 }
 
-/** From self, and every To/Cc recipient is self (Bcc is invisible here). An empty recipient list is NOT self-only. */
+/** From self, and every To/Cc recipient is self (Bcc included). An empty recipient list is NOT self-only. */
 function isSelfOnly(meta, selfSet) {
   const from = addressesIn(GmailClient.getHeader(meta, 'From'));
-  const rcpt = [...addressesIn(GmailClient.getHeader(meta, 'To')), ...addressesIn(GmailClient.getHeader(meta, 'Cc'))];
+  // Bcc IS present on the sender's own SENT copy; "To: me, Bcc: everyone" is real outgoing mail, not a note to self.
+  const rcpt = [...addressesIn(GmailClient.getHeader(meta, 'To')), ...addressesIn(GmailClient.getHeader(meta, 'Cc')), ...addressesIn(GmailClient.getHeader(meta, 'Bcc'))];
   return from.length > 0 && from.every(a => selfSet.has(a)) && rcpt.length > 0 && rcpt.every(a => selfSet.has(a));
 }
 
@@ -154,6 +155,11 @@ export async function poll(config, handler) {
     // 30-day "enabled yet silent" check. Only ever written for an ingestSent account.
     if (ingestSent && !dryRun && !state.accounts[accountKey].sentEnabledAt) {
       state.accounts[accountKey].sentEnabledAt = new Date().toISOString();
+    }
+    // Switched off again: forget the baseline, so a re-enable months later starts a fresh 30-day window.
+    if (!ingestSent && !dryRun) {
+      delete state.accounts[accountKey].sentEnabledAt;
+      delete state.accounts[accountKey].lastSentIngestedAt;
     }
 
     // Stall bookkeeping. PROGRESS means the cursor moved OR we handled at least
@@ -434,7 +440,7 @@ export async function poll(config, handler) {
         // Per-client archiveAfterProcess overrides the global setting.
         // Set noArchive: true on a client entry to keep that account's inbox intact.
         // A readOnly client (readonly-guard.js) is never archived, whatever the flags say.
-        const shouldArchive = !dryRun && !client.readOnly && (clientEntry.noArchive ? false : archiveAfterProcess);
+        const shouldArchive = !dryRun && !client.readOnly && !isSent && (clientEntry.noArchive ? false : archiveAfterProcess);
         if (shouldArchive) toArchive.push(id);
       } catch (err) {
         // Gmail 404: message deleted before fetch — skip silently, not an error
