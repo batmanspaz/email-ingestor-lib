@@ -236,6 +236,34 @@ export function computeQuarantineCheck(count) {
 }
 
 /**
+ * poll.sent_enabled_but_zero_30d (#2421) — accounts with `ingestSent` on that have ingested no sent
+ * mail for 30 days. That shape ("enabled, yet silent") is exactly how Sent ingestion stopped on
+ * 2026-08-05 and went unnoticed for two and a half months. `warn`, not `fail`: a mailbox Paul simply
+ * does not send from would trip it, and nothing is lost that a backfill cannot recover. 0 (pass)
+ * whenever no account has ingestSent. Unreported is unknown, never green.
+ */
+export function computeSentSilentCheck(count) {
+  if (invalidCount(count)) {
+    return {
+      id: 'poll.sent_enabled_but_zero_30d',
+      status: 'warn',
+      unit: 'count',
+      detail: 'sent-silence count not reported by poll() — cannot assert Sent ingestion is working',
+    };
+  }
+  return {
+    id: 'poll.sent_enabled_but_zero_30d',
+    status: count > 0 ? 'warn' : 'pass',
+    metric: count,
+    unit: 'count',
+    detail:
+      count > 0
+        ? `${count} account(s) have Sent ingestion on but ingested no sent mail in 30 days`
+        : 'no account with Sent ingestion on is silent',
+  };
+}
+
+/**
  * cursor.stalled — consecutive runs in which an account's cursor did not move.
  * Every wedge this module can suffer takes this shape, and "quiet" and "stuck"
  * are indistinguishable without it. Threshold is 6 runs: at the deployed
@@ -298,6 +326,7 @@ export async function reportProducerHealth(telemetry, stats, opts = {}) {
   const expiredCheck = computeHistoryExpiredCheck(stats.historyExpired);
   const stallCheck = computeStallCheck(stats.maxStalledRuns);
   const quarantineCheck = computeQuarantineCheck(stats.quarantined);
+  const sentSilentCheck = computeSentSilentCheck(stats.sentSilentAccounts);
 
   // Overall status is the WORST of EVERY check, not just the producer's own run.
   // A green producer filling a queue nothing drains is an outage (the 2026-08-02
@@ -311,6 +340,7 @@ export async function reportProducerHealth(telemetry, stats, opts = {}) {
     HEALTH_STATUS_BY_CHECK_STATUS[expiredCheck.status],
     HEALTH_STATUS_BY_CHECK_STATUS[stallCheck.status],
     HEALTH_STATUS_BY_CHECK_STATUS[quarantineCheck.status],
+    HEALTH_STATUS_BY_CHECK_STATUS[sentSilentCheck.status],
   ].reduce((worst, s) => (HEALTH_SEVERITY[s] > HEALTH_SEVERITY[worst] ? s : worst));
 
   await telemetry.reportHealth({
@@ -327,6 +357,7 @@ export async function reportProducerHealth(telemetry, stats, opts = {}) {
       expiredCheck,
       stallCheck,
       quarantineCheck,
+      sentSilentCheck,
     ],
   });
 }
@@ -345,8 +376,15 @@ export async function reportProducerHealth(telemetry, stats, opts = {}) {
  */
 export function trackProducerRun(
   telemetry,
-  { entityId, fetched, produced, skipped, errors, messageErrors = 0, accountErrors = 0, quarantined = 0 },
+  { entityId, fetched, produced, skipped, errors, messageErrors = 0, accountErrors = 0, quarantined = 0, sentIngested, sentSkippedAuto, sentSkippedSelf },
 ) {
+  // #2421 sent counters: emitted only when the caller actually reports them. A consumer still on a
+  // hand-enumerated producerRunStats copy omits them, and a defaulted 0 there would claim "no sent
+  // mail" on the very run that ingested some — absent is honest, a laundered zero is not.
+  const sent = {};
+  if (validCount(sentIngested)) sent.sent_ingested = sentIngested;
+  if (validCount(sentSkippedAuto)) sent.sent_skipped_auto = sentSkippedAuto;
+  if (validCount(sentSkippedSelf)) sent.sent_skipped_self = sentSkippedSelf;
   telemetry.track({
     event: 'producer.run',
     props: {
@@ -358,6 +396,7 @@ export function trackProducerRun(
       message_errors: messageErrors,
       account_errors: accountErrors,
       quarantined,
+      ...sent,
     },
   });
 }
@@ -420,5 +459,9 @@ export function producerRunStats(entityId, stats) {
     messageErrors: stats.messageErrors,
     accountErrors: stats.accountErrors,
     quarantined: stats.quarantined ?? 0,
+    // #2421: forwarded as-is (never defaulted) — trackProducerRun omits an absent one.
+    sentIngested: stats.sentIngested,
+    sentSkippedAuto: stats.sentSkippedAuto,
+    sentSkippedSelf: stats.sentSkippedSelf,
   };
 }

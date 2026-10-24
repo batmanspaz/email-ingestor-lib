@@ -9,6 +9,37 @@ import fs from 'fs';
 import path from 'path';
 import { GmailClient } from './gmail.js';
 
+// ── Sent mail (#2421) ────────────────────────────────────────────────────────────────────────────
+// Headers poll() needs to recognise automated / self-only sent mail. Requested ONLY for accounts
+// with `ingestSent: true`; every other account's metadata call is byte-identical to before.
+const SENT_SCREEN_HEADERS = ['Cc', 'Auto-Submitted', 'List-Id', 'List-Unsubscribe', 'Precedence'];
+// An account with ingestSent on that has ingested no sent mail for this long is reported (warn):
+// "enabled yet silent" is exactly how 2026-08-05 -> 2026-10 went unnoticed.
+const SENT_SILENT_MS = 30 * 24 * 3600 * 1000;
+const ADDR_RE = /[^\s<>,;:"'()]+@[^\s<>,;:"'()]+/g;
+
+function addressesIn(value) {
+  return (String(value || '').match(ADDR_RE) || []).map(a => a.toLowerCase());
+}
+
+/**
+ * Mail a machine sent: RFC 3834 Auto-Submitted (anything but "no"), a mailing-list header, or a
+ * bulk/list/junk/auto_reply Precedence. Never a commitment Paul made.
+ */
+function isAutomatedMessage(meta) {
+  const auto = GmailClient.getHeader(meta, 'Auto-Submitted').trim().toLowerCase();
+  if (auto && auto !== 'no') return true;
+  if (GmailClient.getHeader(meta, 'List-Id').trim() || GmailClient.getHeader(meta, 'List-Unsubscribe').trim()) return true;
+  return /^(bulk|list|junk|auto_reply)$/i.test(GmailClient.getHeader(meta, 'Precedence').trim());
+}
+
+/** From self, and every To/Cc recipient is self (Bcc is invisible here). An empty recipient list is NOT self-only. */
+function isSelfOnly(meta, selfSet) {
+  const from = addressesIn(GmailClient.getHeader(meta, 'From'));
+  const rcpt = [...addressesIn(GmailClient.getHeader(meta, 'To')), ...addressesIn(GmailClient.getHeader(meta, 'Cc'))];
+  return from.length > 0 && from.every(a => selfSet.has(a)) && rcpt.length > 0 && rcpt.every(a => selfSet.has(a));
+}
+
 /**
  * Run one poll cycle for a set of accounts.
  *
@@ -25,10 +56,21 @@ import { GmailClient } from './gmail.js';
  *   processed message after the per-account loop. Keeps entity inboxes thin.
  *   Forwarded messages are also archived (already handled at destination).
  *   Has no effect in dryRun mode.
+ *
+ * Per client entry (alongside `client`, `label`, `noArchive`), all OFF unless set to boolean true:
+ *   ingestSent      — hand SENT mail to the handler instead of screening it (#2421). Same history
+ *                     cursor, same processed ring, same 3-strike quarantine; DRAFT/SPAM/TRASH stay
+ *                     screened. Automated sent mail is skipped (counted `sentSkippedAuto`), and so is
+ *                     self-only mail (From and every To/Cc are this account; counted `sentSkippedSelf`)
+ *                     so Intake's own digests to Paul can never feed back into Intake. Absent/false =
+ *                     the pre-#2421 behaviour, unchanged.
+ *   ingestSelfSent  — with ingestSent: let non-automated self-only mail (a note to self) through.
+ *   sentSelfAddresses — extra addresses that count as "self" (send-as aliases). The account always does.
  * @param {function} handler — async (message, client, { dryRun }) => void, called for each new message
  * @returns {Promise<{fetched:number, processed:number, errors:number, messageErrors:number,
  *   accountErrors:number, forwarded:number, archived:number, truncated:number,
- *   quarantined:number, historyExpired:number, maxStalledRuns:number}>}
+ *   quarantined:number, historyExpired:number, maxStalledRuns:number, sentIngested:number,
+ *   sentSkippedAuto:number, sentSkippedSelf:number, sentSilentAccounts:number}>}
  *   `errors` is messageErrors + accountErrors. The two are reported separately because they are
  *   DIFFERENT UNITS and a health status cannot be derived correctly from their sum (tasks.db
  *   #1056): a message that failed to process is one item of many, a whole account that threw is
@@ -67,6 +109,11 @@ export async function poll(config, handler) {
     quarantined: 0,      // messages retired after repeated deterministic failure
     historyExpired: 0,   // KNOWN-LOSS events: Gmail's ~7d history aged out
     maxStalledRuns: 0,   // worst consecutive runs an account's cursor sat still
+    // #2421 — always present, 0 when no account has ingestSent (an absent count is not a zero).
+    sentIngested: 0,       // SENT messages handed to the handler and processed
+    sentSkippedAuto: 0,    // SENT messages skipped as automated (Auto-Submitted / List-* / Precedence)
+    sentSkippedSelf: 0,    // SENT messages skipped as self-only (From and all To/Cc = this account)
+    sentSilentAccounts: 0, // ingestSent accounts with no sent mail ingested for 30 days
   };
 
   const state = readState(statePath);
@@ -75,6 +122,11 @@ export async function poll(config, handler) {
   for (const clientEntry of clients) {
     const { client, label } = clientEntry;
     const accountKey = client.account;
+    // Strict `=== true`: a string "false" from an env var must not switch Sent ingestion on.
+    const ingestSent = clientEntry.ingestSent === true;
+    const ingestSelfSent = clientEntry.ingestSelfSent === true;
+    const selfSet = new Set([client.account, ...(Array.isArray(clientEntry.sentSelfAddresses) ? clientEntry.sentSelfAddresses : [])]
+      .filter(Boolean).map(a => String(a).toLowerCase()));
     // Set the moment getHistory() resolves — declared here so the catch below can tell "died
     // before listing anything" (accountError) apart from "failed after a successful listing"
     // (messageError), see the accountErrors doc above (tasks.db #1056 defect 2, H-2). Deliberately
@@ -96,6 +148,12 @@ export async function poll(config, handler) {
       if (!dryRun) writeState(statePath, state);
       console.log(`  [${label}] Seeded historyId = ${currentId}`);
       continue; // first run: no prior cursor, so nothing to call a stall
+    }
+
+    // #2421: when Sent ingestion was first switched on for this account — the baseline for the
+    // 30-day "enabled yet silent" check. Only ever written for an ingestSent account.
+    if (ingestSent && !dryRun && !state.accounts[accountKey].sentEnabledAt) {
+      state.accounts[accountKey].sentEnabledAt = new Date().toISOString();
     }
 
     // Stall bookkeeping. PROGRESS means the cursor moved OR we handled at least
@@ -316,38 +374,62 @@ export async function poll(config, handler) {
 
     for (const id of messageIds) {
       try {
-        const meta = await client.fetchMetadata(id);
+        // Off: the exact one-argument call this always was. On: also the headers the sent screen reads.
+        const meta = ingestSent
+          ? await client.fetchMetadata(id, { extraHeaders: SENT_SCREEN_HEADERS })
+          : await client.fetchMetadata(id);
 
         // getHistory no longer filters by INBOX label (a current-state filter
         // hid triage-archived mail from producers entirely) — screen the
         // non-mail classes here instead. Screened ids join the ring so they
         // are never refetched. Archived-but-real mail IS processed.
+        // SENT is screened too unless this account opted in with ingestSent (#2421).
         const labels = meta.labelIds || [];
-        if (labels.some(l => l === 'SENT' || l === 'DRAFT' || l === 'SPAM' || l === 'TRASH')) {
+        const isSent = labels.includes('SENT');
+        if (labels.some(l => l === 'DRAFT' || l === 'SPAM' || l === 'TRASH') || (isSent && !ingestSent)) {
           if (!dryRun) ringAdd(id);
           continue;
+        }
+
+        // #2421: sent mail a machine wrote, or that only went to Paul himself, is not a commitment
+        // or a contact. Skipped, COUNTED, and ringed like any screened id (never refetched).
+        if (isSent) {
+          const skip = isAutomatedMessage(meta) ? 'auto' : (!ingestSelfSent && isSelfOnly(meta, selfSet) ? 'self' : null);
+          if (skip) {
+            if (skip === 'auto') stats.sentSkippedAuto++; else stats.sentSkippedSelf++;
+            if (!dryRun) ringAdd(id);
+            continue;
+          }
         }
 
         const msgId = GmailClient.getHeader(meta, 'Message-ID');
+        // A SENT copy and the RECEIVED copy of one message (Paul writing from one polled account to
+        // another) are two different facts for two mailboxes, so they dedupe in separate spaces.
+        const dedupeKey = msgId ? (isSent ? `sent:${msgId}` : msgId) : '';
 
         // Dedupe across accounts (same message delivered to multiple addresses)
-        if (msgId && seenMessageIds.has(msgId)) {
+        if (dedupeKey && seenMessageIds.has(dedupeKey)) {
           if (!dryRun) ringAdd(id);
           continue;
         }
-        if (msgId) seenMessageIds.add(msgId);
+        if (dedupeKey) seenMessageIds.add(dedupeKey);
 
         if (dryRun && !invokeHandlerInDryRun) {
           const from = GmailClient.getHeader(meta, 'From') || '(unknown sender)';
           const subject = GmailClient.getHeader(meta, 'Subject') || '(no subject)';
           console.log(`    [DRY] would process: ${from.slice(0, 40)} — ${subject.slice(0, 60)}`);
           stats.processed++;
+          if (isSent) stats.sentIngested++;
           continue;
         }
 
         const result = await handler(meta, client, { dryRun });
         if (result === 'forwarded') stats.forwarded++;
         stats.processed++;
+        if (isSent) {
+          stats.sentIngested++;
+          if (!dryRun) state.accounts[accountKey].lastSentIngestedAt = new Date().toISOString();
+        }
         if (!dryRun) { ringAdd(id); delete failures[id]; }
         // Per-client archiveAfterProcess overrides the global setting.
         // Set noArchive: true on a client entry to keep that account's inbox intact.
@@ -456,6 +538,16 @@ export async function poll(config, handler) {
         console.error(`  [${label}] Unhandled error polling account AFTER it listed successfully this run — not counting it as an account outage: ${err.message}`);
       }
     }
+  }
+
+  // #2421: ingestSent accounts that have ingested no sent mail for 30 days (measured from the last
+  // ingested sent message, else from when the option was first seen on). Skipped self/automated
+  // mail does not count as ingested. Accounts with ingestSent off are never counted.
+  for (const entry of clients) {
+    if (entry.ingestSent !== true) continue;
+    const acct = state.accounts?.[entry.client?.account];
+    const since = Date.parse(acct?.lastSentIngestedAt || acct?.sentEnabledAt || '');
+    if (Number.isFinite(since) && Date.now() - since > SENT_SILENT_MS) stats.sentSilentAccounts++;
   }
 
   // Update global stats
