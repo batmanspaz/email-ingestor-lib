@@ -451,13 +451,21 @@ export class GmailClient {
     return res.data;
   }
 
-  /** Fetch message metadata only (lighter) */
-  async fetchMetadata(id) {
+  /**
+   * Fetch message metadata only (lighter).
+   * @param {string} id
+   * @param {{extraHeaders?: string[]}} [opts] — headers wanted beyond the default five (poll() asks
+   *   for Cc / Auto-Submitted / List-* / Precedence only on accounts with `ingestSent`, #2421).
+   *   Omitted = the exact request this method always made.
+   */
+  async fetchMetadata(id, opts = {}) {
+    const metadataHeaders = ['Subject', 'From', 'Date', 'To', 'Message-ID'];
+    for (const h of opts?.extraHeaders || []) if (!metadataHeaders.includes(h)) metadataHeaders.push(h);
     const res = await withRetry(() => this._gmail.users.messages.get({
       userId: 'me',
       id,
       format: 'metadata',
-      metadataHeaders: ['Subject', 'From', 'Date', 'To', 'Message-ID'],
+      metadataHeaders,
     }), `${this.account}:messages.get(metadata)`);
     return res.data;
   }
@@ -640,7 +648,9 @@ export class GmailClient {
 
   /**
    * List recent messages from a specific label (not history-based).
-   * Used for sent mail scanning where history API filters to INBOX.
+   * Written for sent mail scanning back when the history API filtered to INBOX. It has had NO
+   * caller since 1681b77 (2026-08-04); Sent ingestion now goes through poll()'s per-account
+   * `ingestSent` option on the shared history cursor (#2421). Kept: exported API surface.
    *
    * @param {string} labelId — Gmail label ID (e.g. 'SENT')
    * @param {number} maxResults

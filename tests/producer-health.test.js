@@ -299,7 +299,7 @@ describe('reportProducerHealth', () => {
     // truncated: 0 is REQUIRED for an 'ok' report as of 2026-08-23 — a caller that
     // cannot attest zero truncation gets 'warn', because "missing = healthy" is
     // banned (dev-rules Sec28.1) and an absent counter is not evidence of absence.
-    await reportProducerHealth(telemetry, { fetched: 3, produced: 3, errors: 0, truncated: 0, historyExpired: 0, maxStalledRuns: 0, quarantined: 0 }, { sluiceDir });
+    await reportProducerHealth(telemetry, { fetched: 3, produced: 3, errors: 0, truncated: 0, historyExpired: 0, maxStalledRuns: 0, quarantined: 0, sentSilentAccounts: 0 }, { sluiceDir });
 
     expect(sent.health.length).toBe(1);
     const report = sent.health[0];
@@ -457,7 +457,7 @@ describe('reportProducerHealth — default sluiceDir resolution (env-var rename 
     // perfectcity index.js), all of which call reportProducerHealth(telemetry,
     // stats) with no third argument at all and rely entirely on this module's
     // env-var default.
-    await reportProducerHealth(telemetry, { fetched: 1, produced: 1, errors: 0, truncated: 0, historyExpired: 0, maxStalledRuns: 0, quarantined: 0 });
+    await reportProducerHealth(telemetry, { fetched: 1, produced: 1, errors: 0, truncated: 0, historyExpired: 0, maxStalledRuns: 0, quarantined: 0, sentSilentAccounts: 0 });
 
     const report = sent.health[0];
     expect(() => HealthReportSchema.parse(report)).not.toThrow();
@@ -885,6 +885,7 @@ function fullPollStats() {
     quarantined: 0,
     historyExpired: 0,
     maxStalledRuns: 0,
+    sentSilentAccounts: 0,
   };
 }
 
