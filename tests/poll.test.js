@@ -88,7 +88,7 @@ describe('poll — first run (no historyId)', () => {
     const stats = await poll({ clients: [{ client, label: 'A' }], statePath }, handler);
 
     expect(handler).not.toHaveBeenCalled();
-    expect(stats).toEqual({ fetched: 0, processed: 0, errors: 0, messageErrors: 0, accountErrors: 0, forwarded: 0, archived: 0 , truncated: 0 , quarantined: 0, historyExpired: 0, maxStalledRuns: 0, sentIngested: 0, sentSkippedAuto: 0, sentSkippedSelf: 0, sentSilentAccounts: 0 });
+    expect(stats).toEqual({ fetched: 0, processed: 0, errors: 0, messageErrors: 0, accountErrors: 0, forwarded: 0, archived: 0 , truncated: 0 , quarantined: 0, historyExpired: 0, maxStalledRuns: 0, sentIngested: 0, sentSkippedAuto: 0, sentSkippedSelf: 0, sentSilentAccounts: 0, sentShadowWouldIngest: 0, sentShadowWouldSkip: 0 });
     expect(readStateFile().accounts['a@example.com'].lastHistoryId).toBe('1234');
   });
 
@@ -112,7 +112,7 @@ describe('poll — normal run', () => {
 
     expect(handler).toHaveBeenCalledTimes(2);
     expect(handler).toHaveBeenCalledWith(messages[0], client, { dryRun: false });
-    expect(stats).toEqual({ fetched: 2, processed: 2, errors: 0, messageErrors: 0, accountErrors: 0, forwarded: 0, archived: 0 , truncated: 0 , quarantined: 0, historyExpired: 0, maxStalledRuns: 0, sentIngested: 0, sentSkippedAuto: 0, sentSkippedSelf: 0, sentSilentAccounts: 0 });
+    expect(stats).toEqual({ fetched: 2, processed: 2, errors: 0, messageErrors: 0, accountErrors: 0, forwarded: 0, archived: 0 , truncated: 0 , quarantined: 0, historyExpired: 0, maxStalledRuns: 0, sentIngested: 0, sentSkippedAuto: 0, sentSkippedSelf: 0, sentSilentAccounts: 0, sentShadowWouldIngest: 0, sentShadowWouldSkip: 0 });
     const state = readStateFile();
     expect(state.accounts['a@example.com'].lastHistoryId).toBe('3000');
     expect(state.totalProcessed).toBe(2);
@@ -540,7 +540,7 @@ describe('poll — dry-run', () => {
     );
 
     expect(handler).not.toHaveBeenCalled();
-    expect(stats).toEqual({ fetched: 2, processed: 2, errors: 0, messageErrors: 0, accountErrors: 0, forwarded: 0, archived: 0 , truncated: 0 , quarantined: 0, historyExpired: 0, maxStalledRuns: 0, sentIngested: 0, sentSkippedAuto: 0, sentSkippedSelf: 0, sentSilentAccounts: 0 });
+    expect(stats).toEqual({ fetched: 2, processed: 2, errors: 0, messageErrors: 0, accountErrors: 0, forwarded: 0, archived: 0 , truncated: 0 , quarantined: 0, historyExpired: 0, maxStalledRuns: 0, sentIngested: 0, sentSkippedAuto: 0, sentSkippedSelf: 0, sentSilentAccounts: 0, sentShadowWouldIngest: 0, sentShadowWouldSkip: 0 });
   });
 
   it('logs a "[DRY] would process" preview line per message', async () => {

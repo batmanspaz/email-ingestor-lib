@@ -11,7 +11,7 @@ import { GmailClient } from './gmail.js';
 
 // ── Sent mail (#2421) ────────────────────────────────────────────────────────────────────────────
 // Headers poll() needs to recognise automated / self-only sent mail. Requested ONLY for accounts
-// with `ingestSent: true`; every other account's metadata call is byte-identical to before.
+// with `ingestSent: true` or `'shadow'`; every other account's metadata call is byte-identical to before.
 const SENT_SCREEN_HEADERS = ['Cc', 'Bcc', 'Auto-Submitted', 'List-Id', 'List-Unsubscribe', 'Precedence'];
 // An account with ingestSent on that has ingested no sent mail for this long is reported (warn):
 // "enabled yet silent" is exactly how 2026-08-05 -> 2026-10 went unnoticed.
@@ -65,6 +65,10 @@ function isSelfOnly(meta, selfSet) {
  *                     self-only mail (From and every To/Cc are this account; counted `sentSkippedSelf`)
  *                     so Intake's own digests to Paul can never feed back into Intake. Absent/false =
  *                     the pre-#2421 behaviour, unchanged.
+ *                     The exact string 'shadow' instead of true = SHADOW: every SENT message is still
+ *                     screened exactly as with the option off (ringed, never handled, never archived)
+ *                     but is first classified with the same screens and counted (`sentShadowWouldIngest`
+ *                     / `sentShadowWouldSkip`). Shadow writes no sent state and is never "silent".
  *   ingestSelfSent  — with ingestSent: let non-automated self-only mail (a note to self) through.
  *   sentSelfAddresses — extra addresses that count as "self" (send-as aliases). The account always does.
  * @param {function} handler — async (message, client, { dryRun }) => void, called for each new message
@@ -115,6 +119,8 @@ export async function poll(config, handler) {
     sentSkippedAuto: 0,    // SENT messages skipped as automated (Auto-Submitted / List-* / Precedence)
     sentSkippedSelf: 0,    // SENT messages skipped as self-only (From and all To/Cc = this account)
     sentSilentAccounts: 0, // ingestSent accounts with no sent mail ingested for 30 days
+    sentShadowWouldIngest: 0, // ingestSent:'shadow' — SENT messages that WOULD have been handed to the handler
+    sentShadowWouldSkip: 0,   // ingestSent:'shadow' — SENT messages that would have been skipped (automated / self-only)
   };
 
   const state = readState(statePath);
@@ -125,6 +131,8 @@ export async function poll(config, handler) {
     const accountKey = client.account;
     // Strict `=== true`: a string "false" from an env var must not switch Sent ingestion on.
     const ingestSent = clientEntry.ingestSent === true;
+    // Exact string only: 'Shadow', 'on', 'true' and every other value are OFF.
+    const sentShadow = clientEntry.ingestSent === 'shadow';
     const ingestSelfSent = clientEntry.ingestSelfSent === true;
     const selfSet = new Set([client.account, ...(Array.isArray(clientEntry.sentSelfAddresses) ? clientEntry.sentSelfAddresses : [])]
       .filter(Boolean).map(a => String(a).toLowerCase()));
@@ -381,7 +389,7 @@ export async function poll(config, handler) {
     for (const id of messageIds) {
       try {
         // Off: the exact one-argument call this always was. On: also the headers the sent screen reads.
-        const meta = ingestSent
+        const meta = (ingestSent || sentShadow)
           ? await client.fetchMetadata(id, { extraHeaders: SENT_SCREEN_HEADERS })
           : await client.fetchMetadata(id);
 
@@ -393,6 +401,12 @@ export async function poll(config, handler) {
         const labels = meta.labelIds || [];
         const isSent = labels.includes('SENT');
         if (labels.some(l => l === 'DRAFT' || l === 'SPAM' || l === 'TRASH') || (isSent && !ingestSent)) {
+          // Shadow: classify with the same screens the live path uses below, count, then screen as before.
+          // (No cross-account Message-ID dedupe here: a message polled in two shadow accounts counts twice.)
+          if (isSent && sentShadow && !labels.some(l => l === 'DRAFT' || l === 'SPAM' || l === 'TRASH')) {
+            const wouldSkip = isAutomatedMessage(meta) || (!ingestSelfSent && isSelfOnly(meta, selfSet));
+            if (wouldSkip) stats.sentShadowWouldSkip++; else stats.sentShadowWouldIngest++;
+          }
           if (!dryRun) ringAdd(id);
           continue;
         }

@@ -376,7 +376,7 @@ export async function reportProducerHealth(telemetry, stats, opts = {}) {
  */
 export function trackProducerRun(
   telemetry,
-  { entityId, fetched, produced, skipped, errors, messageErrors = 0, accountErrors = 0, quarantined = 0, sentIngested, sentSkippedAuto, sentSkippedSelf },
+  { entityId, fetched, produced, skipped, errors, messageErrors = 0, accountErrors = 0, quarantined = 0, sentIngested, sentSkippedAuto, sentSkippedSelf, sentShadowWouldIngest, sentShadowWouldSkip },
 ) {
   // #2421 sent counters: emitted only when the caller actually reports them. A consumer still on a
   // hand-enumerated producerRunStats copy omits them, and a defaulted 0 there would claim "no sent
@@ -385,6 +385,8 @@ export function trackProducerRun(
   if (validCount(sentIngested)) sent.sent_ingested = sentIngested;
   if (validCount(sentSkippedAuto)) sent.sent_skipped_auto = sentSkippedAuto;
   if (validCount(sentSkippedSelf)) sent.sent_skipped_self = sentSkippedSelf;
+  if (validCount(sentShadowWouldIngest)) sent.sent_shadow_would_ingest = sentShadowWouldIngest;
+  if (validCount(sentShadowWouldSkip)) sent.sent_shadow_would_skip = sentShadowWouldSkip;
   telemetry.track({
     event: 'producer.run',
     props: {
@@ -463,5 +465,7 @@ export function producerRunStats(entityId, stats) {
     sentIngested: stats.sentIngested,
     sentSkippedAuto: stats.sentSkippedAuto,
     sentSkippedSelf: stats.sentSkippedSelf,
+    sentShadowWouldIngest: stats.sentShadowWouldIngest,
+    sentShadowWouldSkip: stats.sentShadowWouldSkip,
   };
 }
