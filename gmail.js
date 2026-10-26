@@ -554,8 +554,12 @@ export class GmailClient {
     // Fail before the reads below — a read-only account can never send.
     if (this.readOnly) denyWrite(this.account, 'users.messages.send (forwardEmail)', this.#accountLabel);
     const original = await this.fetchMessage(messageId);
-    const subject = GmailClient.getHeader(original, 'Subject');
-    const from = GmailClient.getHeader(original, 'From');
+    // CR/LF in an attacker-controlled Subject/From (or a bad target) could end the header block early,
+    // pushing the forward markers into the body, or inject headers (Bcc). Strip them (#2546).
+    const oneLine = (v) => String(v ?? '').replace(/[\r\n]+/g, ' ');
+    const subject = oneLine(GmailClient.getHeader(original, 'Subject'));
+    const from = oneLine(GmailClient.getHeader(original, 'From'));
+    const to = oneLine(toAddress);
 
     const boundary = `boundary_${Date.now()}`;
     const rawOriginal = await this._gmail.users.messages.get({
@@ -565,10 +569,11 @@ export class GmailClient {
     });
 
     const emailLines = [
-      `From: ${this.account}`,
-      `To: ${toAddress}`,
-      `Subject: Fwd: ${subject}`,
+      // Markers FIRST: no later header value can displace them (#2546).
       ...FORWARD_MARKER_LINES,
+      `From: ${this.account}`,
+      `To: ${to}`,
+      `Subject: Fwd: ${subject}`,
       `Content-Type: multipart/mixed; boundary="${boundary}"`,
       '',
       `--${boundary}`,
@@ -763,7 +768,11 @@ export class GmailClient {
     }
   }
 
-  /** Send an email */
+  /**
+   * Send an email. NOT marked as automated (no Auto-Submitted / X-Intake-Forwarded): the copy lands in
+   * SENT looking like Paul's own mail. Callers on accounts with `ingestSent` on must therefore send only
+   * to the account itself (self-only is screened) or add the forward marker themselves (#2546).
+   */
   async sendEmail({ to, subject, body, cc, bcc }) {
     const lines = [
       `From: ${this.account}`,
