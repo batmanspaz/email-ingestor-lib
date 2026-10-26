@@ -4,6 +4,8 @@
  * Exports:
  *   GmailClient  — OAuth2 Gmail API client (refresh-token based); readOnly:true
  *     makes every Gmail write throw ReadOnlyAccountError (readonly-guard.js)
+ *   INTAKE_FORWARD_HEADER — marker header forwardEmail stamps on every forward (#2502);
+ *     poll()'s Sent screen skips mail carrying it
  *   poll         — incremental poll loop using Gmail history API
  *   checkAndForward — apply forward rules and forward misrouted emails
  *   createLogger — entity-specific JSONL logger
@@ -17,7 +19,7 @@
  *     transport, until the central ingest Worker is deployed
  */
 
-export { GmailClient } from './gmail.js';
+export { GmailClient, INTAKE_FORWARD_HEADER } from './gmail.js';
 export { poll } from './poll.js';
 export { checkAndForward } from './forward.js';
 export {

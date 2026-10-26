@@ -22,6 +22,16 @@ const CRED_DIR = path.join(os.homedir(), 'claude/shared/config/credentials');
 const CLIENT_FILE = path.join(CRED_DIR, 'conductor_paul_client.json');
 
 /**
+ * #2502: every forward this library sends is marked as machine-sent, so the forwarding account's
+ * SENT copy is screened by poll()'s Sent screen (ingestSent) instead of being re-ingested as Paul's
+ * own outbound mail (inbound -> forward -> "sent" loop). `Auto-Submitted: auto-forwarded` is the
+ * RFC 3834 signal (the screen honours any value but "no"); the X- header is a distinctive marker
+ * poll() also honours on its own. Intake's own forward path stamps the same two headers.
+ */
+export const INTAKE_FORWARD_HEADER = 'X-Intake-Forwarded';
+const FORWARD_MARKER_LINES = ['Auto-Submitted: auto-forwarded', `${INTAKE_FORWARD_HEADER}: 1`];
+
+/**
  * Read a credentials file, converting ANY failure (EACCES, EPERM, EISDIR, ENOENT after a passing
  * existsSync, a non-Error throw...) into the typed error `fail` builds. The raw Node error is
  * never rethrown, never attached as `cause`, and its message / `path` / `errno` / `syscall` are
@@ -558,6 +568,7 @@ export class GmailClient {
       `From: ${this.account}`,
       `To: ${toAddress}`,
       `Subject: Fwd: ${subject}`,
+      ...FORWARD_MARKER_LINES,
       `Content-Type: multipart/mixed; boundary="${boundary}"`,
       '',
       `--${boundary}`,

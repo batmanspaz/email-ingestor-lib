@@ -7,12 +7,12 @@
 
 import fs from 'fs';
 import path from 'path';
-import { GmailClient } from './gmail.js';
+import { GmailClient, INTAKE_FORWARD_HEADER } from './gmail.js';
 
 // ── Sent mail (#2421) ────────────────────────────────────────────────────────────────────────────
 // Headers poll() needs to recognise automated / self-only sent mail. Requested ONLY for accounts
 // with `ingestSent: true` or `'shadow'`; every other account's metadata call is byte-identical to before.
-const SENT_SCREEN_HEADERS = ['Cc', 'Bcc', 'Auto-Submitted', 'List-Id', 'List-Unsubscribe', 'Precedence'];
+const SENT_SCREEN_HEADERS = ['Cc', 'Bcc', 'Auto-Submitted', 'List-Id', 'List-Unsubscribe', 'Precedence', INTAKE_FORWARD_HEADER];
 // An account with ingestSent on that has ingested no sent mail for this long is reported (warn):
 // "enabled yet silent" is exactly how 2026-08-05 -> 2026-10 went unnoticed.
 const SENT_SILENT_MS = 30 * 24 * 3600 * 1000;
@@ -23,10 +23,12 @@ function addressesIn(value) {
 }
 
 /**
- * Mail a machine sent: RFC 3834 Auto-Submitted (anything but "no"), a mailing-list header, or a
- * bulk/list/junk/auto_reply Precedence. Never a commitment Paul made.
+ * Mail a machine sent: RFC 3834 Auto-Submitted (anything but "no"), a mailing-list header, a
+ * bulk/list/junk/auto_reply Precedence, or Intake's own forward marker (#2502 — forwardEmail stamps
+ * it, honoured even if Auto-Submitted was lost in transit). Never a commitment Paul made.
  */
 function isAutomatedMessage(meta) {
+  if (GmailClient.getHeader(meta, INTAKE_FORWARD_HEADER).trim()) return true;
   const auto = GmailClient.getHeader(meta, 'Auto-Submitted').trim().toLowerCase();
   if (auto && auto !== 'no') return true;
   if (GmailClient.getHeader(meta, 'List-Id').trim() || GmailClient.getHeader(meta, 'List-Unsubscribe').trim()) return true;
@@ -61,7 +63,8 @@ function isSelfOnly(meta, selfSet) {
  * Per client entry (alongside `client`, `label`, `noArchive`), all OFF unless set to boolean true:
  *   ingestSent      — hand SENT mail to the handler instead of screening it (#2421). Same history
  *                     cursor, same processed ring, same 3-strike quarantine; DRAFT/SPAM/TRASH stay
- *                     screened. Automated sent mail is skipped (counted `sentSkippedAuto`), and so is
+ *                     screened. Automated sent mail (incl. Intake's own marked forwards, #2502) is skipped
+ *                     (counted `sentSkippedAuto`), and so is
  *                     self-only mail (From and every To/Cc are this account; counted `sentSkippedSelf`)
  *                     so Intake's own digests to Paul can never feed back into Intake. Absent/false =
  *                     the pre-#2421 behaviour, unchanged.
@@ -116,7 +119,7 @@ export async function poll(config, handler) {
     maxStalledRuns: 0,   // worst consecutive runs an account's cursor sat still
     // #2421 — always present, 0 when no account has ingestSent (an absent count is not a zero).
     sentIngested: 0,       // SENT messages handed to the handler and processed
-    sentSkippedAuto: 0,    // SENT messages skipped as automated (Auto-Submitted / List-* / Precedence)
+    sentSkippedAuto: 0,    // SENT messages skipped as automated (Auto-Submitted / List-* / Precedence / X-Intake-Forwarded)
     sentSkippedSelf: 0,    // SENT messages skipped as self-only (From and all To/Cc = this account)
     sentSilentAccounts: 0, // ingestSent accounts with no sent mail ingested for 30 days
     sentShadowWouldIngest: 0, // ingestSent:'shadow' — SENT messages that WOULD have been handed to the handler
