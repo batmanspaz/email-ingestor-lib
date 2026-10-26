@@ -18,6 +18,12 @@ import { execFileSync } from 'node:child_process';
 import { mkdtempSync, writeFileSync, readFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { resolveModelAlias } from './models.js';
+
+// #2536 (Rule 12): resolved through the lib's alias mirror (models.js), never a
+// raw id here. Both SDK call sites below use it.
+export const OCR_MODEL_ALIAS = 'haiku';
+export const OCR_MODEL = resolveModelAlias(OCR_MODEL_ALIAS);
 
 const MAX_FILE_SIZE = 30 * 1024 * 1024; // 30MB
 // Real production bug (2026-07-05): a dense multi-page expense report hit the
@@ -504,7 +510,7 @@ export async function ocrImagePdf(pdfBuffer, filename, opts = {}) {
     // measured 122s at 16k. Same response shape either way — only the transport
     // changes, so every caller and the parse path below are unaffected.
     const response = await anthropic.messages.stream({
-      model: 'claude-haiku-4-5-20251001',
+      model: OCR_MODEL,
       max_tokens: MAX_OUTPUT_TOKENS,
       // No cache_control here -- and DO NOT add one just because UNIVERSAL_PROMPT
       // grows, without also reordering the content array. This was gotten
@@ -601,7 +607,7 @@ export async function ocrImage(imageBuffer, filename, ext, opts = {}) {
     // measured 122s at 16k. Same response shape either way — only the transport
     // changes, so every caller and the parse path below are unaffected.
     const response = await anthropic.messages.stream({
-      model: 'claude-haiku-4-5-20251001',
+      model: OCR_MODEL,
       max_tokens: MAX_OUTPUT_TOKENS,
       // Same UNIVERSAL_PROMPT, same reasoning as ocrImagePdf above: ~850
       // tokens is under Haiku 4.5's real 4096-token cache minimum, so no
