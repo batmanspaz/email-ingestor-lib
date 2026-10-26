@@ -142,6 +142,16 @@ describe('#2421 shadow: counts what Sent ingestion would do, changes nothing', (
     expect(stats.sentShadowWouldIngest).toBe(1);
     expect(readStateFile().accounts[ME].processedIds || []).not.toContain('s1');
   });
+
+  // #2502 / Fable N1: dryRun skips the stale-baseline delete, so a long-expired sentEnabledAt is still
+  // in state when the silence loop runs. Only its `ingestSent !== true` guard keeps shadow from being
+  // reported "silent" here (a `!entry.ingestSent` guard would count it: 'shadow' is truthy).
+  it('dryRun with a stale sentEnabledAt seeded: shadow is still never reported silent', async () => {
+    seedState({ lastHistoryId: '2000', sentEnabledAt: '2020-01-01T00:00:00.000Z' });
+    const { stats } = await run([sentTo('s1')], {}, { dryRun: true });
+    expect(readStateFile().accounts[ME].sentEnabledAt).toBe('2020-01-01T00:00:00.000Z'); // dryRun wrote nothing
+    expect(stats.sentSilentAccounts).toBe(0);
+  });
 });
 
 describe('#2421 shadow: strictness and default', () => {
