@@ -50,9 +50,14 @@ describe('real chmod 000 token file', () => {
 });
 
 describe('packaging + docs', () => {
-  it('package.json declares node >=20.3 (AbortSignal.any)', () => {
+  it('package.json engines floor still covers AbortSignal.any (>= 20.3)', () => {
+    // The floor was raised to >=22.12 by #2539 (googleapis/vitest need it);
+    // this check only guards that it never drops below what AbortSignal.any needs.
     const pkg = JSON.parse(fs.readFileSync(path.join(root, 'package.json'), 'utf8'));
-    expect(pkg.engines?.node).toBe('>=20.3');
+    const m = /^>=(\d+)\.(\d+)/.exec(pkg.engines?.node ?? '');
+    expect(m, `engines.node ${pkg.engines?.node}`).toBeTruthy();
+    const [maj, min] = [Number(m[1]), Number(m[2])];
+    expect(maj > 20 || (maj === 20 && min >= 3)).toBe(true);
   });
   it('README documents: unexpectedScopes display-only + count, timeout 0, accountLabel', () => {
     const readme = fs.readFileSync(path.join(root, 'README.md'), 'utf8');
