@@ -11,7 +11,7 @@
     "test": "vitest run --dir tests"
   },
   "dependencies": {
-    "@anthropic-ai/sdk": "^0.137.0",
+    "@anthropic-ai/sdk": "^1.3.0",
     "@perfectcity/telemetry": "git+https://github.com/batmanspaz/telemetry.git#396821cca10376117c7c4e25e7cf8386319bcdf9",
     "dotenv": "^18.0.9",
     "googleapis": "^188.0.0"
