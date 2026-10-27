@@ -477,7 +477,9 @@ describe('ocr (shared email-ingestor-lib)', () => {
     expect(result.parsed.urgency).toBe('low');
     expect(result.parsed.signals).toContain('receipt');
     expect(result.cost).toBeGreaterThan(0);
-    expect(costTracker.record).toHaveBeenCalledWith({ input_tokens: 2000, output_tokens: 300 });
+    // #2544: record(usage, model) — the model is passed so trackers can price by model.
+    const { OCR_MODEL } = await import('../ocr.js');
+    expect(costTracker.record).toHaveBeenCalledWith({ input_tokens: 2000, output_tokens: 300 }, OCR_MODEL);
   });
 
   // ── Collection notice parsing ─────────────────────────────────────────────

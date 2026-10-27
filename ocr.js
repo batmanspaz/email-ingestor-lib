@@ -398,7 +398,7 @@ function parseOcrResponse(text, filename, log, { truncated = false } = {}) {
  * OCR a PDF buffer using Claude Haiku vision.
  * @param {Buffer} pdfBuffer - Raw PDF bytes
  * @param {string} filename - Original filename (for logging)
- * @param {object} [opts] - { costTracker: {isCapReached, record}, log: {info,warn,error} }
+ * @param {object} [opts] - { costTracker: {isCapReached, record(usage, model)}, log: {info,warn,error} }
  * @returns {Promise<object|null>} Result with rawText, structured, parsed, usage, cost
  */
 // ── extraction-result contract v1 ───────────────────────────────────────────
@@ -553,7 +553,7 @@ export async function ocrImagePdf(pdfBuffer, filename, opts = {}) {
     }).finalMessage();
 
     const usage = response.usage || {};
-    const cost = costTracker.record(usage);
+    const cost = costTracker.record(usage, OCR_MODEL);
     log.info(`OCR cost: $${(cost || 0).toFixed(4)} — ${filename}`);
 
     const text = response.content[0]?.text || '';
@@ -578,7 +578,7 @@ const EXT_TO_MIME = {
  * @param {Buffer} imageBuffer - Raw image bytes
  * @param {string} filename - Original filename
  * @param {string} ext - File extension (e.g. '.jpg')
- * @param {object} [opts] - { costTracker: {isCapReached, record}, log: {info,warn,error} }
+ * @param {object} [opts] - { costTracker: {isCapReached, record(usage, model)}, log: {info,warn,error} }
  * @returns {Promise<object|null>} Result with rawText, structured, parsed, usage, cost
  */
 export async function ocrImage(imageBuffer, filename, ext, opts = {}) {
@@ -632,7 +632,7 @@ export async function ocrImage(imageBuffer, filename, ext, opts = {}) {
     }).finalMessage();
 
     const usage = response.usage || {};
-    const cost = costTracker.record(usage);
+    const cost = costTracker.record(usage, OCR_MODEL);
     log.info(`Image OCR cost: $${(cost || 0).toFixed(4)} — ${filename}`);
 
     const text = response.content[0]?.text || '';
