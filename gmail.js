@@ -13,6 +13,7 @@ import { google, GoogleApis } from 'googleapis';
 import fs from 'fs';
 import path from 'path';
 import os from 'os';
+import { randomBytes } from 'crypto';
 import {
   guardGmailApi, denyWrite, emitDenial, ReadOnlyScopeError, TokenFileInvalidError, TokenFileMissingError,
   RefreshTokenMissingError, OAuthClientFileError, READONLY_SCOPE, safeScopeList,
@@ -561,7 +562,7 @@ export class GmailClient {
     const from = oneLine(GmailClient.getHeader(original, 'From'));
     const to = oneLine(toAddress);
 
-    const boundary = `boundary_${Date.now()}`;
+    const boundary = `boundary_${randomBytes(16).toString('hex')}`;
     const rawOriginal = await this._gmail.users.messages.get({
       userId: 'me',
       id: messageId,
