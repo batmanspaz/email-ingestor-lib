@@ -599,7 +599,7 @@ export class GmailClient {
     // toAddress is configured routing (not message content), so it keeps the #2546 strip behaviour.
     const subject = sanitizeHeaderValue(GmailClient.getHeader(original, 'Subject'));
     const from = sanitizeHeaderValue(GmailClient.getHeader(original, 'From'));
-    const to = sanitizeHeaderValue(toAddress);
+    const to = sanitizeHeaderValue(toAddress).trim();
 
     const boundary = `boundary_${randomBytes(16).toString('hex')}`;
     const rawOriginal = await this._gmail.users.messages.get({
@@ -816,6 +816,7 @@ export class GmailClient {
    * Send an email. NOT marked as automated (no Auto-Submitted / X-Intake-Forwarded): the copy lands in
    * SENT looking like Paul's own mail. Callers on accounts with `ingestSent` on must therefore send only
    * to the account itself (self-only is screened) or add the forward marker themselves (#2546).
+   * @throws {Error} when to/cc/bcc contain a line-break/control character (header injection, #2584)
    */
   async sendEmail({ to, subject, body, cc, bcc }) {
     // Same header-injection hardening as createDraft (#2584): reject line breaks in recipients,

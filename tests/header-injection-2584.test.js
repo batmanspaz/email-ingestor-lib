@@ -171,7 +171,7 @@ describe('#2584 forwardEmail returns the address it actually used', () => {
     } } };
     const res = await client.forwardEmail('in-1', 'shop@entity.example\r\n');
     expect(res.forwarded_to).not.toMatch(BAD);
-    expect(res.forwarded_to.trim()).toBe('shop@entity.example');
+    expect(res.forwarded_to).toBe('shop@entity.example');
   });
 });
 
