@@ -2,7 +2,8 @@
  * tasks.db #2584 — createDraft (and sendEmail, same pattern) pasted to/cc/bcc/subject/inReplyTo/references
  * straight into RFC 5322 header lines. A CR/LF (or another line-breaking control char) in any of them ends
  * the header line early: it can inject headers (Bcc) or end the header block and turn the rest into body.
- * No production caller today (tests only) — harden before one appears.
+ * Live callers: intake scripts/draft-reply.js:349 calls createDraft (relative import of the shared checkout);
+ * forwardEmail is called from shared/forward.js:55 and collagesoup/src/accounts.js:143.
  *
  * Contract:
  *  - free-text headers (Subject, In-Reply-To, References): line-breaking chars are collapsed to a space.
@@ -137,6 +138,26 @@ describe('#2584 sendEmail has the same hardening', () => {
       expect(send).not.toHaveBeenCalled();
     });
   }
+});
+
+describe('#2584 forwardEmail emits a sanitized To line', () => {
+  it('the To header actually sent (not just the return value) has no line break', async () => {
+    const client = new GmailClient({ account: ME, refreshToken: 'rt_fake', clientId: 'cid_fake', clientSecret: 'cs_fake' });
+    const send = vi.fn().mockResolvedValue({ data: { id: 'fwd-1' } });
+    client._gmail = { users: { messages: {
+      get: vi.fn().mockImplementation(async ({ format }) => (format === 'raw'
+        ? { data: { raw: Buffer.from('From: x\r\n\r\nbody').toString('base64') } }
+        : { data: { id: 'in-1', snippet: 's', payload: { headers: [{ name: 'Subject', value: 's' }] } } })),
+      send,
+    } } };
+    await client.forwardEmail('in-1', 'shop@entity.example\r\nBcc: evil@attacker.example');
+    const raw = decodeB64url(send.mock.calls[0][0].requestBody.raw);
+    const head = headerBlock(raw);
+    expect(head.some((l) => /^bcc:/i.test(l))).toBe(false);
+    const toLines = head.filter((l) => /^to:/i.test(l));
+    expect(toLines).toHaveLength(1);
+    expect(toLines[0]).not.toMatch(BAD);
+  });
 });
 
 describe('#2584 forwardEmail returns the address it actually used', () => {
