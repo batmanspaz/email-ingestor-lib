@@ -33,6 +33,45 @@ export const INTAKE_FORWARD_HEADER = 'X-Intake-Forwarded';
 const FORWARD_MARKER_LINES = ['Auto-Submitted: auto-forwarded', `${INTAKE_FORWARD_HEADER}: 1`];
 
 /**
+ * Characters that can end (or, in a lenient parser, be treated as ending) an RFC 5322 header line:
+ * CR, LF, NUL, VT, FF, NEL (U+0085), LINE SEPARATOR (U+2028), PARAGRAPH SEPARATOR (U+2029).
+ */
+const HEADER_BREAK_RE = /[\r\n\0\v\f\u0085\u2028\u2029]+/g;
+const HEADER_BREAK_TEST = /[\r\n\0\v\f\u0085\u2028\u2029]/;
+
+/**
+ * #2546/#2584: make a value safe to paste into a single header line by collapsing every run of
+ * line-breaking characters to one space. Use for free-text headers (Subject, In-Reply-To,
+ * References, a forwarded From). One shared helper instead of per-call-site `oneLine` lambdas.
+ *
+ * @param {unknown} v
+ * @returns {string}
+ */
+export function sanitizeHeaderValue(v) {
+  return String(v ?? '').replace(HEADER_BREAK_RE, ' ');
+}
+
+/**
+ * #2584: recipient headers (To/Cc/Bcc) are REJECTED, not stripped, when they contain a line-breaking
+ * char: "a@b\r\nBcc: evil@x" stripped is "a@b Bcc: evil@x", which still names the attacker's address
+ * on the recipient line. The error names the field only — never the raw value (no attacker text in logs).
+ *
+ * @param {string|string[]|undefined|null} v
+ * @param {string} field — header name for the error message
+ * @returns {string|undefined} comma-joined recipients, or undefined when v is empty
+ */
+function recipientHeaderValue(v, field) {
+  if (v === undefined || v === null || v === '') return undefined;
+  const list = Array.isArray(v) ? v : [v];
+  for (const item of list) {
+    if (HEADER_BREAK_TEST.test(String(item ?? ''))) {
+      throw new Error(`${field} header contains a line-break/control character; refusing to build message`);
+    }
+  }
+  return list.join(', ');
+}
+
+/**
  * Read a credentials file, converting ANY failure (EACCES, EPERM, EISDIR, ENOENT after a passing
  * existsSync, a non-Error throw...) into the typed error `fail` builds. The raw Node error is
  * never rethrown, never attached as `cause`, and its message / `path` / `errno` / `syscall` are
@@ -556,11 +595,11 @@ export class GmailClient {
     if (this.readOnly) denyWrite(this.account, 'users.messages.send (forwardEmail)', this.#accountLabel);
     const original = await this.fetchMessage(messageId);
     // CR/LF in an attacker-controlled Subject/From (or a bad target) could end the header block early,
-    // pushing the forward markers into the body, or inject headers (Bcc). Strip them (#2546).
-    const oneLine = (v) => String(v ?? '').replace(/[\r\n]+/g, ' ');
-    const subject = oneLine(GmailClient.getHeader(original, 'Subject'));
-    const from = oneLine(GmailClient.getHeader(original, 'From'));
-    const to = oneLine(toAddress);
+    // pushing the forward markers into the body, or inject headers (Bcc). Strip them (#2546, #2584).
+    // toAddress is configured routing (not message content), so it keeps the #2546 strip behaviour.
+    const subject = sanitizeHeaderValue(GmailClient.getHeader(original, 'Subject'));
+    const from = sanitizeHeaderValue(GmailClient.getHeader(original, 'From'));
+    const to = sanitizeHeaderValue(toAddress).trim();
 
     const boundary = `boundary_${randomBytes(16).toString('hex')}`;
     const rawOriginal = await this._gmail.users.messages.get({
@@ -605,7 +644,8 @@ export class GmailClient {
       requestBody: { raw },
     });
 
-    return { ok: true, id: res.data.id, forwarded_to: toAddress };
+    // Report the address actually used, not the raw (possibly CR/LF-carrying) input (#2584).
+    return { ok: true, id: res.data.id, forwarded_to: to };
   }
 
   /**
@@ -620,21 +660,24 @@ export class GmailClient {
    * @param {string}          [opts.inReplyTo] — Message-ID header of the email being replied to
    * @param {string}          [opts.references] — References header chain
    * @returns {{ ok: boolean, draftId: string, threadId: string }}
+   * @throws {Error} when to/cc contain a line-break/control character (header injection, #2584)
    */
   async createDraft({ to, subject, body, cc, threadId, inReplyTo, references }) {
-    const toStr = Array.isArray(to) ? to.join(', ') : to;
+    // Validate every header value BEFORE any API call (#2584).
+    const toStr = recipientHeaderValue(to, 'To') ?? '';
+    const ccStr = recipientHeaderValue(cc, 'Cc');
     const lines = [
       `From: ${this.account}`,
       `To: ${toStr}`,
-      cc ? `Cc: ${Array.isArray(cc) ? cc.join(', ') : cc}` : null,
-      `Subject: ${subject}`,
-      inReplyTo ? `In-Reply-To: ${inReplyTo}` : null,
-      references ? `References: ${references}` : null,
+      ccStr ? `Cc: ${ccStr}` : null,
+      `Subject: ${sanitizeHeaderValue(subject)}`,
+      inReplyTo ? `In-Reply-To: ${sanitizeHeaderValue(inReplyTo)}` : null,
+      references ? `References: ${sanitizeHeaderValue(references)}` : null,
       'Content-Type: text/plain; charset="UTF-8"',
       'MIME-Version: 1.0',
       '',
       body,
-    ].filter(Boolean);
+    ].filter((l) => l !== null); // keep the '' header/body separator (#2584)
 
     const raw = Buffer.from(lines.join('\r\n'))
       .toString('base64')
@@ -773,18 +816,24 @@ export class GmailClient {
    * Send an email. NOT marked as automated (no Auto-Submitted / X-Intake-Forwarded): the copy lands in
    * SENT looking like Paul's own mail. Callers on accounts with `ingestSent` on must therefore send only
    * to the account itself (self-only is screened) or add the forward marker themselves (#2546).
+   * @throws {Error} when to/cc/bcc contain a line-break/control character (header injection, #2584)
    */
   async sendEmail({ to, subject, body, cc, bcc }) {
+    // Same header-injection hardening as createDraft (#2584): reject line breaks in recipients,
+    // collapse them in Subject — before any API call.
+    const toStr = recipientHeaderValue(to, 'To') ?? '';
+    const ccStr = recipientHeaderValue(cc, 'Cc');
+    const bccStr = recipientHeaderValue(bcc, 'Bcc');
     const lines = [
       `From: ${this.account}`,
-      `To: ${to}`,
-      cc ? `Cc: ${cc}` : null,
-      bcc ? `Bcc: ${bcc}` : null,
-      `Subject: ${subject}`,
+      `To: ${toStr}`,
+      ccStr ? `Cc: ${ccStr}` : null,
+      bccStr ? `Bcc: ${bccStr}` : null,
+      `Subject: ${sanitizeHeaderValue(subject)}`,
       'Content-Type: text/plain; charset="UTF-8"',
       '',
       body,
-    ].filter(Boolean);
+    ].filter((l) => l !== null); // keep the '' header/body separator (#2584)
 
     const raw = Buffer.from(lines.join('\r\n'))
       .toString('base64')

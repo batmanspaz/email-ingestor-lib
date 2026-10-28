@@ -19,7 +19,7 @@
  *     transport, until the central ingest Worker is deployed
  */
 
-export { GmailClient, INTAKE_FORWARD_HEADER } from './gmail.js';
+export { GmailClient, INTAKE_FORWARD_HEADER, sanitizeHeaderValue } from './gmail.js';
 export { poll } from './poll.js';
 export { checkAndForward } from './forward.js';
 export {
