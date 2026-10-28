@@ -10,7 +10,7 @@
 // repo), so the lib mirrors the three aliases in ONE module (models.js) and a
 // drift test checks that mirror against model-config whenever a harness
 // checkout is on disk (pc-server). CI has no harness checkout; there the
-// drift test is skipped and the other assertions still run.
+// drift test is skipped (CI === 'true' only; it FAILS elsewhere) and the other assertions still run.
 
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { readFileSync, existsSync } from 'node:fs';
@@ -73,7 +73,13 @@ describe('#2536 ocr.js resolves its model through the alias map', () => {
     for (const [req] of mockCreate.mock.calls) expect(req.model).toBe(MODEL_ALIASES.haiku);
   });
 
-  it.skipIf(!existsSync(MODEL_CONFIG))('mirror matches @hx/model-config ALIASES (drift check; skipped without a harness checkout)', async () => {
+  // Fails loud off CI (#2572): skips ONLY when CI === 'true' (exact string compare, same as intake #2570).
+  it.skipIf(process.env.CI === 'true')('mirror matches @hx/model-config ALIASES (drift check; fails off CI without a harness checkout)', async () => {
+    expect(
+      existsSync(MODEL_CONFIG),
+      `model-config source not found at ${MODEL_CONFIG}. Skips only when CI==='true'; ` +
+      'check out batmanspaz/harness at ~/developer/shared/harness or set MODEL_CONFIG_SRC.',
+    ).toBe(true);
     const { ALIASES } = await import(/* @vite-ignore */ MODEL_CONFIG);
     const { MODEL_ALIASES } = await import('../models.js');
     for (const alias of ['haiku', 'sonnet', 'opus']) expect(MODEL_ALIASES[alias]).toBe(ALIASES[alias]);
