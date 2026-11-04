@@ -76,7 +76,13 @@ describe('scanLabelledDates rejects independent of the backstop (post-floor DOBs
 describe('MIN_PLAUSIBLE_YEAR parity with Python date_labels', () => {
   it('is 2010', () => expect(MIN_PLAUSIBLE_YEAR).toBe(2010));
   const py = `${homedir()}/claude/shared/lib/date_labels.py`;
-  it.skipIf(!existsSync(py))('matches date_labels.MIN_PLAUSIBLE_YEAR', () => {
+  // Fails loud off CI (tasks.db #2618 (5)): skips ONLY when CI === 'true', same as ocr-model-alias-2536 and
+  // intake #2570. It used to skipIf(!existsSync(py)), so a moved/missing date_labels.py silently dropped the check.
+  it.skipIf(process.env.CI === 'true')('matches date_labels.MIN_PLAUSIBLE_YEAR (fails off CI without date_labels.py)', () => {
+    expect(
+      existsSync(py),
+      `date_labels.py not found at ${py}. Skips only when CI==='true'; the Python side lives in ~/claude/shared/lib.`,
+    ).toBe(true);
     const m = /^MIN_PLAUSIBLE_YEAR\s*=\s*(\d+)/m.exec(readFileSync(py, 'utf8'));
     expect(+m[1]).toBe(MIN_PLAUSIBLE_YEAR);
   });
