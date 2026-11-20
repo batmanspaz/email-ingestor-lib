@@ -12,7 +12,8 @@
  * Retention (dev-rules §15, SOC 2 §17.6): size-based rotation. When the next
  * append would push the file past `maxBytes` (default 10 MB) it is renamed to
  * `.1`, `.1` -> `.2`, ... keeping `keep` (default 5) rotated files. New files
- * are created mode 0600.
+ * are created mode 0600, and an existing live or rotated file found with any
+ * other mode is tightened to 0600. Assumes a single writer per logPath.
  */
 
 import fs from 'fs';
@@ -51,21 +52,48 @@ export function createLogger(entity, logPath, opts = {}) {
   const dir = path.dirname(logPath);
   if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
 
-  function rotateIfNeeded(nextLen) {
-    let size;
+  /** Enforce 0600 on an existing file (the `mode` on append only applies at create). */
+  function ensurePrivate(p, st) {
     try {
-      size = fs.statSync(logPath).size;
+      const mode = (st ?? fs.statSync(p)).mode & 0o777;
+      if (mode !== 0o600) fs.chmodSync(p, 0o600);
+    } catch (err) {
+      if (err.code !== 'ENOENT') console.warn(`[log] chmod 0600 failed for ${p}: ${err.message}`);
+    }
+  }
+
+  // SINGLE-WRITER ASSUMPTION: one process appends to a given logPath at a time
+  // (each entity ingestor is one LaunchAgent and runs do not overlap). Two
+  // concurrent writers could both decide to rotate; the re-stat just before
+  // the rename chain narrows, but does not close, that window. If concurrent
+  // writers are ever introduced, move rotation behind a lock file.
+  function rotateIfNeeded(nextLen) {
+    let st;
+    try {
+      st = fs.statSync(logPath);
     } catch {
       return; // no file yet
     }
-    if (size === 0 || size + nextLen <= maxBytes) return;
+    ensurePrivate(logPath, st);
+    const needs = (s) => s.size > 0 && s.size + nextLen > maxBytes;
+    if (!needs(st)) return;
+    try {
+      // Re-stat right before renaming: another writer may have rotated already.
+      if (!needs(fs.statSync(logPath))) return;
+    } catch {
+      return; // file vanished (rotated elsewhere); append recreates it 0600
+    }
     try {
       // Rename chain, oldest first: .keep is overwritten by .keep-1, ..., .1 by live.
       for (let i = keep - 1; i >= 1; i--) {
         const src = `${logPath}.${i}`;
-        if (fs.existsSync(src)) fs.renameSync(src, `${logPath}.${i + 1}`);
+        if (fs.existsSync(src)) {
+          fs.renameSync(src, `${logPath}.${i + 1}`);
+          ensurePrivate(`${logPath}.${i + 1}`);
+        }
       }
       fs.renameSync(logPath, `${logPath}.1`);
+      ensurePrivate(`${logPath}.1`);
     } catch (err) {
       console.warn(`[log] Rotation failed for ${logPath}: ${err.message}`);
     }

@@ -11,7 +11,7 @@
  *     maxBytes (default 10 MB, dev-rules §15), file -> .1, .1 -> .2 ... keep N
  *     (default 5); the oldest beyond N is dropped by the rename chain.
  */
-import { describe, it, expect, beforeEach, afterEach } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import fs from 'fs';
 import os from 'os';
 import path from 'path';
@@ -24,7 +24,10 @@ beforeEach(() => {
   tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'log-3215-'));
   logPath = path.join(tmpDir, 'email-ingestor.jsonl');
 });
-afterEach(() => fs.rmSync(tmpDir, { recursive: true, force: true }));
+afterEach(() => {
+  vi.restoreAllMocks();
+  fs.rmSync(tmpDir, { recursive: true, force: true });
+});
 
 const META = {
   id: 'msg-3215',
@@ -154,13 +157,59 @@ describe('#3215 size-based rotation', () => {
     expect(lines()).toHaveLength(1);
   });
 
-  it('a rotation failure never throws and the record is still written', () => {
+  it('a REAL rotation failure (live -> .1 rename throws) warns, never throws, and still writes the record', () => {
     const log = createLogger('collagesoup', logPath, { maxBytes: 100 });
     log.runEnd({ pad: 'a'.repeat(120) });
-    // make .1 a non-empty directory so rename(live -> .1) fails
-    fs.mkdirSync(`${logPath}.1`);
-    fs.writeFileSync(path.join(`${logPath}.1`, 'blocker'), 'x');
+    const realRename = fs.renameSync;
+    const renameSpy = vi.spyOn(fs, 'renameSync').mockImplementation((src, dst) => {
+      if (src === logPath && dst === `${logPath}.1`) throw Object.assign(new Error('EACCES: simulated'), { code: 'EACCES' });
+      return realRename(src, dst);
+    });
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
     expect(() => log.runEnd({ marker: 'after-fail' })).not.toThrow();
+    expect(renameSpy).toHaveBeenCalledWith(logPath, `${logPath}.1`);
+    expect(warn).toHaveBeenCalledWith(expect.stringMatching(/Rotation failed .*EACCES: simulated/));
+    expect(fs.existsSync(`${logPath}.1`)).toBe(false); // rotation really did not happen
     expect(fs.readFileSync(logPath, 'utf8')).toContain('after-fail');
+  });
+});
+
+describe('#3215 mode 0600 enforced on existing files, not just on create', () => {
+  it('tightens a pre-existing 0644 live file to 0600 on write', () => {
+    fs.writeFileSync(logPath, '{"old":1}\n', { mode: 0o644 });
+    fs.chmodSync(logPath, 0o644);
+    createLogger('collagesoup', logPath).runStart({});
+    expect(fs.statSync(logPath).mode & 0o777).toBe(0o600);
+  });
+
+  it('tightens pre-existing 0644 rotated files as the chain shifts them', () => {
+    fs.writeFileSync(logPath, 'q'.repeat(500) + '\n');
+    fs.chmodSync(logPath, 0o644);
+    fs.writeFileSync(`${logPath}.1`, 'old1\n');
+    fs.chmodSync(`${logPath}.1`, 0o644);
+    createLogger('collagesoup', logPath, { maxBytes: 300 }).runStart({});
+    for (const p of [logPath, `${logPath}.1`, `${logPath}.2`]) {
+      expect(fs.statSync(p).mode & 0o777, p).toBe(0o600);
+    }
+  });
+});
+
+describe('#3215 re-stat before the rename chain', () => {
+  it('skips rotation if the file shrank (another writer rotated) between the size check and the rename', () => {
+    fs.writeFileSync(logPath, 'q'.repeat(500) + '\n', { mode: 0o600 });
+    const log = createLogger('collagesoup', logPath, { maxBytes: 300 });
+    const realStat = fs.statSync;
+    let calls = 0;
+    vi.spyOn(fs, 'statSync').mockImplementation((p, ...rest) => {
+      if (p === logPath && ++calls === 2) {
+        // simulate a concurrent rotation landing between the two stats
+        fs.renameSync(logPath, `${logPath}.other`);
+        fs.writeFileSync(logPath, '', { mode: 0o600 });
+      }
+      return realStat(p, ...rest);
+    });
+    log.runStart({});
+    expect(fs.existsSync(`${logPath}.1`)).toBe(false);
+    expect(lines()).toHaveLength(1);
   });
 });
