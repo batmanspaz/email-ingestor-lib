@@ -71,14 +71,16 @@ describe('createLogger — PII masking on the persistent sink', () => {
     }
   });
 
-  it('message(): masks the sender to first-char + ***@domain and keeps the messageId', () => {
+  it('message(): writes the sender as domain only (#3215) and keeps the messageId', () => {
     const log = createLogger('perfectcity', logPath);
     log.message(META);
 
     const [rec] = readLines();
     expect(rec.op).toBe('message');
     expect(rec.messageId).toBe('msg-123');
-    expect(rec.from).toContain('p***@gmail.com'); // masked address present (not just dropped)
+    expect(rec.fromDomain).toBe('gmail.com'); // sender domain present (not just dropped)
+    expect(rec).not.toHaveProperty('from');
+    expect(rec).not.toHaveProperty('snippet');
   });
 
   it('forward(): no raw email-local / subject text reaches the log file', () => {

@@ -2,6 +2,17 @@
  * log.js — Append-only JSONL email log for entity ingestors
  *
  * Each entity writes to ~/claude/{entity}/logs/email-ingestor.jsonl
+ *
+ * PII (SOC 2 §17.5, tasks.db #3215): the sink never holds message body text
+ * (no `snippet` key at all), the sender is written as its DOMAIN ONLY
+ * (`fromDomain`), and the subject is a length marker. `messageId` (the Gmail
+ * id) is the dedupe/debug key: anyone authorised to debug can open the
+ * message in Gmail from it, so no sender identity or hash is needed here.
+ *
+ * Retention (dev-rules §15, SOC 2 §17.6): size-based rotation. When the next
+ * append would push the file past `maxBytes` (default 10 MB) it is renamed to
+ * `.1`, `.1` -> `.2`, ... keeping `keep` (default 5) rotated files. New files
+ * are created mode 0600.
  */
 
 import fs from 'fs';
@@ -9,15 +20,56 @@ import path from 'path';
 import { GmailClient } from './gmail.js';
 import { maskFrom, redact } from './mask.js';
 
+export const DEFAULT_MAX_BYTES = 10 * 1024 * 1024;
+export const DEFAULT_KEEP = 5;
+
+/**
+ * Sender domain only. maskFrom() already extracts a single address (and fails
+ * closed to '[redacted]'); keep only what follows the '@'.
+ * @param {*} from raw From header
+ * @returns {string|undefined}
+ */
+function senderDomain(from) {
+  const masked = maskFrom(from);
+  if (!masked || typeof masked !== 'string') return undefined;
+  const at = masked.lastIndexOf('@');
+  return at === -1 ? '[redacted]' : masked.slice(at + 1).toLowerCase();
+}
+
 /**
  * Create a logger for an entity.
  * @param {string} entity — entity name (collagesoup, perfectcity, personal)
  * @param {string} logPath — full path to the .jsonl log file
+ * @param {object} [opts]
+ * @param {number} [opts.maxBytes=DEFAULT_MAX_BYTES] rotate before the file would exceed this
+ * @param {number} [opts.keep=DEFAULT_KEEP] rotated files to keep (.1 .. .keep)
  * @returns {object} logger with methods: message(), forward(), error(), runStart(), runEnd()
  */
-export function createLogger(entity, logPath) {
+export function createLogger(entity, logPath, opts = {}) {
+  const maxBytes = opts.maxBytes ?? DEFAULT_MAX_BYTES;
+  const keep = Math.max(1, opts.keep ?? DEFAULT_KEEP);
   const dir = path.dirname(logPath);
   if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+
+  function rotateIfNeeded(nextLen) {
+    let size;
+    try {
+      size = fs.statSync(logPath).size;
+    } catch {
+      return; // no file yet
+    }
+    if (size === 0 || size + nextLen <= maxBytes) return;
+    try {
+      // Rename chain, oldest first: .keep is overwritten by .keep-1, ..., .1 by live.
+      for (let i = keep - 1; i >= 1; i--) {
+        const src = `${logPath}.${i}`;
+        if (fs.existsSync(src)) fs.renameSync(src, `${logPath}.${i + 1}`);
+      }
+      fs.renameSync(logPath, `${logPath}.1`);
+    } catch (err) {
+      console.warn(`[log] Rotation failed for ${logPath}: ${err.message}`);
+    }
+  }
 
   function append(record) {
     const line = JSON.stringify({
@@ -27,7 +79,8 @@ export function createLogger(entity, logPath) {
     }) + '\n';
 
     try {
-      fs.appendFileSync(logPath, line, 'utf8');
+      rotateIfNeeded(Buffer.byteLength(line, 'utf8'));
+      fs.appendFileSync(logPath, line, { encoding: 'utf8', mode: 0o600 });
     } catch (err) {
       console.warn(`[log] Failed to write to ${logPath}: ${err.message}`);
     }
@@ -35,14 +88,15 @@ export function createLogger(entity, logPath) {
 
   return {
     message(meta, extra = {}) {
+      // PII (SOC 2, #3215): sender domain only, subject length only, and the
+      // body snippet is never written — not even by a caller's `extra`.
+      const { snippet: _dropped, from: _droppedFrom, ...safeExtra } = extra;
       append({
         op: 'message',
         messageId: meta.id,
-        // PII (SOC 2): mask sender, redact subject + body snippet before write.
-        from: maskFrom(GmailClient.getHeader(meta, 'From')),
+        fromDomain: senderDomain(GmailClient.getHeader(meta, 'From')),
         subject: redact(GmailClient.getHeader(meta, 'Subject')),
-        snippet: redact(meta.snippet),
-        ...extra,
+        ...safeExtra,
       });
     },
 
@@ -50,8 +104,8 @@ export function createLogger(entity, logPath) {
       append({
         op: 'forward',
         messageId: meta.id,
-        // PII (SOC 2): mask sender + redact subject before write.
-        from: maskFrom(GmailClient.getHeader(meta, 'From')),
+        // PII (SOC 2, #3215): sender domain only + subject length only.
+        fromDomain: senderDomain(GmailClient.getHeader(meta, 'From')),
         subject: redact(GmailClient.getHeader(meta, 'Subject')),
         target,
         rule,
