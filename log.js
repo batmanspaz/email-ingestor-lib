@@ -24,6 +24,18 @@ import { maskFrom, redact } from './mask.js';
 export const DEFAULT_MAX_BYTES = 10 * 1024 * 1024;
 export const DEFAULT_KEEP = 5;
 
+// Fields every record's writer owns; callers' extra/stats can never overwrite
+// them (a caller-supplied `subject` would otherwise land raw on disk).
+const RESERVED = ['ts', 'entity', 'op', 'messageId', 'fromDomain', 'subject', 'from', 'snippet'];
+const stripReserved = (obj) => {
+  const out = {};
+  for (const [k, v] of Object.entries(obj ?? {})) if (!RESERVED.includes(k)) out[k] = v;
+  return out;
+};
+
+// Latch: warn about a persistent chmod failure once per logPath per process.
+const chmodWarned = new Set();
+
 /**
  * Sender domain only. maskFrom() already extracts a single address (and fails
  * closed to '[redacted]'); keep only what follows the '@'.
@@ -58,7 +70,10 @@ export function createLogger(entity, logPath, opts = {}) {
       const mode = (st ?? fs.statSync(p)).mode & 0o777;
       if (mode !== 0o600) fs.chmodSync(p, 0o600);
     } catch (err) {
-      if (err.code !== 'ENOENT') console.warn(`[log] chmod 0600 failed for ${p}: ${err.message}`);
+      if (err.code !== 'ENOENT' && !chmodWarned.has(p)) {
+        chmodWarned.add(p);
+        console.warn(`[log] chmod 0600 failed for ${p}: ${err.message}`);
+      }
     }
   }
 
@@ -83,8 +98,18 @@ export function createLogger(entity, logPath, opts = {}) {
     } catch {
       return; // file vanished (rotated elsewhere); append recreates it 0600
     }
+    // Move the live file aside FIRST: if it cannot be renamed (persistent
+    // EBUSY/EACCES), nothing in the .N chain has moved, so history is never
+    // collapsed by repeated failing rotations.
+    const tmp = `${logPath}.1-tmp`;
     try {
-      // Rename chain, oldest first: .keep is overwritten by .keep-1, ..., .1 by live.
+      fs.renameSync(logPath, tmp);
+    } catch (err) {
+      console.warn(`[log] Rotation failed for ${logPath}: ${err.message}`);
+      return;
+    }
+    try {
+      // Rename chain, oldest first: .keep is overwritten by .keep-1, ..., .2 by .1.
       for (let i = keep - 1; i >= 1; i--) {
         const src = `${logPath}.${i}`;
         if (fs.existsSync(src)) {
@@ -92,19 +117,25 @@ export function createLogger(entity, logPath, opts = {}) {
           ensurePrivate(`${logPath}.${i + 1}`);
         }
       }
-      fs.renameSync(logPath, `${logPath}.1`);
+      fs.renameSync(tmp, `${logPath}.1`);
       ensurePrivate(`${logPath}.1`);
     } catch (err) {
       console.warn(`[log] Rotation failed for ${logPath}: ${err.message}`);
+      try {
+        fs.renameSync(tmp, logPath); // put the live file back; nothing lost
+      } catch (err2) {
+        console.warn(`[log] Could not restore ${logPath} from ${tmp}: ${err2.message}`);
+      }
     }
   }
 
   function append(record) {
-    const line = JSON.stringify({
-      ts: new Date().toISOString(),
-      entity,
-      ...record,
-    }) + '\n';
+    // Fixed fields last so a record can never overwrite them.
+    const { ts: _ts, entity: _entity, ...rest } = record;
+    const line = JSON.stringify(Object.assign(
+      { ts: new Date().toISOString(), entity }, rest,
+      { ts: new Date().toISOString(), entity },
+    )) + '\n';
 
     try {
       rotateIfNeeded(Buffer.byteLength(line, 'utf8'));
@@ -117,8 +148,9 @@ export function createLogger(entity, logPath, opts = {}) {
   return {
     message(meta, extra = {}) {
       // PII (SOC 2, #3215): sender domain only, subject length only, and the
-      // body snippet is never written — not even by a caller's `extra`.
-      const { snippet: _dropped, from: _droppedFrom, ...safeExtra } = extra;
+      // body snippet is never written. Reserved keys are stripped from the
+      // caller's `extra` so it cannot overwrite (or re-add) any of them.
+      const safeExtra = stripReserved(extra);
       append({
         op: 'message',
         messageId: meta.id,
@@ -155,11 +187,11 @@ export function createLogger(entity, logPath, opts = {}) {
     },
 
     runStart(stats) {
-      append({ op: 'run_start', ...stats });
+      append({ op: 'run_start', ...stripReserved(stats) });
     },
 
     runEnd(stats) {
-      append({ op: 'run_end', ...stats });
+      append({ op: 'run_end', ...stripReserved(stats) });
     },
   };
 }
